@@ -67,7 +67,7 @@ def round_trip(bytes payload, int64 read_size):
     rejected = False
     try:
         conn.execute([b"PING"])
-    except RuntimeError:
+    except redis.ConnectionError:
         rejected = True
     check(rejected, "use after disconnect rejected")
 
@@ -115,7 +115,9 @@ def failure(bytes reply, bool peer_eof, int64 max_frame, str want):
     auto message = ""
     try:
         conn.execute([b"PING"])
-    except RuntimeError as e:
+    except redis.ConnectionError as e:
+        message = e
+    except redis.ProtocolError as e:
         message = e
     check(message.find(want) >= 0, "failure diagnostic: " + want)
     check(conn.is_closed(), "failure invalidates connection")
@@ -151,15 +153,21 @@ def exclusive_owner():
     auto rejected = False
     try:
         conn.execute([b"PING"])
-    except RuntimeError as e:
+    except redis.BusyError as e:
         rejected = e.find("in use") >= 0
     check(rejected, "concurrent execute rejected")
     rejected = False
     try:
         conn.disconnect()
-    except RuntimeError as e:
+    except redis.BusyError as e:
         rejected = e.find("in use") >= 0
     check(rejected, "concurrent disconnect rejected")
+    rejected = False
+    try:
+        conn.reconnect()
+    except redis.BusyError:
+        rejected = True
+    check(rejected, "concurrent reconnect rejected")
     release <- True
     check(<-finished, "original owner completed")
     expect_simple(conn.execute([b"PING"]), b"OK")

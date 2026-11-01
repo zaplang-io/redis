@@ -9,7 +9,7 @@ jobs:
   codec:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    container: ghcr.io/zaplang-io/zap:latest
+    container: ghcr.io/zaplang-io/zap@sha256:77f68f492779b2d3c58cb6fa1f25363766c83b7ea0a7b5a25f7d92582bbd73d6
     steps:
       - uses: actions/checkout@v4
       - name: Execute codec and TCP tests
