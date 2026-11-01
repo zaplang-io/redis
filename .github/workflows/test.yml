@@ -1,0 +1,14 @@
+name: Test
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  codec:
+    runs-on: ubuntu-latest
+    container: ghcr.io/zaplang-io/zap:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Execute codec tests
+        run: sh tools/run-tests.sh
