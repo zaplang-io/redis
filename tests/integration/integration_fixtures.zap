@@ -74,6 +74,7 @@ def other_database(Fixture source) -> Fixture:
         old.max_frame,
         old.max_depth,
         old.read_size,
+        old.secure,
     )
     list[bytes] keys = []
     return Fixture(cfg, source.prefix, keys)

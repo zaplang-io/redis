@@ -23,6 +23,13 @@ def main():
         redis.describe_options(defaults) == "redis://127.0.0.1:6379/0",
         "default description",
     )
+    auto encrypted = redis.parse_url("rediss://:password@localhost:6380/2")
+    check(encrypted.secure, "rediss selects TLS")
+    check(
+        redis.describe_options(encrypted) == "rediss://***@localhost:6380/2",
+        "rediss description",
+    )
+    check(not defaults.secure, "TCP remains the default")
     auto empty = redis.parse_url("redis://")
     check(empty.host == defaults.host, "URL default host")
     check(empty.port == 6379, "URL default port")
@@ -61,7 +68,7 @@ def main():
     list[str] bad = [
         "",
         "http://localhost",
-        "rediss://localhost",
+        "redisx://localhost",
         "redis://localhost#fragment",
         "redis://user:SECRET@localhost:0",
         "redis://user:SECRET@localhost:65536",

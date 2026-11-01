@@ -4,7 +4,7 @@ A pure-Zap Redis client, official non-core package. Tracks
 [zaplang-io/zap#322](https://github.com/zaplang-io/zap/issues/322).
 
 The package includes a binary-safe RESP2 codec, TCP connections, typed errors,
-explicit reconnect, URL configuration, and session initialization. Typed command
+explicit reconnect, URL configuration, verified TLS, and session initialization. Typed command
 helpers are still planned.
 
 ## TCP connection
@@ -42,7 +42,7 @@ The connection fields and direct construction are internal; use `connect()`.
 
 Transport failures, EOF before a complete reply, and invalid framing close the
 connection and discard buffered bytes. Commands are never automatically retried.
-A failed operation might already have executed on the server. Pooling, TLS, and
+A failed operation might already have executed on the server. Pooling and
 configurable deadlines have separate backlog issues. Use a dedicated connection for stateful
 commands and manage its lifetime with `try/finally`.
 
@@ -66,7 +66,7 @@ print(redis.describe_options(cfg))  # redis://***@localhost:6379/2
 ```
 
 `redis.options(...) -> Options` provides host, port, database, username, password,
-client_name, authenticate, max_frame, max_depth, and read_size. Use
+client_name, authenticate, max_frame, max_depth, read_size, and secure. Use
 `redis.connect_options(cfg)` to connect; it takes a validated snapshot, so later
 mutations of `cfg` cannot change reconnect behavior. The existing first five
 positional arguments to `connect()` (host, port, max_frame, max_depth, read_size)
@@ -85,8 +85,7 @@ query `db` takes precedence over the path database; all supplied values are
 validated. There is no implicit merge with a second options object: parse the
 URL, edit the returned options explicitly if needed, then call connect_options.
 Unknown/duplicate query keys, fragments, malformed escapes, invalid ports or
-databases, and unescaped whitespace/control characters are rejected. `rediss://`
-is rejected until TLS support lands. Client names must contain printable ASCII
+databases, and unescaped whitespace/control characters are rejected. `rediss://` enables verified TLS with the same parsing and session options. Client names must contain printable ASCII
 without spaces. Databases must be nonnegative int32 values; the server validates
 that the configured database actually exists.
 
@@ -102,6 +101,59 @@ Use `describe_options()` for diagnostics; it omits both credentials. Avoid loggi
 the input URL, password field, or AUTH command arguments yourself. Offline session tests use deterministic loopback protocol fixtures. The live
 Redis harness also checks ACL authentication, selected database isolation, client
 names, and reconnect against real servers.
+
+## Verified TLS
+
+```zap
+auto conn = redis.connect_url("rediss://redis.example.com:6380/0")
+try:
+    auto reply = conn.execute([b"PING"])
+finally:
+    conn.disconnect()
+```
+
+Use `rediss://` URLs or `secure=True` in direct options/connect calls. Plain
+`redis://` and existing calls remain TCP. `describe_options()` preserves the
+scheme while redacting credentials. Reconnect retains the selected transport
+and repeats AUTH/SELECT/client-name setup over it. Binary payloads, parser
+limits, ownership rejection, server errors, EOF handling, and disconnect follow
+the same connection contract for both transports.
+
+TLS calls Zap's verified `tls.connect`: certificate-chain and DNS hostname
+verification are always on. Redis exposes no insecure/skip-verification option
+and never retries a failed TLS connection as plaintext. TLS failures raise
+`redis.ConnectionError`; protocol errors still raise `redis.ProtocolError`.
+Use the certificate's DNS hostname for the connection endpoint. Numeric-IP-only
+certificate identities are not part of this slice's compatibility guarantee:
+the current stdlib configures OpenSSL's DNS hostname checker.
+
+Trust comes from OpenSSL's default trust paths. For a private CA, set
+`SSL_CERT_FILE` (PEM CA bundle) and/or `SSL_CERT_DIR` (hashed CA directory) before
+starting the process or opening connections. These are process-wide trust
+settings, as described by [OpenSSL's default verify paths](https://docs.openssl.org/3.0/man3/SSL_CTX_load_verify_locations/).
+There are no per-connection CA settings or client-certificate/private-key
+options in the current Zap TLS client API; mutual TLS is not supported by this
+Redis slice. Do not change global trust settings around concurrent connections
+to imitate isolated CA configuration. Core support is tracked in [zap#560](https://github.com/zaplang-io/zap/issues/560).
+
+TLS handshakes and reads/writes currently share the runtime deadline/cancellation
+limitations documented for #7. This feature does not add bounded handshakes or
+command deadlines.
+
+### TLS tests
+
+```sh
+ZAP=/path/to/zap tools/run-tls-tests.sh
+```
+
+The runner requires the OpenSSL 3 command-line tool, generates an ephemeral test
+CA and server keys in a temporary directory, and removes them after the suite.
+No certificate private keys are checked into the repository. It runs verified
+loopback TLS command/session tests with 64 KiB binary data and reconnect, EOF and
+malformed-frame cleanup, rejection of an untrusted chain, and rejection of a
+trusted certificate for the wrong hostname. Linux CI also checks descriptor
+counts across repeated failed handshakes. It needs no external Redis server.
+`tools/run-tls-tests.sh --check` only checks the frontend and needs no certificates.
 
 ## Errors and explicit reconnect
 
