@@ -99,9 +99,9 @@ credentials are not retained in last_error(). General command error handling
 continues to preserve raw server messages as documented below.
 
 Use `describe_options()` for diagnostics; it omits both credentials. Avoid logging
-the input URL, password field, or AUTH command arguments yourself. Session tests
-use deterministic loopback protocol fixtures; the planned live-Redis harness
-adds server-version and database-isolation interoperability checks separately.
+the input URL, password field, or AUTH command arguments yourself. Offline session tests use deterministic loopback protocol fixtures. The live
+Redis harness also checks ACL authentication, selected database isolation, client
+names, and reconnect against real servers.
 
 ## Errors and explicit reconnect
 
@@ -221,3 +221,53 @@ Use medium-sized individual issues. Issues for this library belong in
 `zaplang-io/redis`. Follow-up slices: TCP connection lifecycle and incremental
 buffering; command helpers and integration tests against Redis. Keep this codec
 independent of transport and command policy.
+
+## Live integration tests
+
+The declared minimum Redis server branch is **7.4**. CI tests the pinned patch
+versions **7.4.12** and **8.10.3**, alongside an independent offline job. Redis
+7.4 is an extended release and 8.10 is a current GA branch in the
+[Redis version policy](https://redis.io/docs/latest/operate/oss_and_stack/install/version-mgmt/).
+Older server branches and Redis-compatible alternatives are currently untested.
+The server images, Zap toolchain, and checkout action are pinned by digest/SHA in
+`.github/workflows/test.yml`; update the server version and image digest together.
+The live suites verify the actual server version when CI supplies the expected
+patch version. CI runs once per pull request and on pushes to main only.
+
+The existing `tools/run-tests.sh` remains offline and does not start or connect
+to Redis. To run the live basic suite, supply an explicit endpoint:
+
+```sh
+REDIS_TEST_URL=redis://127.0.0.1:6379/0 ZAP=/path/to/zap \
+  tools/run-integration-tests.sh
+```
+
+There is no implicit localhost connection. The endpoint must permit PING, INFO,
+ECHO, GET/SET/DEL, LPUSH (for WRONGTYPE checks), and CLIENT ID. Credentials can be
+supplied in the URL using the usual percent-encoding rules. The runner does not
+print the URL. Basic tests use unique random key prefixes, delete only their
+registered keys in finally cleanup, and set a 60-second fallback TTL. They do
+not flush or enumerate the database.
+
+For a **disposable, isolated** instance with administrative ACL permissions and
+at least two databases, also run the session suite:
+
+```sh
+REDIS_TEST_URL=redis://127.0.0.1:6379/0 ZAP=/path/to/zap \
+  tools/run-integration-tests.sh --isolated
+```
+
+That explicit mode tests database isolation and reconnect, creates a randomly
+named ACL user limited to the test namespace and required commands, checks good
+and bad authentication and client-name restoration, and removes the user and
+keys during cleanup. It never changes the default user or global server config.
+CI supplies a fresh service container per matrix job. Readiness is gated by
+`redis-cli ping` health checks; tests have no startup sleeps. Destroying the
+service container also removes any state left after a forcibly terminated job.
+
+`tools/run-integration-tests.sh --check` validates both live suites without a
+server or endpoint. Reusable setup/assertion/cleanup helpers live in
+`tests/integration/integration_fixtures.zap`; add future live suites under that
+directory with a matching `.expected` output file. Any suite that mutates ACLs
+or otherwise needs administrative isolation must explicitly require isolated
+mode and be selected accordingly in the runner.
