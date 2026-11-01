@@ -202,13 +202,6 @@ def main():
     invalid_options()
     io.write(2, "start binary round trip\n")
     round_trip(bytes([0, 255, 13, 10, 128]), 1)
-    auto large = bytes([0, 255, 13, 10])
-    auto i = 0
-    while i < 14:
-        large = large + large
-        i = i + 1
-    io.write(2, "start large round trip\n")
-    round_trip(large, 4096)
     io.write(2, "start coalesced\n")
     coalesced()
     io.write(2, "start EOF tests\n")
@@ -218,4 +211,11 @@ def main():
     failure(b"$100\r\n", False, 32, "exceeds byte limit")
     io.write(2, "start ownership\n")
     exclusive_owner()
+    auto large = bytes([0, 255, 13, 10])
+    auto i = 0
+    while i < 14:
+        large = large + large
+        i = i + 1
+    io.write(2, "start large round trip\n")
+    round_trip(large, 4096)
     print("TCP connection: PASS")
