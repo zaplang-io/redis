@@ -1,6 +1,7 @@
 name: Test
 on:
   push:
+    branches: [main]
   pull_request:
 permissions:
   contents: read
@@ -10,5 +11,5 @@ jobs:
     container: ghcr.io/zaplang-io/zap:latest
     steps:
       - uses: actions/checkout@v4
-      - name: Execute codec tests
+      - name: Execute codec and TCP tests
         run: sh tools/run-tests.sh
