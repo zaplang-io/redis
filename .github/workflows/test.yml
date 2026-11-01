@@ -14,16 +14,25 @@ jobs:
       - uses: actions/checkout@v4
       - name: Execute codec and TCP tests
         run: sh tools/run-tests.sh
-      - name: Diagnose binary runtime failure
+      - name: Verify upstream allocator correction
         if: failure()
         run: |
-          for workers in 1 2 4; do
-            echo "Binary transport with MAXPROCS=$workers"
-            MAXPROCS=$workers zap run tests/binary_transport_test.zap || true
+          cat > /tmp/zap-cc-fixed <<'EOF'
+          #!/bin/sh
+          for arg do
+            case "$arg" in
+              */zaprt.c)
+                sed -i 's/sizeof(ZapBlock) + ZAP_BLOCK/ZAP_RESERVED_BYTES + ZAP_BLOCK/g' "${arg%/*}/zapgc.inc.c"
+                ;;
+            esac
           done
-          echo "Binary transport with evacuation disabled"
-          ZAP_GC_NO_EVAC=1 zap run tests/binary_transport_test.zap || true
-          echo "Binary transport with AddressSanitizer"
+          exec clang-18 "$@"
+          EOF
+          chmod +x /tmp/zap-cc-fixed
+          ZAP_CC=/tmp/zap-cc-fixed sh tools/run-tests.sh
+          python3 -c 'import urllib.request; urllib.request.urlretrieve("https://raw.githubusercontent.com/zaplang-io/zap/2a80826fdecbbb69327d86e4800c6008d1cc4c53/tests/golden/immix_los_boundaries.zap", "/tmp/immix_los_boundaries.zap")'
+          ZAP_CC=/tmp/zap-cc-fixed zap run /tmp/immix_los_boundaries.zap
           apt-get update -qq
           apt-get install -y --no-install-recommends libclang-rt-18-dev
-          ZAP_CC_EXTRA='-g -fsanitize=address -fno-omit-frame-pointer' ASAN_OPTIONS=detect_leaks=0 zap run tests/binary_transport_test.zap
+          ZAP_CC=/tmp/zap-cc-fixed ZAP_CC_EXTRA='-g -fsanitize=address -fno-omit-frame-pointer' ASAN_OPTIONS=detect_leaks=0 zap run tests/binary_transport_test.zap
+          ZAP_CC=/tmp/zap-cc-fixed ZAP_CC_EXTRA='-g -fsanitize=address -fno-omit-frame-pointer' ASAN_OPTIONS=detect_leaks=0 zap run /tmp/immix_los_boundaries.zap
