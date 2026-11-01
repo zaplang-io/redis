@@ -1,5 +1,5 @@
 # RESP2 wire codec. All payloads stay bytes; text decoding is a caller choice.
-# No sockets or implicit command execution in this module.
+# Importing this module performs no sockets or implicit command execution.
 enum Reply:
     Simple(bytes data)
     Error(bytes data)
@@ -358,6 +358,50 @@ def parse_url(str address) -> Options:
     cfg.secure = parsed.group("scheme") == "rediss"
     return cfg
 
+# MSET preserves caller ordering and permits binary keys and values.
+struct KeyValue:
+    bytes key
+    bytes value
+
+def _bulk_value(Reply reply) -> Optional[bytes]:
+    match reply:
+        case Reply.Bulk(data):
+            return Optional.Some(data)
+        case Reply.NullBulk:
+            return None
+        case _:
+            raise ProtocolError("Expected Redis bulk or null reply")
+
+def _integer_value(Reply reply) -> int64:
+    match reply:
+        case Reply.Integer(value):
+            return value
+        case _:
+            raise ProtocolError("Expected Redis integer reply")
+
+def _status_value(Reply reply, bytes expected) -> bool:
+    match reply:
+        case Reply.Simple(data):
+            if data == expected:
+                return True
+        case _:
+            raise ProtocolError("Expected Redis status reply")
+    raise ProtocolError("Unexpected Redis status value")
+
+def _boolean_value(Reply reply) -> bool:
+    auto value = _integer_value(reply)
+    if value != 0 and value != 1:
+        raise ProtocolError("Expected Redis zero or one reply")
+    return value == 1
+
+def _keys_command(bytes name, list[bytes] keys) -> list[bytes]:
+    if len(keys) == 0:
+        raise ValueError("Redis key list must not be empty")
+    list[bytes] args = [name]
+    for key in keys:
+        args.append(key)
+    return args
+
 # One connection has one active owner. The atomic state protects both socket
 # access and the reply buffer: 0=idle, 1=owned, 2=closed. Sharing requires callers
 # to serialize access; a concurrent execute/disconnect is rejected, never queued.
@@ -444,6 +488,116 @@ struct Connection:
                 [b"CLIENT", b"SETNAME", bytes(self._config.client_name)],
                 "CLIENT SETNAME",
             )
+
+    def ping(self) -> bool:
+        return _status_value(self.execute([b"PING"]), b"PONG")
+
+    def get(self, bytes key) -> Optional[bytes]:
+        return _bulk_value(self.execute([b"GET", key]))
+
+    def set_value(
+        self,
+        bytes key,
+        bytes value,
+        bool nx = False,
+        bool xx = False,
+        Optional[int64] ex = None,
+        Optional[int64] px = None,
+    ) -> bool:
+        if nx and xx:
+            raise ValueError("SET NX and XX are mutually exclusive")
+        list[bytes] args = [b"SET", key, value]
+        if ex.is_some() and px.is_some():
+            raise ValueError("SET EX and PX are mutually exclusive")
+        if ex.is_some():
+            auto seconds = ex.unwrap()
+            if seconds <= 0:
+                raise ValueError("SET EX must be positive")
+            args.append(b"EX")
+            args.append(bytes(str(seconds)))
+        if px.is_some():
+            auto milliseconds = px.unwrap()
+            if milliseconds <= 0:
+                raise ValueError("SET PX must be positive")
+            args.append(b"PX")
+            args.append(bytes(str(milliseconds)))
+        if nx:
+            args.append(b"NX")
+        if xx:
+            args.append(b"XX")
+        auto reply = self.execute(args)
+        match reply:
+            case Reply.NullBulk:
+                if nx or xx:
+                    return False
+                raise ProtocolError("Unexpected null SET reply")
+            case _:
+                return _status_value(reply, b"OK")
+
+    def mget(self, list[bytes] keys) -> list[Optional[bytes]]:
+        auto reply = self.execute(_keys_command(b"MGET", keys))
+        match reply:
+            case Reply.Array(items):
+                if len(items) != len(keys):
+                    raise ProtocolError("MGET reply length differs from key count")
+                list[Optional[bytes]] values = []
+                for item in items:
+                    values.append(_bulk_value(item))
+                return values
+            case _:
+                raise ProtocolError("Expected MGET array reply")
+
+    def mset(self, list[KeyValue] pairs) -> bool:
+        if len(pairs) == 0:
+            raise ValueError("MSET pairs must not be empty")
+        list[bytes] args = [b"MSET"]
+        for pair in pairs:
+            args.append(pair.key)
+            args.append(pair.value)
+        return _status_value(self.execute(args), b"OK")
+
+    def delete(self, list[bytes] keys) -> int64:
+        return _integer_value(self.execute(_keys_command(b"DEL", keys)))
+
+    def unlink(self, list[bytes] keys) -> int64:
+        return _integer_value(self.execute(_keys_command(b"UNLINK", keys)))
+
+    def exists(self, list[bytes] keys) -> int64:
+        return _integer_value(self.execute(_keys_command(b"EXISTS", keys)))
+
+    def key_type(self, bytes key) -> bytes:
+        match self.execute([b"TYPE", key]):
+            case Reply.Simple(data):
+                return data
+            case _:
+                raise ProtocolError("Expected TYPE status reply")
+
+    def incr(self, bytes key) -> int64:
+        return _integer_value(self.execute([b"INCR", key]))
+
+    def decr(self, bytes key) -> int64:
+        return _integer_value(self.execute([b"DECR", key]))
+
+    def incrby(self, bytes key, int64 amount) -> int64:
+        return _integer_value(self.execute([b"INCRBY", key, bytes(str(amount))]))
+
+    def decrby(self, bytes key, int64 amount) -> int64:
+        return _integer_value(self.execute([b"DECRBY", key, bytes(str(amount))]))
+
+    def expire(self, bytes key, int64 seconds) -> bool:
+        return _boolean_value(self.execute([b"EXPIRE", key, bytes(str(seconds))]))
+
+    def pexpire(self, bytes key, int64 milliseconds) -> bool:
+        return _boolean_value(self.execute([b"PEXPIRE", key, bytes(str(milliseconds))]))
+
+    def ttl(self, bytes key) -> int64:
+        return _integer_value(self.execute([b"TTL", key]))
+
+    def pttl(self, bytes key) -> int64:
+        return _integer_value(self.execute([b"PTTL", key]))
+
+    def persist(self, bytes key) -> bool:
+        return _boolean_value(self.execute([b"PERSIST", key]))
 
     def execute(self, list[bytes] args) -> Reply:
         return self._exchange(args, True)
