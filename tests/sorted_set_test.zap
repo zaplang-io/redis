@@ -12,7 +12,10 @@ def server(bytes listener, list[Step] steps):
     auto socket = net.accept(listener)
     net.close_listener(listener)
     try:
+        auto index = 0
         for step in steps:
+            print("sorted fixture step " + str(index))
+            index = index + 1
             auto want = redis.encode_command(step.args)
             auto got = b""
             while len(got) < len(want):
