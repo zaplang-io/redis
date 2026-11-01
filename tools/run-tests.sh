@@ -13,7 +13,12 @@ for source in "$here"/tests/*_test.zap; do
         "$zap" ir "$build/$name.zap" > /dev/null
         echo "$name: frontend PASS"
     else
-        "$zap" run "$build/$name.zap" > "$build/actual"
+        if "$zap" run "$build/$name.zap" > "$build/actual"; then
+            :
+        else
+            cat "$build/actual"
+            exit 1
+        fi
         diff -u "$here/tests/$name.expected" "$build/actual"
         cat "$build/actual"
     fi
