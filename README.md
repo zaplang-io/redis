@@ -443,3 +443,51 @@ outside this slice; raw `execute` remains available.
 References: [HSET](https://redis.io/docs/latest/commands/hset/),
 [HMGET](https://redis.io/docs/latest/commands/hmget/),
 [HGETALL](https://redis.io/docs/latest/commands/hgetall/).
+
+## Non-blocking list commands
+
+These `Connection` helpers accept binary keys and elements:
+
+| Method | Result |
+| --- | --- |
+| `lpush(key, values)`, `rpush(key, values)` | `int64` new list length |
+| `lpop(key)`, `rpop(key)` | `Optional[bytes]` single head/tail element |
+| `llen(key)` | `int64` length, zero for a missing list |
+| `lrange(key, start, stop)` | `list[bytes]` in list order |
+| `lindex(key, index)` | `Optional[bytes]` element, None for missing/out-of-range |
+| `lset(key, index, value)` | `bool`, true for OK; missing/out-of-range raises |
+| `ltrim(key, start, stop)` | `bool`, true for OK, including a missing list |
+
+```zap
+conn.rpush(b"queue", [b"first", b"second"])
+conn.lpush(b"queue", [b"a", b"b"])
+# The list is now [b"b", b"a", b"first", b"second"].
+auto last = conn.lindex(b"queue", -1)
+auto tail = conn.lrange(b"queue", -2, -1)
+conn.ltrim(b"queue", 0, 1)  # retain the first two elements
+```
+
+Pushes require a nonempty `list[bytes]`; an empty list raises `ValueError`
+before network I/O. LPUSH inserts each supplied element at the head, so their
+order is reversed in the resulting list. RPUSH appends in supplied order.
+Empty byte elements are valid and pop/index results distinguish Some(b"")
+from None. Pops use only the single-element form; no count argument is sent.
+
+Indexes are signed `int64`, zero-based from the head; -1 is the last element.
+LRANGE and LTRIM have **inclusive** stop indexes. Bounds are passed directly to
+Redis, which clips ranges to the available elements. An empty selected range
+returns an empty LRANGE result or removes the list with LTRIM. The final pop
+also removes the list key. LSET errors for missing keys or out-of-range indexes
+remain `ResponseError`; all helpers preserve WRONGTYPE errors and server bytes
+in `last_error()`.
+
+LRANGE validates a non-null array of non-null bulk elements. Unexpected typed
+replies raise `ProtocolError` after consuming the complete frame, following the
+same connection recovery contract as other helpers. No command is replayed.
+Blocking list operations are tracked separately in #15, and depend on core
+cancellation/deadline support. This slice adds no blocking command or multi-pop
+variant; raw `execute` remains available for unsupported commands.
+
+References: [LPUSH](https://redis.io/docs/latest/commands/lpush/),
+[LRANGE](https://redis.io/docs/latest/commands/lrange/),
+[LSET](https://redis.io/docs/latest/commands/lset/).
