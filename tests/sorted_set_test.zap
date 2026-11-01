@@ -12,10 +12,7 @@ def server(bytes listener, list[Step] steps):
     auto socket = net.accept(listener)
     net.close_listener(listener)
     try:
-        auto index = 0
         for step in steps:
-            print("sorted fixture step " + str(index))
-            index = index + 1
             auto want = redis.encode_command(step.args)
             auto got = b""
             while len(got) < len(want):
@@ -114,9 +111,9 @@ def main():
     steps.append(Step([b"PING"], b"+PONG\r\n"))
     steps.append(Step([b"ZSCORE", b"k", b"v"], b"$7\r\n1e-9999\r\n"))
     steps.append(Step([b"PING"], b"+PONG\r\n"))
-    steps.append(Step([b"ZSCORE", b"k", b"v"], b"$1\r\n\x00\r\n"))
+    steps.append(Step([b"ZSCORE", b"k", b"v"], b"$1\r\n" + bytes([0]) + b"\r\n"))
     steps.append(Step([b"PING"], b"+PONG\r\n"))
-    steps.append(Step([b"ZSCORE", b"k", b"v"], b"$1\r\n\xff\r\n"))
+    steps.append(Step([b"ZSCORE", b"k", b"v"], b"$1\r\n" + bytes([255]) + b"\r\n"))
     steps.append(Step([b"PING"], b"+PONG\r\n"))
     steps.append(Step([b"ZSCORE", b"k", b"v"], b":1\r\n"))
     steps.append(Step([b"PING"], b"+PONG\r\n"))
