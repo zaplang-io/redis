@@ -8,8 +8,20 @@ permissions:
 jobs:
   codec:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     container: ghcr.io/zaplang-io/zap:latest
     steps:
       - uses: actions/checkout@v4
       - name: Execute codec and TCP tests
         run: sh tools/run-tests.sh
+      - name: Diagnose binary runtime failure
+        if: failure()
+        run: |
+          for workers in 1 2 4; do
+            echo "Binary transport with MAXPROCS=$workers"
+            MAXPROCS=$workers zap run tests/binary_transport_test.zap || true
+          done
+          echo "Binary transport with evacuation disabled"
+          ZAP_GC_NO_EVAC=1 zap run tests/binary_transport_test.zap || true
+          echo "Binary transport with AddressSanitizer"
+          ZAP_CC_EXTRA='-g -fsanitize=address -fno-omit-frame-pointer' ASAN_OPTIONS=detect_leaks=0 zap run tests/binary_transport_test.zap
