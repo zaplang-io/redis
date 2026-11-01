@@ -185,6 +185,142 @@ def _dial(str host, int64 port) -> bytes:
     except Exception as e:
         raise ConnectionError("Redis connect failed: " + e)
 
+# Public value configuration. connect_options snapshots this object, so later
+# caller mutations cannot change an established connection's reconnect policy.
+struct Options:
+    str host
+    int64 port
+    int64 database
+    str username
+    str password
+    str client_name
+    bool authenticate
+    int64 max_frame
+    int64 max_depth
+    int64 read_size
+
+# Diagnostics deliberately omit BOTH credentials, even when authentication is off.
+def describe_options(Options cfg) -> str:
+    auto host = cfg.host
+    if host.find(":") >= 0:
+        host = "[" + host + "]"
+    auto auth = ""
+    if cfg.authenticate or len(cfg.username) > 0 or len(cfg.password) > 0:
+        auth = "***@"
+    return "redis://" + auth + host + ":" + str(cfg.port) + "/" + str(cfg.database)
+
+def options(
+    str host = "127.0.0.1",
+    int64 port = 6379,
+    int64 database = 0,
+    str username = "",
+    str password = "",
+    str client_name = "",
+    bool authenticate = False,
+    int64 max_frame = 16777216,
+    int64 max_depth = 64,
+    int64 read_size = 4096,
+) -> Options:
+    if len(host) == 0 or port < 1 or port > 65535:
+        raise ValueError("invalid Redis host or port")
+    if host =~ m{[\x00-\x20\/@?#\[\]\x7f]}:
+        raise ValueError("invalid Redis host")
+    if database < 0 or database > 2147483647:
+        raise ValueError("invalid Redis database")
+    if max_frame < 3 or max_depth < 0 or read_size < 1 or read_size > 65536:
+        raise ValueError("invalid Redis connection limits")
+    if client_name !~ m/\A[\x21-\x7e]*\z/:
+        raise ValueError("invalid Redis client name")
+    auto auth = authenticate or len(username) > 0 or len(password) > 0
+    return Options(
+        host,
+        port,
+        database,
+        username,
+        password,
+        client_name,
+        auth,
+        max_frame,
+        max_depth,
+        read_size,
+    )
+
+def _unquote(str value) -> str:
+    if value !~ m/\A(?:[^%]|%[0-9A-Fa-f]{2})*\z/s:
+        raise ValueError("invalid Redis URL percent escape")
+    try:
+        return str(bytes(url.unquote(value)))
+    except Exception:
+        raise ValueError("invalid Redis URL UTF-8")
+
+def _uint(str value, int64 maximum) -> int64:
+    if value !~ m/\A[0-9]+\z/:
+        raise ValueError("invalid Redis URL number")
+    auto number = 0
+    try:
+        number = _number(bytes(value))
+    except ValueError:
+        raise ValueError("invalid Redis URL number")
+    if number > maximum:
+        raise ValueError("invalid Redis URL number")
+    return number
+
+# Named regex captures separate URL structure without decoding delimiters first.
+# Query db overrides path db; every supplied value is validated. Unsupported or
+# repeated query keys, fragments, and implicit TLS are rejected.
+def parse_url(str address) -> Options:
+    if address =~ m/[\x00-\x20\x7f]/:
+        raise ValueError("invalid Redis URL characters")
+    auto parsed = address =~ m{\Aredis:\/\/(?<authority>[^\/?#]*)(?:\/(?<database>[^?#]*))?(?:\?(?<query>[^#]*))?\z}
+    if not parsed:
+        raise ValueError("invalid Redis URL or unsupported scheme")
+    auto authority = parsed.group("authority")
+    auto endpoint = authority =~ m/\A(?:(?<username>[^:@]*):(?<password>[^@]*)@)?(?<host>\[[^\]]+\]|[^:\[\]@]*)(?::(?<port>[0-9]+))?\z/
+    if not endpoint:
+        raise ValueError("invalid Redis URL authority")
+    auto host = "127.0.0.1"
+    auto raw_host = bytes(endpoint.group("host"))
+    auto ipv6 = False
+    if len(raw_host) > 0:
+        if raw_host[0] == 91:
+            ipv6 = True
+            raw_host = raw_host[1:len(raw_host) - 1]
+        host = _unquote(str(raw_host))
+        if ipv6:
+            if host.find(":") < 0:
+                raise ValueError("invalid Redis URL IPv6 host")
+        elif host.find(":") >= 0:
+            raise ValueError("Redis URL IPv6 hosts require brackets")
+    auto port = 6379
+    if len(endpoint.group("port")) > 0:
+        port = _uint(endpoint.group("port"), 65535)
+    auto database = 0
+    if len(parsed.group("database")) > 0:
+        database = _uint(_unquote(parsed.group("database")), 2147483647)
+    auto username = _unquote(endpoint.group("username"))
+    auto password = _unquote(endpoint.group("password"))
+    auto authenticate = authority.find("@") >= 0
+    auto client_name = ""
+    if address.find("?") >= 0:
+        auto pairs = parsed.group("query").split("&")
+        dict[str, bool] seen = {}
+        for pair in pairs:
+            auto option = pair =~ m/\A(?<key>[^=]+)=(?<value>.*)\z/s
+            if not option:
+                raise ValueError("invalid Redis URL query option")
+            auto key = _unquote(option.group("key"))
+            auto value = _unquote(option.group("value"))
+            if key in seen:
+                raise ValueError("duplicate Redis URL query option")
+            seen[key] = True
+            if key == "db":
+                database = _uint(value, 2147483647)
+            elif key == "client_name":
+                client_name = value
+            else:
+                raise ValueError("unsupported Redis URL query option")
+    return options(host, port, database, username, password, client_name, authenticate)
+
 # One connection has one active owner. The atomic state protects both socket
 # access and the reply buffer: 0=idle, 1=owned, 2=closed. Sharing requires callers
 # to serialize access; a concurrent execute/disconnect is rejected, never queued.
@@ -195,8 +331,7 @@ struct Connection:
     int64 _max_frame
     int64 _max_depth
     int64 _read_size
-    str _host
-    int64 _port
+    Options _config
     bytes _last_error
 
     def is_closed(self) -> bool:
@@ -225,13 +360,49 @@ struct Connection:
         self._last_error = b""
         auto opened = False
         try:
-            self._socket = _dial(self._host, self._port)
+            self._socket = _dial(self._config.host, self._config.port)
+            self._initialize()
             opened = True
         finally:
             if opened:
                 self._state.store(0)
             else:
+                net.close_conn(self._socket)
+                self._buffer = b""
+                self._last_error = b""
                 self._state.store(2)
+
+    def _session_ok(self, list[bytes] args, str stage):
+        auto reply = self._wire_reply(encode_command(args))
+        match reply:
+            case Reply.Simple(data):
+                if data != b"OK":
+                    raise ProtocolError("Unexpected Redis session reply: " + stage)
+            case Reply.Error(data):
+                raise ResponseError("Redis session initialization failed: " + stage)
+            case _:
+                raise ProtocolError("Unexpected Redis session reply: " + stage)
+
+    def _initialize(self):
+        if self._config.authenticate:
+            if len(self._config.username) > 0:
+                self._session_ok(
+                    [
+                        b"AUTH",
+                        bytes(self._config.username),
+                        bytes(self._config.password),
+                    ],
+                    "AUTH",
+                )
+            else:
+                self._session_ok([b"AUTH", bytes(self._config.password)], "AUTH")
+        if self._config.database != 0:
+            self._session_ok([b"SELECT", bytes(str(self._config.database))], "SELECT")
+        if len(self._config.client_name) > 0:
+            self._session_ok(
+                [b"CLIENT", b"SETNAME", bytes(self._config.client_name)],
+                "CLIENT SETNAME",
+            )
 
     def execute(self, list[bytes] args) -> Reply:
         return self._exchange(args, True)
@@ -251,51 +422,16 @@ struct Connection:
             raise BusyError("Redis connection is in use")
         auto healthy = False
         try:
-            auto sent = 0
-            while sent < len(wire):
-                # Zap net.send writes all bytes today; retain the loop and the
-                # progress checks for transports that can return short writes.
-                auto n = 0
-                try:
-                    n = net.send(self._socket, wire[sent:len(wire)])
-                except Exception as e:
-                    raise ConnectionError("Redis send failed: " + e)
-                if n <= 0 or n > len(wire) - sent:
-                    raise ConnectionError("Redis command write made invalid progress")
-                sent = sent + n
-            while True:
-                auto result = decode(self._buffer, self._max_frame, self._max_depth)
-                if result.status == "ok":
-                    self._buffer = self._buffer[result.consumed:len(self._buffer)]
-                    healthy = True
-                    match result.value:
-                        case Reply.Error(data):
-                            self._last_error = data
-                            if raise_response_errors:
-                                raise ResponseError(_error_text(data))
-                        case _:
-                            return result.value
-                    return result.value
-                if result.status == "invalid":
-                    raise ProtocolError("Invalid Redis reply: " + result.message)
-                auto room = self._max_frame - len(self._buffer)
-                if room <= 0:
-                    raise ProtocolError("Redis reply exceeds byte limit")
-                auto count = self._read_size
-                if count > room:
-                    count = room
-                # net.recv returns an opaque length-prefixed str buffer. bytes()
-                # relabels it without UTF-8 decoding; do not call str(bytes).
-                auto chunk = b""
-                try:
-                    chunk = bytes(net.recv(self._socket, count))
-                except Exception as e:
-                    raise ConnectionError("Redis receive failed: " + e)
-                if len(chunk) == 0:
-                    if len(self._buffer) == 0:
-                        raise ConnectionError("Redis peer closed before replying")
-                    raise ConnectionError("Redis peer closed during a reply")
-                self._buffer = self._buffer + chunk
+            auto result = self._wire_reply(wire)
+            healthy = True
+            match result:
+                case Reply.Error(data):
+                    self._last_error = data
+                    if raise_response_errors:
+                        raise ResponseError(_error_text(data))
+                case _:
+                    return result
+            return result
         finally:
             if healthy:
                 self._state.store(0)
@@ -304,29 +440,113 @@ struct Connection:
                 self._buffer = b""
                 self._state.store(2)
 
-# Connect only after validating options. Limits bound each reply and the receive
-# buffer; read_size bounds individual reads, not the size of a Redis value.
+    # Caller holds the ownership state for the entire command/session setup.
+    def _wire_reply(self, bytes wire) -> Reply:
+        auto sent = 0
+        while sent < len(wire):
+            # Zap net.send writes all bytes today; retain the loop and the
+            # progress checks for transports that can return short writes.
+            auto n = 0
+            try:
+                n = net.send(self._socket, wire[sent:len(wire)])
+            except Exception as e:
+                raise ConnectionError("Redis send failed: " + e)
+            if n <= 0 or n > len(wire) - sent:
+                raise ConnectionError("Redis command write made invalid progress")
+            sent = sent + n
+        while True:
+            auto result = decode(self._buffer, self._max_frame, self._max_depth)
+            if result.status == "ok":
+                self._buffer = self._buffer[result.consumed:len(self._buffer)]
+                return result.value
+            if result.status == "invalid":
+                raise ProtocolError("Invalid Redis reply: " + result.message)
+            auto room = self._max_frame - len(self._buffer)
+            if room <= 0:
+                raise ProtocolError("Redis reply exceeds byte limit")
+            auto count = self._read_size
+            if count > room:
+                count = room
+            # net.recv returns an opaque length-prefixed str buffer. bytes()
+            # relabels it without UTF-8 decoding; do not call str(bytes).
+            auto chunk = b""
+            try:
+                chunk = bytes(net.recv(self._socket, count))
+            except Exception as e:
+                raise ConnectionError("Redis receive failed: " + e)
+            if len(chunk) == 0:
+                if len(self._buffer) == 0:
+                    raise ConnectionError("Redis peer closed before replying")
+                raise ConnectionError("Redis peer closed during a reply")
+            self._buffer = self._buffer + chunk
+
+# Snapshot and validate options before touching the network. Session setup is
+# performed with exclusive ownership and closes the socket on ANY failure.
+def connect_options(Options config) -> Connection:
+    auto cfg = options(
+        config.host,
+        config.port,
+        config.database,
+        config.username,
+        config.password,
+        config.client_name,
+        config.authenticate,
+        config.max_frame,
+        config.max_depth,
+        config.read_size,
+    )
+    auto socket = _dial(cfg.host, cfg.port)
+    Atomic[int64] state = Atomic(1)
+    auto conn = Connection(
+        socket,
+        b"",
+        state,
+        cfg.max_frame,
+        cfg.max_depth,
+        cfg.read_size,
+        cfg,
+        b"",
+    )
+    auto ready = False
+    try:
+        conn._initialize()
+        ready = True
+        return conn
+    finally:
+        if ready:
+            state.store(0)
+        else:
+            net.close_conn(socket)
+            state.store(2)
+
+# Preserve the existing positional host/port/parser-limit API, adding session
+# options as trailing arguments. An explicit authenticate=True supports AUTH "".
 def connect(
     str host = "127.0.0.1",
     int64 port = 6379,
     int64 max_frame = 16777216,
     int64 max_depth = 64,
     int64 read_size = 4096,
+    int64 database = 0,
+    str username = "",
+    str password = "",
+    str client_name = "",
+    bool authenticate = False,
 ) -> Connection:
-    if len(host) == 0 or port < 1 or port > 65535:
-        raise ValueError("invalid Redis host or port")
-    if max_frame < 3 or max_depth < 0 or read_size < 1 or read_size > 65536:
-        raise ValueError("invalid Redis connection limits")
-    auto socket = _dial(host, port)
-    Atomic[int64] state = Atomic(0)
-    return Connection(
-        socket,
-        b"",
-        state,
-        max_frame,
-        max_depth,
-        read_size,
-        host,
-        port,
-        b"",
+    return connect_options(
+        options(
+            host,
+            port,
+            database,
+            username,
+            password,
+            client_name,
+            authenticate,
+            max_frame,
+            max_depth,
+            read_size,
+        ),
     )
+
+def connect_url(str address) -> Connection:
+    return connect_options(parse_url(address))
