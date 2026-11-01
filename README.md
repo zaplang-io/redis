@@ -491,3 +491,48 @@ variant; raw `execute` remains available for unsupported commands.
 References: [LPUSH](https://redis.io/docs/latest/commands/lpush/),
 [LRANGE](https://redis.io/docs/latest/commands/lrange/),
 [LSET](https://redis.io/docs/latest/commands/lset/).
+
+## Set commands
+
+Set helpers use binary keys/members and retain Redis deduplication semantics:
+
+| Connection method | Result |
+| --- | --- |
+| `sadd(key, members)` | `int64` number of newly added members |
+| `srem(key, members)` | `int64` number of members removed |
+| `sismember(key, member)` | `bool`, whether the member exists |
+| `scard(key)` | `int64` cardinality, zero for a missing set |
+| `smembers(key)` | `list[bytes]` members, in unspecified order |
+| `spop(key)` | `Optional[bytes]` one removed member, None for a missing/empty set |
+| `sunion(keys)` | `list[bytes]` union of the sets |
+| `sinter(keys)` | `list[bytes]` intersection of the sets |
+| `sdiff(keys)` | `list[bytes]` first set minus every following set |
+
+```zap
+conn.sadd(b"first", [b"shared", b"first-only", b"shared"])
+conn.sadd(b"second", [b"shared", b"second-only"])
+auto common = conn.sinter([b"first", b"second"])
+auto only_first = conn.sdiff([b"first", b"second"])
+```
+
+All array results are unordered; compare membership rather than list positions.
+SADD/SREM require a nonempty member list, and set algebra requires at least one
+key. Empty argument lists raise `ValueError` before network I/O. Duplicate
+members are sent unchanged and Redis counts actual additions/removals. Empty
+bytes are valid members and remain distinct from a nil SPOP result.
+
+Missing keys act as empty sets. SDIFF respects input key order; the other
+algebra operations do not promise an output order. These helpers read their
+operands without storing a destination set. Removing/popping the final member
+removes the key. SPOP uses only the single-member form with no count argument;
+its result is chosen by Redis, with no promise of a particular random member.
+
+Wrong key types raise `ResponseError`, preserving the raw server error through
+`last_error()`. Array replies must be non-null arrays of non-null bulk strings;
+unexpected types raise `ProtocolError` after consuming the complete frame.
+The existing connection recovery and no-replay contracts apply. SSCAN belongs
+to #14; count-based SPOP and STORE variants remain available via raw `execute`.
+
+References: [SADD](https://redis.io/docs/latest/commands/sadd/),
+[SPOP](https://redis.io/docs/latest/commands/spop/),
+[SDIFF](https://redis.io/docs/latest/commands/sdiff/).
