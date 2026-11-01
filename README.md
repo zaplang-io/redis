@@ -154,6 +154,8 @@ malformed-frame cleanup, rejection of an untrusted chain, and rejection of a
 trusted certificate for the wrong hostname. Linux CI also checks descriptor
 counts across repeated failed handshakes. It needs no external Redis server.
 `tools/run-tls-tests.sh --check` only checks the frontend and needs no certificates.
+Runtime suites require GNU `timeout` (`coreutils` on macOS supplies `gtimeout`)
+and fail after 60 seconds, with forced termination five seconds later.
 
 ## Errors and explicit reconnect
 

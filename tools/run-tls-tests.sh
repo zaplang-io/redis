@@ -11,6 +11,15 @@ build=$(mktemp -d "${TMPDIR:-/tmp}/redis-tls-tests.XXXXXX")
 trap 'rm -rf "$build"' EXIT HUP INT TERM
 cp "$here/src/redis.zap" "$build/redis.zap"
 if [ "${1:-}" != --check ]; then
+    # Bound native parked-I/O failures outside Zap's pending deadline support.
+    if command -v timeout > /dev/null 2>&1; then
+        timeout_command=timeout
+    elif command -v gtimeout > /dev/null 2>&1; then
+        timeout_command=gtimeout
+    else
+        echo 'TLS runtime tests require GNU timeout (coreutils on macOS)' >&2
+        exit 2
+    fi
     sh "$here/tools/generate-tls-fixture.sh" "$build/certs"
     REDIS_TLS_TEST_CERTS="$build/certs"
     SSL_CERT_FILE="$build/certs/ca.pem"
@@ -25,7 +34,7 @@ for source in "$here"/tests/tls/*_test.zap; do
         "$zap" ir "$build/$name.zap" > /dev/null
         echo "$name: frontend PASS"
     else
-        if "$zap" run "$build/$name.zap" > "$build/actual"; then
+        if "$timeout_command" -k 5s 60s "$zap" run "$build/$name.zap" > "$build/actual"; then
             if ! diff -u "$here/tests/tls/$name.expected" "$build/actual"; then
                 failed=1
             fi
