@@ -41,6 +41,7 @@ def main():
             other.disconnect()
 
         # Limit the generated user to this run's namespace and explicit commands.
+        created = True
         integration_fixtures.simple(
             admin.execute(
                 [
@@ -123,6 +124,7 @@ def main():
     try:
         integration_fixtures.missing(
             verifier.execute([b"ACL", b"GETUSER", bytes(username)]),
+            "deleted ACL user",
         )
     finally:
         verifier.disconnect()

@@ -96,12 +96,12 @@ def bulk(redis.Reply reply, bytes want):
         case _:
             raise ValueError("expected bulk reply")
 
-def missing(redis.Reply reply):
+def missing(redis.Reply reply, str label = "missing-key null"):
     match reply:
         case redis.Reply.NullBulk:
             return
         case _:
-            raise ValueError("expected missing-key null")
+            raise ValueError("expected " + label)
 
 def integer(redis.Reply reply) -> int64:
     match reply:
