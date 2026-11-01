@@ -20,8 +20,6 @@ def main():
         match reply:
             case redis.Reply.Bulk(data):
                 print(str(data))
-            case redis.Reply.Error(data):
-                print("Redis error: " + str(data))
             case _:
                 print("unexpected reply")
     finally:
@@ -31,20 +29,22 @@ def main():
 `connect()` returns an open `Connection`. `execute(list[bytes]) -> Reply` sends
 one command and reads one complete RESP2 reply. Reads preserve arbitrary bytes;
 fragmented replies are assembled and surplus bytes retained for the next reply.
-Redis server errors currently return `Reply.Error`; typed exceptions are a later
-slice. Empty commands raise `ValueError` before touching the socket.
+A top-level Redis server error raises `redis.ResponseError`. Use
+`execute_raw(list[bytes])` to receive `Reply.Error` values instead. Nested errors
+inside arrays remain values in either API. Empty commands raise `ValueError`
+before touching the socket.
 
 Use `disconnect()` to close the connection (Zap reserves the word `close`). It
 is idempotent when idle or already closed. `is_closed()` reports whether it has
 been closed. One active operation owns the connection: overlapping `execute` or
-`disconnect` calls raise `RuntimeError` instead of queuing or sharing replies.
+`disconnect`/`reconnect` calls raise `redis.BusyError` instead of queuing or
+sharing replies.
 The connection fields and direct construction are internal; use `connect()`.
 
 Transport failures, EOF before a complete reply, and invalid framing close the
 connection and discard buffered bytes. Commands are never automatically retried.
-A failed operation might already have executed on the server. There is no
-reconnect, authentication, pooling, TLS, or configurable deadline in this slice;
-these have separate backlog issues. Use a dedicated connection for stateful
+A failed operation might already have executed on the server. Authentication,
+pooling, TLS, and configurable deadlines have separate backlog issues. Use a dedicated connection for stateful
 commands and manage its lifetime with `try/finally`.
 
 `max_frame` (default 16 MiB) and `max_depth` (default 64) apply to each incoming
@@ -52,6 +52,47 @@ reply. The receive buffer is bounded by `max_frame`; outgoing command size is
 not limited by this option. `read_size` (default 4096, valid range 1–65536) controls
 read chunk size. Large values work across multiple reads. Host, port, and limits
 are validated before connecting.
+
+## Errors and explicit reconnect
+
+- `redis.ResponseError`: a complete top-level server error. Its UTF-8 message is
+  preserved verbatim, including its prefix (WRONGTYPE, NOAUTH, ERR, or an unknown
+  future prefix). The connection remains usable.
+- `redis.ProtocolError`: invalid or oversized RESP framing. The connection is
+  closed and its reply buffer discarded.
+- `redis.ConnectionError`: connect/send/receive failure, EOF before a complete
+  reply, or use after close. The connection is closed after I/O failures.
+- `redis.BusyError`: another operation owns the connection. The owner proceeds
+  unchanged; the rejected operation does not touch its socket or buffer.
+- `ValueError`: invalid local arguments. The existing connection is unchanged.
+
+Zap's `except Error as message` binds a string. `conn.last_error()` retains the
+exact bytes of the most recently consumed top-level server error, including
+non-UTF-8 payloads. Success preserves it; another server error replaces it and
+reconnect clears it. `redis.error_prefix(raw)` returns the bytes before the
+first ASCII space. Non-UTF-8 server errors use a lossless hex exception message.
+Use `execute_raw()` when response errors should be handled as values directly.
+
+```zap
+try:
+    conn.execute([b"GET", b"a-list-key"])
+except redis.ResponseError as message:
+    print(message)
+    print(str(redis.error_prefix(conn.last_error())))
+except redis.ConnectionError as message:
+    print(message)
+    conn.reconnect()
+    # Start a new operation explicitly. The failed command is never replayed.
+```
+
+`conn.reconnect()` closes the old socket, discards all old-session reply bytes,
+and connects again with the original host, port, and parser limits. It works on
+an idle or closed connection. A failed reconnect leaves the connection closed;
+a later explicit reconnect can try again. It cannot run during another operation.
+Reconnecting creates a fresh Redis session: database selection, authentication,
+WATCH/MULTI state, subscriptions, and other session state are not restored by
+this slice. Callers must decide how to recover after an ambiguously executed
+operation. Cancellation propagates and the socket is closed during cleanup.
 
 ## Codec
 
@@ -119,7 +160,7 @@ docker run --rm -v "$PWD":/work -w /work ghcr.io/zaplang-io/zap:latest \
 A frontend-only installation can check parsing, types, and IR lowering with
 `ZAP=/path/to/zap tools/run-tests.sh --check`; this does not execute tests.
 The suite uses real module imports and needs no Redis server or Python runtime.
-Transport tests start loopback fake servers and cover one-byte reads, 64 KiB
+Transport and error tests start loopback fake servers and cover one-byte reads, 64 KiB
 binary commands/replies, coalesced frames, EOF, malformed/oversized replies,
 connection reuse, exclusive ownership, and cleanup. Zap net.send currently
 handles partial OS writes internally; the client also checks write progress.
