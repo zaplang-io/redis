@@ -17,14 +17,12 @@ def peer(bytes listener, channel[int64] entered, Atomic[int64] released):
         net.close_conn(socket)
 
 def reader(
-    int64 port,
+    bytes socket,
     Atomic[int64] completed,
     Atomic[int64] cancelled,
     Atomic[int64] cleaned,
 ):
-    auto socket = net.connect("127.0.0.1", port)
     try:
-        net.send(socket, b"x")
         auto reply = net.recv(socket, 1)
         completed.store(1)
     except Cancelled:
@@ -42,14 +40,18 @@ def main():
     Atomic[int64] cancelled = Atomic(0)
     Atomic[int64] cleaned = Atomic(0)
     spawn peer(listener, entered, released)
+    auto socket = net.connect("127.0.0.1", port)
+    net.send(socket, b"x")
+    auto started = <-entered
     auto timed_out = False
     auto start = time.monotonic_ns()
     try:
         scope(timeout=100):
-            spawn reader(port, completed, cancelled, cleaned)
-            auto started = <-entered
+            spawn reader(socket, completed, cancelled, cleaned)
     except ScopeTimeout:
         timed_out = True
+    finally:
+        net.close_conn(socket)
     auto elapsed = (time.monotonic_ns() - start) // 1000000
     print("requested_deadline_ms=100")
     print("scope_elapsed_ms=" + str(elapsed))
@@ -64,5 +66,7 @@ def main():
         raise ValueError("reader failed to clean up")
     if released.load() == 1:
         print("TCP_CANCEL=blocked-until-peer-release")
-    else:
+    elif cancelled.load() == 1 and completed.load() == 0:
         print("TCP_CANCEL=interruptible")
+    else:
+        raise ValueError("unexpected cancellation outcome")
