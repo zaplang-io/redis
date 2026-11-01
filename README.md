@@ -339,3 +339,60 @@ works; it cannot substitute for interruptible I/O.
 
 See [the deadline capability audit](docs/deadlines.md) for the reproducer,
 upstream prerequisites, and the acceptance checks required before #7 can close.
+
+## Typed key and string commands
+
+These `Connection` methods use RESP2 and accept keys/values as `bytes`:
+
+| Method | Result |
+| --- | --- |
+| `ping()` | `bool`, true for PONG |
+| `get(key)` | `Optional[bytes]`; None for missing, Some(b"") for empty |
+| `set_value(key, value, nx=False, xx=False, ex=0, px=0)` | `bool`: written or condition not met |
+| `mget(keys)` | `list[Optional[bytes]]` in input order, including duplicates |
+| `mset(pairs)` | `bool`, true for OK; pairs are `redis.KeyValue(key, value)` |
+| `delete(keys)`, `unlink(keys)` | `int64` number removed |
+| `exists(keys)` | `int64` count; duplicate existing keys count repeatedly |
+| `key_type(key)` | `bytes` status, e.g. b"string" or b"none" |
+| `incr(key)`, `decr(key)` | `int64` new value |
+| `incrby(key, amount)`, `decrby(key, amount)` | `int64` new value; signed amounts allowed |
+| `expire(key, seconds)`, `pexpire(key, milliseconds)` | `bool`, whether expiration was applied |
+| `ttl(key)`, `pttl(key)` | `int64` remaining seconds/milliseconds, -1 for no expiry, -2 for missing |
+| `persist(key)` | `bool`, whether an expiration was removed |
+
+Zap reserves `set`, so SET uses `set_value`; DEL uses `delete` and TYPE uses
+`key_type`. SET supports only NX/XX and EX/PX in this slice. Expiry arguments are `int64` durations, with zero meaning omitted, for example:
+
+```zap
+auto lifetime = 60
+auto written = conn.set_value(b"key", b"value", nx=True, ex=lifetime)
+auto result = conn.get(b"key")
+match result:
+    case Optional.Some(data):
+        print(str(data))  # explicit UTF-8 conversion; may raise on binary data
+    case _:
+        print("missing")
+```
+
+NX and XX conflict, EX and PX conflict, and negative SET expiry durations are rejected. Zero omits that expiry option;
+a positive value sends EX or PX.
+Invalid combinations and empty multi-key/pair lists raise `ValueError` before
+network I/O. EXPIRE/PEXPIRE retain Redis semantics: zero or negative durations
+delete existing keys immediately. SET GET, KEEPTTL, absolute expirations, and
+conditional EXPIRE flags remain available through `execute`.
+
+MGET returns None for both absent and non-string keys, as Redis specifies;
+GET on a non-string key raises `ResponseError`. MSET accepts a nonempty ordered
+list of pairs and follows Redis overwrite/expiry semantics. Counter overflow
+and non-integer values raise `ResponseError` without replaying the command.
+No helper implicitly converts payload bytes to text.
+
+Helpers validate reply shapes and raise `ProtocolError` for unexpected types,
+status values, MGET lengths, or non-boolean integer flags. A complete valid
+RESP frame has already been consumed in these cases; the connection remains
+usable. Transport/framing failures still invalidate the connection as described
+above. Helpers inherit the connection's single-owner contract.
+
+References: [SET](https://redis.io/docs/latest/commands/set/),
+[MGET](https://redis.io/docs/latest/commands/mget/),
+[TTL](https://redis.io/docs/latest/commands/ttl/).
