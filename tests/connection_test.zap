@@ -198,24 +198,24 @@ def invalid_options():
     check(rejected == 7, "options rejected before network access")
 
 def main():
-    print("start options")
+    io.write(2, "start options\n")
     invalid_options()
-    print("start binary round trip")
+    io.write(2, "start binary round trip\n")
     round_trip(bytes([0, 255, 13, 10, 128]), 1)
     auto large = bytes([0, 255, 13, 10])
     auto i = 0
     while i < 14:
         large = large + large
         i = i + 1
-    print("start large round trip")
+    io.write(2, "start large round trip\n")
     round_trip(large, 4096)
-    print("start coalesced")
+    io.write(2, "start coalesced\n")
     coalesced()
-    print("start EOF tests")
+    io.write(2, "start EOF tests\n")
     failure(b"", True, 4096, "before replying")
     failure(b"$5\r\nab", True, 4096, "during a reply")
     failure(b"?", False, 4096, "unknown RESP2 type")
     failure(b"$100\r\n", False, 32, "exceeds byte limit")
-    print("start ownership")
+    io.write(2, "start ownership\n")
     exclusive_owner()
     print("TCP connection: PASS")

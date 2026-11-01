@@ -1,7 +1,1 @@
-start options
-start binary round trip
-start large round trip
-start coalesced
-start EOF tests
-start ownership
 TCP connection: PASS
