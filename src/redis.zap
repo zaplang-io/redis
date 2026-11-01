@@ -375,6 +375,16 @@ def _required_bulk(Reply reply) -> bytes:
         case _:
             raise ProtocolError("Expected Redis non-null bulk reply")
 
+def _bulk_array(Reply reply) -> list[bytes]:
+    match reply:
+        case Reply.Array(items):
+            list[bytes] values = []
+            for item in items:
+                values.append(_required_bulk(item))
+            return values
+        case _:
+            raise ProtocolError("Expected Redis non-null bulk array reply")
+
 def _hash_command(bytes name, bytes key, list[bytes] fields) -> list[bytes]:
     if len(fields) == 0:
         raise ValueError("Redis hash field list must not be empty")
@@ -721,6 +731,41 @@ struct Connection:
             self.execute([b"LTRIM", key, bytes(str(start)), bytes(str(stop))]),
             b"OK",
         )
+
+    def _set_members(self, bytes command, bytes key, list[bytes] members) -> int64:
+        if len(members) == 0:
+            raise ValueError("Redis set mutation requires at least one member")
+        list[bytes] args = [command, key]
+        for member in members:
+            args.append(member)
+        return _integer_value(self.execute(args))
+
+    def sadd(self, bytes key, list[bytes] members) -> int64:
+        return self._set_members(b"SADD", key, members)
+
+    def srem(self, bytes key, list[bytes] members) -> int64:
+        return self._set_members(b"SREM", key, members)
+
+    def sismember(self, bytes key, bytes member) -> bool:
+        return _boolean_value(self.execute([b"SISMEMBER", key, member]))
+
+    def scard(self, bytes key) -> int64:
+        return _integer_value(self.execute([b"SCARD", key]))
+
+    def smembers(self, bytes key) -> list[bytes]:
+        return _bulk_array(self.execute([b"SMEMBERS", key]))
+
+    def spop(self, bytes key) -> Optional[bytes]:
+        return _bulk_value(self.execute([b"SPOP", key]))
+
+    def sunion(self, list[bytes] keys) -> list[bytes]:
+        return _bulk_array(self.execute(_keys_command(b"SUNION", keys)))
+
+    def sinter(self, list[bytes] keys) -> list[bytes]:
+        return _bulk_array(self.execute(_keys_command(b"SINTER", keys)))
+
+    def sdiff(self, list[bytes] keys) -> list[bytes]:
+        return _bulk_array(self.execute(_keys_command(b"SDIFF", keys)))
 
     def execute(self, list[bytes] args) -> Reply:
         return self._exchange(args, True)
