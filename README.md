@@ -142,7 +142,9 @@ a later explicit reconnect can try again. It cannot run during another operation
 Reconnecting creates a fresh Redis session and reapplies the configured AUTH,
 SELECT, and client name. WATCH/MULTI state, subscriptions, and other session state
 are not restored. Callers must decide how to recover after an ambiguously executed
-operation. Cancellation propagates and the socket is closed during cleanup.
+operation. Cancellation that reaches the operation propagates and closes the
+socket during cleanup. The current runtime does not wake a TCP read merely
+because its enclosing scope was cancelled; see the deadline audit below.
 
 ## Codec
 
@@ -271,3 +273,15 @@ server or endpoint. Reusable setup/assertion/cleanup helpers live in
 directory with a matching `.expected` output file. Any suite that mutates ACLs
 or otherwise needs administrative isolation must explicitly require isolated
 mode and be selected accordingly in the runner.
+
+## Deadline support status
+
+Connection and total command deadlines ([#7](https://github.com/zaplang-io/redis/issues/7))
+are blocked by missing core socket primitives. No timeout options are currently
+exposed. A scope timeout alone does not interrupt the pinned runtime's parked
+TCP read: the bounded audit requested 100 ms but the scope drained only after
+the peer replied roughly one second later. Normal failure/EOF cleanup still
+works; it cannot substitute for interruptible I/O.
+
+See [the deadline capability audit](docs/deadlines.md) for the reproducer,
+upstream prerequisites, and the acceptance checks required before #7 can close.
