@@ -4,8 +4,54 @@ A pure-Zap Redis client, official non-core package. Tracks
 [zaplang-io/zap#322](https://github.com/zaplang-io/zap/issues/322).
 
 The first implementation slice ([#1](https://github.com/zaplang-io/redis/issues/1))
-is a binary-safe RESP2 wire codec. TCP connections and command helpers are not
-implemented yet.
+is a binary-safe RESP2 wire codec. The next slice ([#3](https://github.com/zaplang-io/redis/issues/3))
+adds a TCP connection and raw command execution. Typed command helpers are still
+planned.
+
+## TCP connection
+
+```zap
+import redis
+
+def main():
+    auto conn = redis.connect(host="127.0.0.1", port=6379)
+    try:
+        auto reply = conn.execute([b"ECHO", bytes("hello")])
+        match reply:
+            case redis.Reply.Bulk(data):
+                print(str(data))
+            case redis.Reply.Error(data):
+                print("Redis error: " + str(data))
+            case _:
+                print("unexpected reply")
+    finally:
+        conn.disconnect()
+```
+
+`connect()` returns an open `Connection`. `execute(list[bytes]) -> Reply` sends
+one command and reads one complete RESP2 reply. Reads preserve arbitrary bytes;
+fragmented replies are assembled and surplus bytes retained for the next reply.
+Redis server errors currently return `Reply.Error`; typed exceptions are a later
+slice. Empty commands raise `ValueError` before touching the socket.
+
+Use `disconnect()` to close the connection (Zap reserves the word `close`). It
+is idempotent when idle or already closed. `is_closed()` reports whether it has
+been closed. One active operation owns the connection: overlapping `execute` or
+`disconnect` calls raise `RuntimeError` instead of queuing or sharing replies.
+The connection fields and direct construction are internal; use `connect()`.
+
+Transport failures, EOF before a complete reply, and invalid framing close the
+connection and discard buffered bytes. Commands are never automatically retried.
+A failed operation might already have executed on the server. There is no
+reconnect, authentication, pooling, TLS, or configurable deadline in this slice;
+these have separate backlog issues. Use a dedicated connection for stateful
+commands and manage its lifetime with `try/finally`.
+
+`max_frame` (default 16 MiB) and `max_depth` (default 64) apply to each incoming
+reply. The receive buffer is bounded by `max_frame`; outgoing command size is
+not limited by this option. `read_size` (default 4096, valid range 1–65536) controls
+read chunk size. Large values work across multiple reads. Host, port, and limits
+are validated before connecting.
 
 ## Codec
 
@@ -73,6 +119,10 @@ docker run --rm -v "$PWD":/work -w /work ghcr.io/zaplang-io/zap:latest \
 A frontend-only installation can check parsing, types, and IR lowering with
 `ZAP=/path/to/zap tools/run-tests.sh --check`; this does not execute tests.
 The suite uses real module imports and needs no Redis server or Python runtime.
+Transport tests start loopback fake servers and cover one-byte reads, 64 KiB
+binary commands/replies, coalesced frames, EOF, malformed/oversized replies,
+connection reuse, exclusive ownership, and cleanup. Zap net.send currently
+handles partial OS writes internally; the client also checks write progress.
 
 ## Development
 

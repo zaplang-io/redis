@@ -149,3 +149,92 @@ def _parse(bytes data, int64 start, int64 limit, int64 depth) -> Decoded:
         pos = child.consumed
         i = i + 1
     return _ok(Reply.Array(items), pos)
+
+# One connection has one active owner. The atomic state protects both socket
+# access and the reply buffer: 0=idle, 1=owned, 2=closed. Sharing requires callers
+# to serialize access; a concurrent execute/disconnect is rejected, never queued.
+struct Connection:
+    bytes _socket
+    bytes _buffer
+    Atomic[int64] _state
+    int64 _max_frame
+    int64 _max_depth
+    int64 _read_size
+
+    def is_closed(self) -> bool:
+        return self._state.load() == 2
+
+    def disconnect(self):
+        if not self._state.compare_and_swap(0, 1):
+            if self._state.load() == 2:
+                return
+            raise RuntimeError("Redis connection is in use")
+        net.close_conn(self._socket)
+        self._buffer = b""
+        self._state.store(2)
+
+    # Server errors remain Reply.Error until the typed error layer is added.
+    # No automatic retry: a failed write/read may already have executed remotely.
+    def execute(self, list[bytes] args) -> Reply:
+        # Local argument failures do not damage or acquire the connection.
+        auto wire = encode_command(args)
+        if not self._state.compare_and_swap(0, 1):
+            if self._state.load() == 2:
+                raise RuntimeError("Redis connection is closed")
+            raise RuntimeError("Redis connection is in use")
+        auto healthy = False
+        try:
+            auto sent = 0
+            while sent < len(wire):
+                # Zap net.send writes all bytes today; retain the loop and the
+                # progress checks for transports that can return short writes.
+                auto n = net.send(self._socket, wire[sent:len(wire)])
+                if n <= 0 or n > len(wire) - sent:
+                    raise RuntimeError("Redis command write made invalid progress")
+                sent = sent + n
+            while True:
+                auto result = decode(self._buffer, self._max_frame, self._max_depth)
+                if result.status == "ok":
+                    self._buffer = self._buffer[result.consumed:len(self._buffer)]
+                    healthy = True
+                    return result.value
+                if result.status == "invalid":
+                    raise RuntimeError("Invalid Redis reply: " + result.message)
+                auto room = self._max_frame - len(self._buffer)
+                if room <= 0:
+                    raise RuntimeError("Redis reply exceeds byte limit")
+                auto count = self._read_size
+                if count > room:
+                    count = room
+                # net.recv returns an opaque length-prefixed str buffer. bytes()
+                # relabels it without UTF-8 decoding; do not call str(bytes).
+                auto chunk = bytes(net.recv(self._socket, count))
+                if len(chunk) == 0:
+                    if len(self._buffer) == 0:
+                        raise RuntimeError("Redis peer closed before replying")
+                    raise RuntimeError("Redis peer closed during a reply")
+                self._buffer = self._buffer + chunk
+        finally:
+            if healthy:
+                self._state.store(0)
+            else:
+                net.close_conn(self._socket)
+                self._buffer = b""
+                self._state.store(2)
+
+# Connect only after validating options. Limits bound each reply and the receive
+# buffer; read_size bounds individual reads, not the size of a Redis value.
+def connect(
+    str host = "127.0.0.1",
+    int64 port = 6379,
+    int64 max_frame = 16777216,
+    int64 max_depth = 64,
+    int64 read_size = 4096,
+) -> Connection:
+    if len(host) == 0 or port < 1 or port > 65535:
+        raise ValueError("invalid Redis host or port")
+    if max_frame < 3 or max_depth < 0 or read_size < 1 or read_size > 65536:
+        raise ValueError("invalid Redis connection limits")
+    auto socket = net.connect(host, port)
+    Atomic[int64] state = Atomic(0)
+    return Connection(socket, b"", state, max_frame, max_depth, read_size)
