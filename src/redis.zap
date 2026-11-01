@@ -432,6 +432,106 @@ def _bulk_array(Reply reply) -> list[bytes]:
         case _:
             raise ProtocolError("Expected Redis non-null bulk array reply")
 
+def _hash_pairs(Reply reply) -> list[HashField]:
+    match reply:
+        case Reply.Array(items):
+            if len(items) % 2 != 0:
+                raise ProtocolError("Hash reply has an odd number of items")
+            list[HashField] fields = []
+            auto i = 0
+            while i < len(items):
+                fields.append(
+                    HashField(_required_bulk(items[i]), _required_bulk(items[i + 1])),
+                )
+                i = i + 2
+            return fields
+        case _:
+            raise ProtocolError("Expected hash field/value array reply")
+
+def _scored_members(Reply reply) -> list[ScoredMember]:
+    match reply:
+        case Reply.Array(items):
+            if len(items) % 2 != 0:
+                raise ProtocolError("Scored reply has an odd number of items")
+            list[ScoredMember] members = []
+            auto i = 0
+            while i < len(items):
+                members.append(
+                    ScoredMember(_required_bulk(items[i]), _score_value(items[i + 1])),
+                )
+                i = i + 2
+            return members
+        case _:
+            raise ProtocolError("Expected member/score array reply")
+
+# Cursors stay decimal bytes, never narrowed to signed machine integers.
+struct ScanPage:
+    bytes cursor
+    list[bytes] items
+
+    def done(self) -> bool:
+        return self.cursor == b"0"
+
+struct HashScanPage:
+    bytes cursor
+    list[HashField] fields
+
+    def done(self) -> bool:
+        return self.cursor == b"0"
+
+struct SortedScanPage:
+    bytes cursor
+    list[ScoredMember] members
+
+    def done(self) -> bool:
+        return self.cursor == b"0"
+
+struct _ScanReply:
+    bytes cursor
+    Reply payload
+
+def _valid_cursor(bytes cursor) -> bool:
+    if len(cursor) == 0:
+        return False
+    if cursor[0] == 48:
+        return len(cursor) == 1
+    auto i = 0
+    while i < len(cursor):
+        if cursor[i] < 48 or cursor[i] > 57:
+            return False
+        i = i + 1
+    return True
+
+def _scan_args(
+    list[bytes] args,
+    bytes cursor,
+    bytes pattern,
+    int64 count,
+) -> list[bytes]:
+    if not _valid_cursor(cursor):
+        raise ValueError("Scan cursor must be canonical unsigned decimal bytes")
+    if count < 0:
+        raise ValueError("Scan COUNT hint must not be negative")
+    args.append(cursor)
+    args.append(b"MATCH")
+    args.append(pattern)
+    if count > 0:
+        args.append(b"COUNT")
+        args.append(bytes(str(count)))
+    return args
+
+def _scan_reply(Reply reply) -> _ScanReply:
+    match reply:
+        case Reply.Array(items):
+            if len(items) != 2:
+                raise ProtocolError("Scan reply must contain cursor and page")
+            auto cursor = _required_bulk(items[0])
+            if not _valid_cursor(cursor):
+                raise ProtocolError("Invalid scan reply cursor")
+            return _ScanReply(cursor, items[1])
+        case _:
+            raise ProtocolError("Expected scan cursor/page array reply")
+
 def _hash_command(bytes name, bytes key, list[bytes] fields) -> list[bytes]:
     if len(fields) == 0:
         raise ValueError("Redis hash field list must not be empty")
@@ -698,23 +798,7 @@ struct Connection:
                 raise ProtocolError("Expected HMGET array reply")
 
     def hgetall(self, bytes key) -> list[HashField]:
-        match self.execute([b"HGETALL", key]):
-            case Reply.Array(items):
-                if len(items) % 2 != 0:
-                    raise ProtocolError("HGETALL reply has an odd number of items")
-                list[HashField] fields = []
-                auto i = 0
-                while i < len(items):
-                    fields.append(
-                        HashField(
-                            _required_bulk(items[i]),
-                            _required_bulk(items[i + 1]),
-                        ),
-                    )
-                    i = i + 2
-                return fields
-            case _:
-                raise ProtocolError("Expected HGETALL array reply")
+        return _hash_pairs(self.execute([b"HGETALL", key]))
 
     def hdel(self, bytes key, list[bytes] fields) -> int64:
         return _integer_value(self.execute(_hash_command(b"HDEL", key, fields)))
@@ -864,28 +948,58 @@ struct Connection:
         int64 start,
         int64 stop,
     ) -> list[ScoredMember]:
-        auto reply = self.execute(
-            [b"ZRANGE", key, bytes(str(start)), bytes(str(stop)), b"WITHSCORES"],
+        return _scored_members(
+            self.execute(
+                [b"ZRANGE", key, bytes(str(start)), bytes(str(stop)), b"WITHSCORES"],
+            ),
         )
-        match reply:
-            case Reply.Array(items):
-                if len(items) % 2 != 0:
-                    raise ProtocolError(
-                        "ZRANGE WITHSCORES reply has an odd number of items",
-                    )
-                list[ScoredMember] members = []
-                auto i = 0
-                while i < len(items):
-                    members.append(
-                        ScoredMember(
-                            _required_bulk(items[i]),
-                            _score_value(items[i + 1]),
-                        ),
-                    )
-                    i = i + 2
-                return members
-            case _:
-                raise ProtocolError("Expected ZRANGE WITHSCORES array reply")
+
+    def scan(
+        self,
+        bytes cursor = b"0",
+        bytes pattern = b"*",
+        int64 count = 0,
+    ) -> ScanPage:
+        auto page = _scan_reply(
+            self.execute(_scan_args([b"SCAN"], cursor, pattern, count)),
+        )
+        return ScanPage(page.cursor, _bulk_array(page.payload))
+
+    def hscan(
+        self,
+        bytes key,
+        bytes cursor = b"0",
+        bytes pattern = b"*",
+        int64 count = 0,
+    ) -> HashScanPage:
+        auto page = _scan_reply(
+            self.execute(_scan_args([b"HSCAN", key], cursor, pattern, count)),
+        )
+        return HashScanPage(page.cursor, _hash_pairs(page.payload))
+
+    def sscan(
+        self,
+        bytes key,
+        bytes cursor = b"0",
+        bytes pattern = b"*",
+        int64 count = 0,
+    ) -> ScanPage:
+        auto page = _scan_reply(
+            self.execute(_scan_args([b"SSCAN", key], cursor, pattern, count)),
+        )
+        return ScanPage(page.cursor, _bulk_array(page.payload))
+
+    def zscan(
+        self,
+        bytes key,
+        bytes cursor = b"0",
+        bytes pattern = b"*",
+        int64 count = 0,
+    ) -> SortedScanPage:
+        auto page = _scan_reply(
+            self.execute(_scan_args([b"ZSCAN", key], cursor, pattern, count)),
+        )
+        return SortedScanPage(page.cursor, _scored_members(page.payload))
 
     def execute(self, list[bytes] args) -> Reply:
         return self._exchange(args, True)
