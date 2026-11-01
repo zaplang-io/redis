@@ -26,9 +26,6 @@ def server(bytes listener, list[Step] steps):
 
 def invalid_options(redis.Connection conn):
     auto caught = 0
-    Optional[int64] zero = Optional.Some(0)
-    Optional[int64] negative = Optional.Some(-1)
-    Optional[int64] one = Optional.Some(1)
     list[bytes] no_keys = []
     list[redis.KeyValue] no_pairs = []
     try:
@@ -36,15 +33,15 @@ def invalid_options(redis.Connection conn):
     except ValueError:
         caught = caught + 1
     try:
-        conn.set_value(b"k", b"v", ex=zero)
+        conn.set_value(b"k", b"v", ex=-1)
     except ValueError:
         caught = caught + 1
     try:
-        conn.set_value(b"k", b"v", px=negative)
+        conn.set_value(b"k", b"v", px=-1)
     except ValueError:
         caught = caught + 1
     try:
-        conn.set_value(b"k", b"v", ex=one, px=one)
+        conn.set_value(b"k", b"v", ex=1, px=1)
     except ValueError:
         caught = caught + 1
     try:
@@ -106,11 +103,8 @@ def main():
         check(conn.ping(), "ping")
         check(conn.get(b"k").is_none(), "missing")
         check(conn.get(b"k").unwrap() == b"", "empty")
-        check(conn.set_value(b"k", b"v", nx=True, ex=Optional.Some(60)), "SET EX NX")
-        check(
-            not conn.set_value(b"k", b"v", xx=True, px=Optional.Some(1000)),
-            "SET PX XX",
-        )
+        check(conn.set_value(b"k", b"v", nx=True, ex=60), "SET EX NX")
+        check(not conn.set_value(b"k", b"v", xx=True, px=1000), "SET PX XX")
         auto values = conn.mget([b"a", b"b"])
         check(values[0].unwrap() == b"v" and values[1].is_none(), "MGET")
         check(

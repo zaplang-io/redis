@@ -501,26 +501,22 @@ struct Connection:
         bytes value,
         bool nx = False,
         bool xx = False,
-        Optional[int64] ex = None,
-        Optional[int64] px = None,
+        int64 ex = 0,
+        int64 px = 0,
     ) -> bool:
         if nx and xx:
             raise ValueError("SET NX and XX are mutually exclusive")
         list[bytes] args = [b"SET", key, value]
-        if ex.is_some() and px.is_some():
+        if ex < 0 or px < 0:
+            raise ValueError("SET expiry durations must not be negative")
+        if ex > 0 and px > 0:
             raise ValueError("SET EX and PX are mutually exclusive")
-        if ex.is_some():
-            auto seconds = ex.unwrap()
-            if seconds <= 0:
-                raise ValueError("SET EX must be positive")
+        if ex > 0:
             args.append(b"EX")
-            args.append(bytes(str(seconds)))
-        if px.is_some():
-            auto milliseconds = px.unwrap()
-            if milliseconds <= 0:
-                raise ValueError("SET PX must be positive")
+            args.append(bytes(str(ex)))
+        if px > 0:
             args.append(b"PX")
-            args.append(bytes(str(milliseconds)))
+            args.append(bytes(str(px)))
         if nx:
             args.append(b"NX")
         if xx:

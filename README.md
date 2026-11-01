@@ -348,7 +348,7 @@ These `Connection` methods use RESP2 and accept keys/values as `bytes`:
 | --- | --- |
 | `ping()` | `bool`, true for PONG |
 | `get(key)` | `Optional[bytes]`; None for missing, Some(b"") for empty |
-| `set_value(key, value, nx=False, xx=False, ex=None, px=None)` | `bool`: written or condition not met |
+| `set_value(key, value, nx=False, xx=False, ex=0, px=0)` | `bool`: written or condition not met |
 | `mget(keys)` | `list[Optional[bytes]]` in input order, including duplicates |
 | `mset(pairs)` | `bool`, true for OK; pairs are `redis.KeyValue(key, value)` |
 | `delete(keys)`, `unlink(keys)` | `int64` number removed |
@@ -361,11 +361,10 @@ These `Connection` methods use RESP2 and accept keys/values as `bytes`:
 | `persist(key)` | `bool`, whether an expiration was removed |
 
 Zap reserves `set`, so SET uses `set_value`; DEL uses `delete` and TYPE uses
-`key_type`. SET supports only NX/XX and EX/PX in this slice. Expiry arguments
-are `Optional[int64]`, for example:
+`key_type`. SET supports only NX/XX and EX/PX in this slice. Expiry arguments are `int64` durations, with zero meaning omitted, for example:
 
 ```zap
-Optional[int64] lifetime = Optional.Some(60)
+auto lifetime = 60
 auto written = conn.set_value(b"key", b"value", nx=True, ex=lifetime)
 auto result = conn.get(b"key")
 match result:
@@ -375,7 +374,8 @@ match result:
         print("missing")
 ```
 
-NX and XX conflict, EX and PX conflict, and SET expirations must be positive.
+NX and XX conflict, EX and PX conflict, and negative SET expiry durations are rejected. Zero omits that expiry option;
+a positive value sends EX or PX.
 Invalid combinations and empty multi-key/pair lists raise `ValueError` before
 network I/O. EXPIRE/PEXPIRE retain Redis semantics: zero or negative durations
 delete existing keys immediately. SET GET, KEEPTTL, absolute expirations, and
