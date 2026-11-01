@@ -673,6 +673,55 @@ struct Connection:
             self.execute([b"HINCRBY", key, field, bytes(str(amount))]),
         )
 
+    def _list_push(self, bytes command, bytes key, list[bytes] values) -> int64:
+        if len(values) == 0:
+            raise ValueError("Redis list push requires at least one element")
+        list[bytes] args = [command, key]
+        for value in values:
+            args.append(value)
+        return _integer_value(self.execute(args))
+
+    def lpush(self, bytes key, list[bytes] values) -> int64:
+        return self._list_push(b"LPUSH", key, values)
+
+    def rpush(self, bytes key, list[bytes] values) -> int64:
+        return self._list_push(b"RPUSH", key, values)
+
+    def lpop(self, bytes key) -> Optional[bytes]:
+        return _bulk_value(self.execute([b"LPOP", key]))
+
+    def rpop(self, bytes key) -> Optional[bytes]:
+        return _bulk_value(self.execute([b"RPOP", key]))
+
+    def llen(self, bytes key) -> int64:
+        return _integer_value(self.execute([b"LLEN", key]))
+
+    def lrange(self, bytes key, int64 start, int64 stop) -> list[bytes]:
+        auto reply = self.execute([b"LRANGE", key, bytes(str(start)), bytes(str(stop))])
+        match reply:
+            case Reply.Array(items):
+                list[bytes] values = []
+                for item in items:
+                    values.append(_required_bulk(item))
+                return values
+            case _:
+                raise ProtocolError("Expected LRANGE array reply")
+
+    def lindex(self, bytes key, int64 index) -> Optional[bytes]:
+        return _bulk_value(self.execute([b"LINDEX", key, bytes(str(index))]))
+
+    def lset(self, bytes key, int64 index, bytes value) -> bool:
+        return _status_value(
+            self.execute([b"LSET", key, bytes(str(index)), value]),
+            b"OK",
+        )
+
+    def ltrim(self, bytes key, int64 start, int64 stop) -> bool:
+        return _status_value(
+            self.execute([b"LTRIM", key, bytes(str(start)), bytes(str(stop))]),
+            b"OK",
+        )
+
     def execute(self, list[bytes] args) -> Reply:
         return self._exchange(args, True)
 
