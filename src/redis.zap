@@ -363,6 +363,26 @@ struct KeyValue:
     bytes key
     bytes value
 
+# Hash fields stay separate from keys, with no implicit text conversion.
+struct HashField:
+    bytes field
+    bytes value
+
+def _required_bulk(Reply reply) -> bytes:
+    match reply:
+        case Reply.Bulk(data):
+            return data
+        case _:
+            raise ProtocolError("Expected Redis non-null bulk reply")
+
+def _hash_command(bytes name, bytes key, list[bytes] fields) -> list[bytes]:
+    if len(fields) == 0:
+        raise ValueError("Redis hash field list must not be empty")
+    list[bytes] args = [name, key]
+    for field in fields:
+        args.append(field)
+    return args
+
 def _bulk_value(Reply reply) -> Optional[bytes]:
     match reply:
         case Reply.Bulk(data):
@@ -594,6 +614,64 @@ struct Connection:
 
     def persist(self, bytes key) -> bool:
         return _boolean_value(self.execute([b"PERSIST", key]))
+
+    def hset(self, bytes key, list[HashField] fields) -> int64:
+        if len(fields) == 0:
+            raise ValueError("HSET field/value list must not be empty")
+        list[bytes] args = [b"HSET", key]
+        for entry in fields:
+            args.append(entry.field)
+            args.append(entry.value)
+        return _integer_value(self.execute(args))
+
+    def hget(self, bytes key, bytes field) -> Optional[bytes]:
+        return _bulk_value(self.execute([b"HGET", key, field]))
+
+    def hmget(self, bytes key, list[bytes] fields) -> list[Optional[bytes]]:
+        auto reply = self.execute(_hash_command(b"HMGET", key, fields))
+        match reply:
+            case Reply.Array(items):
+                if len(items) != len(fields):
+                    raise ProtocolError("HMGET reply length differs from field count")
+                list[Optional[bytes]] values = []
+                for item in items:
+                    values.append(_bulk_value(item))
+                return values
+            case _:
+                raise ProtocolError("Expected HMGET array reply")
+
+    def hgetall(self, bytes key) -> list[HashField]:
+        match self.execute([b"HGETALL", key]):
+            case Reply.Array(items):
+                if len(items) % 2 != 0:
+                    raise ProtocolError("HGETALL reply has an odd number of items")
+                list[HashField] fields = []
+                auto i = 0
+                while i < len(items):
+                    fields.append(
+                        HashField(
+                            _required_bulk(items[i]),
+                            _required_bulk(items[i + 1]),
+                        ),
+                    )
+                    i = i + 2
+                return fields
+            case _:
+                raise ProtocolError("Expected HGETALL array reply")
+
+    def hdel(self, bytes key, list[bytes] fields) -> int64:
+        return _integer_value(self.execute(_hash_command(b"HDEL", key, fields)))
+
+    def hexists(self, bytes key, bytes field) -> bool:
+        return _boolean_value(self.execute([b"HEXISTS", key, field]))
+
+    def hlen(self, bytes key) -> int64:
+        return _integer_value(self.execute([b"HLEN", key]))
+
+    def hincrby(self, bytes key, bytes field, int64 amount) -> int64:
+        return _integer_value(
+            self.execute([b"HINCRBY", key, field, bytes(str(amount))]),
+        )
 
     def execute(self, list[bytes] args) -> Reply:
         return self._exchange(args, True)
