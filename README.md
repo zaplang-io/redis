@@ -3,10 +3,9 @@
 A pure-Zap Redis client, official non-core package. Tracks
 [zaplang-io/zap#322](https://github.com/zaplang-io/zap/issues/322).
 
-The first implementation slice ([#1](https://github.com/zaplang-io/redis/issues/1))
-is a binary-safe RESP2 wire codec. The next slice ([#3](https://github.com/zaplang-io/redis/issues/3))
-adds a TCP connection and raw command execution. Typed command helpers are still
-planned.
+The package includes a binary-safe RESP2 codec, TCP connections, typed errors,
+explicit reconnect, URL configuration, and session initialization. Typed command
+helpers are still planned.
 
 ## TCP connection
 
@@ -43,8 +42,8 @@ The connection fields and direct construction are internal; use `connect()`.
 
 Transport failures, EOF before a complete reply, and invalid framing close the
 connection and discard buffered bytes. Commands are never automatically retried.
-A failed operation might already have executed on the server. Authentication,
-pooling, TLS, and configurable deadlines have separate backlog issues. Use a dedicated connection for stateful
+A failed operation might already have executed on the server. Pooling, TLS, and
+configurable deadlines have separate backlog issues. Use a dedicated connection for stateful
 commands and manage its lifetime with `try/finally`.
 
 `max_frame` (default 16 MiB) and `max_depth` (default 64) apply to each incoming
@@ -52,6 +51,57 @@ reply. The receive buffer is bounded by `max_frame`; outgoing command size is
 not limited by this option. `read_size` (default 4096, valid range 1–65536) controls
 read chunk size. Large values work across multiple reads. Host, port, and limits
 are validated before connecting.
+
+## Connection options and URLs
+
+```zap
+# Direct options; nonempty credentials enable authentication automatically.
+auto conn = redis.connect(host="localhost", port=6379, database=2,
+    username="alice", password="secret", client_name="worker-1")
+
+# Options can be parsed/validated without opening a socket.
+auto cfg = redis.parse_url("redis://alice:p%40ss@localhost:6379/1?db=2&client_name=worker-1")
+print(redis.describe_options(cfg))  # redis://***@localhost:6379/2
+# Close each live connection with disconnect() in a try/finally.
+```
+
+`redis.options(...) -> Options` provides host, port, database, username, password,
+client_name, authenticate, max_frame, max_depth, and read_size. Use
+`redis.connect_options(cfg)` to connect; it takes a validated snapshot, so later
+mutations of `cfg` cannot change reconnect behavior. The existing first five
+positional arguments to `connect()` (host, port, max_frame, max_depth, read_size)
+remain compatible; session options are trailing keyword arguments.
+
+`connect_url(address)` connects using `parse_url(address)`. The supported form is
+`redis://[[username]:password@]host[:port][/db][?db=N&client_name=NAME]`.
+Defaults are 127.0.0.1:6379, database 0, and no authentication. IPv6 addresses use
+brackets, for example `redis://[::1]:6379/2`. Credentials use percent-encoding;
+`+` is literal, not a space. Decoded text must be valid UTF-8. Password-only URLs
+use `redis://:password@host`; `redis://:@host` explicitly sends an empty password.
+Direct options can request this with `authenticate=True`.
+
+URL parsing uses Zap's `=~`/`!~` regex operators and named capture groups. The
+query `db` takes precedence over the path database; all supplied values are
+validated. There is no implicit merge with a second options object: parse the
+URL, edit the returned options explicitly if needed, then call connect_options.
+Unknown/duplicate query keys, fragments, malformed escapes, invalid ports or
+databases, and unescaped whitespace/control characters are rejected. `rediss://`
+is rejected until TLS support lands. Client names must contain printable ASCII
+without spaces. Databases must be nonnegative int32 values; the server validates
+that the configured database actually exists.
+
+A new session sends AUTH (password-only or ACL username/password), SELECT for a
+nonzero database, then optional CLIENT SETNAME. The same sequence runs on every
+explicit reconnect, under exclusive ownership. Every step requires a simple
+`OK`; any server, framing, or I/O failure closes the new socket. Initialization
+error messages identify only the failed stage; server replies that could echo
+credentials are not retained in last_error(). General command error handling
+continues to preserve raw server messages as documented below.
+
+Use `describe_options()` for diagnostics; it omits both credentials. Avoid logging
+the input URL, password field, or AUTH command arguments yourself. Session tests
+use deterministic loopback protocol fixtures; the planned live-Redis harness
+adds server-version and database-isolation interoperability checks separately.
 
 ## Errors and explicit reconnect
 
@@ -89,9 +139,9 @@ except redis.ConnectionError as message:
 and connects again with the original host, port, and parser limits. It works on
 an idle or closed connection. A failed reconnect leaves the connection closed;
 a later explicit reconnect can try again. It cannot run during another operation.
-Reconnecting creates a fresh Redis session: database selection, authentication,
-WATCH/MULTI state, subscriptions, and other session state are not restored by
-this slice. Callers must decide how to recover after an ambiguously executed
+Reconnecting creates a fresh Redis session and reapplies the configured AUTH,
+SELECT, and client name. WATCH/MULTI state, subscriptions, and other session state
+are not restored. Callers must decide how to recover after an ambiguously executed
 operation. Cancellation propagates and the socket is closed during cleanup.
 
 ## Codec
