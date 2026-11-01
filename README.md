@@ -536,3 +536,61 @@ to #14; count-based SPOP and STORE variants remain available via raw `execute`.
 References: [SADD](https://redis.io/docs/latest/commands/sadd/),
 [SPOP](https://redis.io/docs/latest/commands/spop/),
 [SDIFF](https://redis.io/docs/latest/commands/sdiff/).
+
+## Sorted-set commands
+
+`redis.ScoredMember(member, score)` pairs binary member bytes with a `float64`
+score. These `Connection` helpers use basic ZADD and rank-based ZRANGE forms:
+
+| Method | Result |
+| --- | --- |
+| `zadd(key, members)` | `int64` newly added members; score updates do not count |
+| `zrem(key, members)` | `int64` members removed |
+| `zcard(key)` | `int64` cardinality, zero for a missing set |
+| `zscore(key, member)` | `Optional[float64]`, None for a missing key/member |
+| `zincrby(key, member, amount)` | `float64` new score; creates missing key/member |
+| `zrank(key, member)`, `zrevrank(key, member)` | `Optional[int64]` zero-based forward/reverse rank |
+| `zrange(key, start, stop)` | `list[bytes]` in ascending score/rank order |
+| `zrange_withscores(key, start, stop)` | `list[redis.ScoredMember]`, using WITHSCORES |
+
+```zap
+conn.zadd(b"scores", [redis.ScoredMember(b"Ada", 1.5), redis.ScoredMember(b"Lin", 2.0)])
+conn.zincrby(b"scores", b"Ada", 1.0)
+auto rank = conn.zrank(b"scores", b"Ada")
+for entry in conn.zrange_withscores(b"scores", 0, -1):
+    print(str(entry.member))  # explicit text conversion for known UTF-8 data
+    print(entry.score)
+```
+
+ZADD and ZREM require nonempty lists; empty lists raise `ValueError` before
+network I/O. Duplicate ZADD members are sent in order and the final score wins.
+Scores use `format(score, ".17g")` for float64 round trips, rather than the
+shorter display precision of `str(float)`. Positive/negative infinity are
+supported as `math.inf`/`-math.inf` and sent as `inf`/`-inf`. NaN inputs raise
+`ValueError` locally, including a NaN later in a multi-member request. A valid
+increment whose result would be NaN is rejected by Redis as `ResponseError`.
+
+Score replies accept decimal/exponent notation and explicit `inf`, `+inf`, or
+`-inf`. Invalid UTF-8, whitespace, hexadecimal forms, NaN, trailing data,
+overflowing decimal values, and nonzero values that underflow to zero raise
+`ProtocolError`. Finite scores retain float64 precision, including subnormals;
+zero is a present score, distinct from None.
+
+Ranges use signed rank bounds with an **inclusive** stop. Negative ranks count
+from the end (-1 is the last member), and Redis clips out-of-range bounds.
+Equal scores use binary lexicographic member ordering; reverse ranks reverse
+that order too. Missing members have no rank/score, while missing or empty
+ranges return empty lists. Removing the final member removes the key.
+
+WITHSCORES replies must contain an even-length non-null array of alternating
+non-null bulk member/score strings. Helpers validate malformed shapes and
+negative ranks, and use the existing complete-frame reply recovery contract.
+Wrong key types remain `ResponseError` with raw bytes in `last_error()`.
+Commands are never replayed automatically.
+
+This slice does not expose ZADD NX/XX/GT/LT/CH/INCR options or ZRANGE
+BYSCORE/BYLEX/REV/LIMIT options. ZRANK WITHSCORE and ZSCAN are also outside this
+API; use raw `execute` for other forms. Cursor iteration is tracked in #14.
+
+References: [ZADD](https://redis.io/docs/latest/commands/zadd/),
+[ZRANGE](https://redis.io/docs/latest/commands/zrange/).

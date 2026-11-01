@@ -368,6 +368,53 @@ struct HashField:
     bytes field
     bytes value
 
+# Float64 scores use round-trip formatting, independently of str(float)'s
+# display precision. Members never undergo text conversion.
+struct ScoredMember:
+    bytes member
+    float64 score
+
+def _score_argument(float64 score) -> bytes:
+    if math.isnan(score):
+        raise ValueError("Redis sorted-set scores must not be NaN")
+    if math.isinf(score):
+        if score < 0.0:
+            return b"-inf"
+        return b"inf"
+    return bytes(format(score, ".17g"))
+
+def _score_value(Reply reply) -> float64:
+    auto raw = _required_bulk(reply)
+    auto text = ""
+    try:
+        text = str(raw)
+    except Exception:
+        raise ProtocolError("Redis score is not UTF-8 decimal text")
+    if text == "inf" or text == "+inf":
+        return math.inf
+    if text == "-inf":
+        return -math.inf
+    if text !~ m/\A[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\z/:
+        raise ProtocolError("Invalid Redis score syntax")
+    # Validate before float(): malformed conversions abort in the pinned core.
+    auto value = float(text)
+    if math.isinf(value) or math.isnan(value):
+        raise ProtocolError("Redis score is outside float64 range")
+    if value == 0.0 and text !~ m/\A[+-]?(?:0+(?:\.0*)?|\.0+)(?:[eE][+-]?[0-9]+)?\z/:
+        raise ProtocolError("Redis score underflows float64")
+    return value
+
+def _rank_value(Reply reply) -> Optional[int64]:
+    match reply:
+        case Reply.NullBulk:
+            return None
+        case Reply.Integer(value):
+            if value < 0:
+                raise ProtocolError("Redis rank must not be negative")
+            return Optional.Some(value)
+        case _:
+            raise ProtocolError("Expected Redis integer or null rank reply")
+
 def _required_bulk(Reply reply) -> bytes:
     match reply:
         case Reply.Bulk(data):
@@ -766,6 +813,79 @@ struct Connection:
 
     def sdiff(self, list[bytes] keys) -> list[bytes]:
         return _bulk_array(self.execute(_keys_command(b"SDIFF", keys)))
+
+    def zadd(self, bytes key, list[ScoredMember] members) -> int64:
+        if len(members) == 0:
+            raise ValueError("ZADD requires at least one score/member pair")
+        list[bytes] args = [b"ZADD", key]
+        for entry in members:
+            args.append(_score_argument(entry.score))
+            args.append(entry.member)
+        return _integer_value(self.execute(args))
+
+    def zrem(self, bytes key, list[bytes] members) -> int64:
+        if len(members) == 0:
+            raise ValueError("ZREM requires at least one member")
+        list[bytes] args = [b"ZREM", key]
+        for member in members:
+            args.append(member)
+        return _integer_value(self.execute(args))
+
+    def zcard(self, bytes key) -> int64:
+        return _integer_value(self.execute([b"ZCARD", key]))
+
+    def zscore(self, bytes key, bytes member) -> Optional[float64]:
+        auto reply = self.execute([b"ZSCORE", key, member])
+        match reply:
+            case Reply.NullBulk:
+                return None
+            case _:
+                return Optional.Some(_score_value(reply))
+
+    def zincrby(self, bytes key, bytes member, float64 amount) -> float64:
+        return _score_value(
+            self.execute([b"ZINCRBY", key, _score_argument(amount), member]),
+        )
+
+    def zrank(self, bytes key, bytes member) -> Optional[int64]:
+        return _rank_value(self.execute([b"ZRANK", key, member]))
+
+    def zrevrank(self, bytes key, bytes member) -> Optional[int64]:
+        return _rank_value(self.execute([b"ZREVRANK", key, member]))
+
+    def zrange(self, bytes key, int64 start, int64 stop) -> list[bytes]:
+        return _bulk_array(
+            self.execute([b"ZRANGE", key, bytes(str(start)), bytes(str(stop))]),
+        )
+
+    def zrange_withscores(
+        self,
+        bytes key,
+        int64 start,
+        int64 stop,
+    ) -> list[ScoredMember]:
+        auto reply = self.execute(
+            [b"ZRANGE", key, bytes(str(start)), bytes(str(stop)), b"WITHSCORES"],
+        )
+        match reply:
+            case Reply.Array(items):
+                if len(items) % 2 != 0:
+                    raise ProtocolError(
+                        "ZRANGE WITHSCORES reply has an odd number of items",
+                    )
+                list[ScoredMember] members = []
+                auto i = 0
+                while i < len(items):
+                    members.append(
+                        ScoredMember(
+                            _required_bulk(items[i]),
+                            _score_value(items[i + 1]),
+                        ),
+                    )
+                    i = i + 2
+                return members
+            case _:
+                raise ProtocolError("Expected ZRANGE WITHSCORES array reply")
 
     def execute(self, list[bytes] args) -> Reply:
         return self._exchange(args, True)
