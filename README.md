@@ -396,3 +396,50 @@ above. Helpers inherit the connection's single-owner contract.
 References: [SET](https://redis.io/docs/latest/commands/set/),
 [MGET](https://redis.io/docs/latest/commands/mget/),
 [TTL](https://redis.io/docs/latest/commands/ttl/).
+
+## Typed hash commands
+
+Hash helpers accept binary keys, fields, and values. `redis.HashField(field,
+value)` represents a field/value pair without text conversion.
+
+| Connection method | Result |
+| --- | --- |
+| `hset(key, fields)` | `int64` number of newly added fields; updates do not count |
+| `hget(key, field)` | `Optional[bytes]`; None for missing key/field, Some(b"") for empty |
+| `hmget(key, fields)` | `list[Optional[bytes]]` in requested order, including duplicates |
+| `hgetall(key)` | `list[redis.HashField]`, retaining field/value associations |
+| `hdel(key, fields)` | `int64` number of fields removed |
+| `hexists(key, field)` | `bool`, whether the field exists |
+| `hlen(key)` | `int64` field count; zero for a missing hash |
+| `hincrby(key, field, amount)` | `int64` new field value; signed increments allowed |
+
+```zap
+conn.hset(b"profile", [redis.HashField(b"name", b"Ada"), redis.HashField(b"note", b"")])
+auto values = conn.hmget(b"profile", [b"note", b"missing", b"name"])
+for entry in conn.hgetall(b"profile"):
+    print(str(entry.field))  # explicit text conversion when the data is UTF-8
+```
+
+HSET accepts a nonempty ordered list of pairs, including repeated fields;
+Redis applies the assignments in order. HMGET and HDEL require nonempty field
+lists. Empty requests raise `ValueError` before network I/O. Empty byte fields
+and values are valid. Missing hashes yield an empty HGETALL list; Redis removes
+a hash when its last field is deleted. HGETALL ordering is unspecified, so
+callers should locate fields by their bytes rather than list position.
+
+HINCRBY creates missing hashes/fields with an initial value of zero before
+applying the increment. Invalid integers, overflow, and operations on keys of
+the wrong type raise `ResponseError` and retain the server error bytes through
+`last_error()`. Commands are not retried automatically.
+
+HGETALL requires a non-null RESP2 array containing an even number of non-null
+bulk strings. Odd lengths, nulls, and incorrectly typed fields/values raise
+`ProtocolError`. HMGET also checks result count and element types. These complete
+frames have already been consumed, so the connection remains usable under the
+same typed-reply validation contract as the key/string helpers. Transport and
+RESP framing errors still invalidate it. HSCAN and hash field expiration are
+outside this slice; raw `execute` remains available.
+
+References: [HSET](https://redis.io/docs/latest/commands/hset/),
+[HMGET](https://redis.io/docs/latest/commands/hmget/),
+[HGETALL](https://redis.io/docs/latest/commands/hgetall/).
