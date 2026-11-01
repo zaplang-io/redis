@@ -24,4 +24,4 @@ jobs:
           echo "Binary transport with evacuation disabled"
           ZAP_GC_NO_EVAC=1 zap run tests/binary_transport_test.zap || true
           echo "Binary transport with AddressSanitizer"
-          ZAP_CC_EXTRA='-g -fsanitize=address -fno-omit-frame-pointer' ASAN_OPTIONS=detect_leaks=0 zap run tests/binary_transport_test.zap
+          ZAP_CC=gcc ZAP_CC_EXTRA='-g -fsanitize=address -fno-omit-frame-pointer' ASAN_OPTIONS=detect_leaks=0 zap run tests/binary_transport_test.zap
