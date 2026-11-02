@@ -594,3 +594,65 @@ API; use raw `execute` for other forms. Cursor iteration is tracked in #14.
 
 References: [ZADD](https://redis.io/docs/latest/commands/zadd/),
 [ZRANGE](https://redis.io/docs/latest/commands/zrange/).
+
+## Cursor-based scan pages
+
+Each scan method fetches **one page** and keeps its cursor as opaque decimal
+`bytes`, so cursors above signed-int64 range round-trip without truncation.
+Start at `b"0"`, process each returned page, and stop only when `page.done()`
+is true (its cursor is exactly `b"0"`). An empty page may still be nonterminal;
+a terminal page may still contain results.
+
+| Connection method | Result |
+| --- | --- |
+| `scan(cursor=b"0", pattern=b"*", count=0)` | `redis.ScanPage` with `.cursor` and `.items: list[bytes]` keys |
+| `hscan(key, cursor=b"0", pattern=b"*", count=0)` | `redis.HashScanPage` with `.cursor` and `.fields: list[HashField]` |
+| `sscan(key, cursor=b"0", pattern=b"*", count=0)` | `redis.ScanPage` with `.cursor` and `.items: list[bytes]` members |
+| `zscan(key, cursor=b"0", pattern=b"*", count=0)` | `redis.SortedScanPage` with `.cursor` and `.members: list[ScoredMember]` |
+
+All page types provide `done()`. Hash values and sorted-set scores use the same
+validated representations as HGETALL and ZRANGE WITHSCORES. ZSCAN page members
+are **not** guaranteed to appear in score order.
+
+```zap
+auto cursor = b"0"
+auto pages = 0
+while pages < 100:
+    auto page = conn.scan(cursor, pattern=b"application:*", count=100)
+    for key in page.items:
+        # Process this page here; no whole-database collection is required.
+        print(str(key))  # explicit conversion only for known UTF-8 keys
+    pages = pages + 1
+    cursor = page.cursor
+    if page.done():
+        break
+# If cursor is nonzero after the budget, retain it to resume this same scan.
+```
+
+MATCH is always sent, defaulting to `b"*"`; patterns and results remain binary.
+An empty pattern is sent unchanged. Positive `count` sends COUNT, zero omits
+it, and negative hints raise `ValueError` locally. COUNT is a **work hint**,
+not a page-size limit: Redis may return fewer, more, or no entries. Existing
+RESP byte/depth limits still apply to individual replies.
+
+Cursors must contain canonical unsigned decimal ASCII bytes (`b"0"` or a
+nonzero first digit followed by digits). Invalid local cursors raise
+`ValueError` before I/O. Tokens are not converted to integers or incremented;
+Redis determines their numeric range. Resume with the returned cursor for the
+same scan family/key and database; cursors are not portable positions or
+snapshot bookmarks.
+
+Scanning is not a snapshot. Results may repeat, and changes during a scan have
+Redis's documented weak guarantees. Consumers that require uniqueness must
+handle duplicates themselves. Pages preserve duplicates without collecting,
+filtering, or sorting the entire dataset. Missing hashes/sets/sorted sets yield
+empty terminal pages. Wrong key types remain `ResponseError`.
+
+Malformed outer arrays, cursors, payload types, hash pairs, or member/score
+pairs raise `ProtocolError` after consuming the complete frame. The existing
+reply recovery/no-replay contract applies. This page API issues SCAN commands;
+it does not use KEYS. No eager collect-all or implicit iterator is provided.
+SCAN TYPE and HSCAN NOVALUES are outside this slice; use raw `execute` for
+those options.
+
+Reference: [Redis SCAN family and guarantees](https://redis.io/docs/latest/commands/scan/).
