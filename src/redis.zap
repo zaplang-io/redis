@@ -17,17 +17,29 @@ struct Decoded:
     int64 consumed
     str message
 
+# Balanced concatenation bounds copying to O(total bytes * log(fragment count))
+# instead of repeatedly copying the entire growing command for each argument.
+def _join_bytes(list[bytes] parts, int64 start, int64 stop) -> bytes:
+    if stop <= start:
+        return b""
+    if stop - start == 1:
+        return parts[start]
+    auto middle = start + (stop - start) // 2
+    return _join_bytes(parts, start, middle) + _join_bytes(parts, middle, stop)
+
 # Encode command + arguments as an array of bulk strings (not inline commands).
 def encode_command(list[bytes] args) -> bytes:
     if len(args) == 0:
         raise ValueError("a Redis command must have at least one argument")
-    auto out = bytes("*" + str(len(args)) + "\r\n")
+    list[bytes] parts = [bytes("*" + str(len(args)) + "\r\n")]
     auto i = 0
     while i < len(args):
         bytes arg = args[i]
-        out = out + bytes("$" + str(len(arg)) + "\r\n") + arg + b"\r\n"
+        parts.append(bytes("$" + str(len(arg)) + "\r\n"))
+        parts.append(arg)
+        parts.append(b"\r\n")
         i = i + 1
-    return out
+    return _join_bytes(parts, 0, len(parts))
 
 def _incomplete() -> Decoded:
     return Decoded("incomplete", Reply.NullBulk, 0, "")
@@ -75,7 +87,7 @@ def _number(bytes raw) -> int64:
 # coalesced buffer may exceed max_frame if its first reply fits within it.
 # max_depth counts nested non-null arrays (a scalar needs depth zero).
 def decode(bytes data, int64 max_frame = 16777216, int64 max_depth = 64) -> Decoded:
-    if max_frame < 3 or max_depth < 0:
+    if max_frame < 3 or max_depth < 0 or max_depth > 64:
         return _invalid("invalid decoder limits")
     return _parse(data, 0, max_frame, max_depth)
 
@@ -253,7 +265,7 @@ def options(
         raise ValueError("invalid Redis host")
     if database < 0 or database > 2147483647:
         raise ValueError("invalid Redis database")
-    if max_frame < 3 or max_depth < 0 or read_size < 1 or read_size > 65536:
+    if max_frame < 3 or max_depth < 0 or max_depth > 64 or read_size < 1 or read_size > 65536:
         raise ValueError("invalid Redis connection limits")
     if client_name !~ m/\A[\x21-\x7e]*\z/:
         raise ValueError("invalid Redis client name")
@@ -578,6 +590,58 @@ def _keys_command(bytes name, list[bytes] keys) -> list[bytes]:
     for key in keys:
         args.append(key)
     return args
+
+def _validate_sha(bytes sha):
+    if len(sha) != 40:
+        raise ValueError("Redis script SHA must contain 40 hexadecimal bytes")
+    auto i = 0
+    while i < len(sha):
+        auto c = sha[i]
+        if not (c >= 48 and c <= 57 or c >= 97 and c <= 102 or c >= 65 and c <= 70):
+            raise ValueError("Redis script SHA must contain 40 hexadecimal bytes")
+        i = i + 1
+
+def _script_command(
+    bytes name,
+    bytes script,
+    list[bytes] keys,
+    list[bytes] arguments,
+) -> list[bytes]:
+    list[bytes] command = [name, script, bytes(str(len(keys)))]
+    for key in keys:
+        command.append(key)
+    for argument in arguments:
+        command.append(argument)
+    return command
+
+# A registered script never retries transport/protocol errors or ordinary server
+# errors. An explicit NOSCRIPT means EVALSHA did not execute the script.
+struct RegisteredScript:
+    bytes _source
+    bytes _sha
+
+    def sha(self) -> bytes:
+        return self._sha
+
+    def run(
+        self,
+        Connection connection,
+        list[bytes] keys,
+        list[bytes] arguments,
+    ) -> Reply:
+        auto result = connection.execute_raw(
+            _script_command(b"EVALSHA", self._sha, keys, arguments),
+        )
+        match result:
+            case Reply.Error(data):
+                if error_prefix(data) == b"NOSCRIPT":
+                    return connection.eval(self._source, keys, arguments)
+                raise ResponseError(_error_text(data))
+            case _:
+                return result
+
+def register_script(bytes source) -> RegisteredScript:
+    return RegisteredScript(source, bytes(crypto.sha1(source)))
 
 # One connection has one active owner. The atomic state protects both socket
 # access and the reply buffer: 0=idle, 1=owned, 2=closed. Sharing requires callers
@@ -1000,6 +1064,43 @@ struct Connection:
             self.execute(_scan_args([b"ZSCAN", key], cursor, pattern, count)),
         )
         return SortedScanPage(page.cursor, _scored_members(page.payload))
+
+    def eval(self, bytes source, list[bytes] keys, list[bytes] arguments) -> Reply:
+        return self.execute(_script_command(b"EVAL", source, keys, arguments))
+
+    def evalsha(self, bytes sha, list[bytes] keys, list[bytes] arguments) -> Reply:
+        _validate_sha(sha)
+        return self.execute(_script_command(b"EVALSHA", sha, keys, arguments))
+
+    def script_load(self, bytes source) -> bytes:
+        auto sha = _required_bulk(self.execute([b"SCRIPT", b"LOAD", source]))
+        try:
+            _validate_sha(sha)
+        except ValueError:
+            raise ProtocolError("SCRIPT LOAD returned an invalid SHA")
+        if sha != bytes(crypto.sha1(source)):
+            raise ProtocolError("SCRIPT LOAD SHA differs from source digest")
+        return sha
+
+    def script_exists(self, list[bytes] shas) -> list[bool]:
+        if len(shas) == 0:
+            raise ValueError("SCRIPT EXISTS requires at least one SHA")
+        list[bytes] args = [b"SCRIPT", b"EXISTS"]
+        for sha in shas:
+            _validate_sha(sha)
+            args.append(sha)
+        match self.execute(args):
+            case Reply.Array(items):
+                if len(items) != len(shas):
+                    raise ProtocolError(
+                        "SCRIPT EXISTS result count differs from SHA count",
+                    )
+                list[bool] exists = []
+                for item in items:
+                    exists.append(_boolean_value(item))
+                return exists
+            case _:
+                raise ProtocolError("Expected SCRIPT EXISTS array reply")
 
     def execute(self, list[bytes] args) -> Reply:
         return self._exchange(args, True)
