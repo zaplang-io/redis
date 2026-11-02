@@ -59,7 +59,7 @@ def invalid(bytes data):
     check(result.consumed == 0 and len(result.message) > 0, "malformed diagnostic")
 
 def depth_worker(bytes frame, channel[bool] done):
-    done <- redis.decode(frame, max_depth=256).status == "ok"
+    done <- redis.decode(frame, max_depth=64).status == "ok"
 
 def main():
     auto seed = 322
@@ -107,15 +107,15 @@ def main():
         if result.status != "ok":
             check(result.consumed == 0, "fuzz failure consumes nothing")
     auto deep = b"+x\r\n"
-    for i in range(0, 256):
+    for i in range(0, 64):
         deep = b"*1\r\n" + deep
-    check(redis.decode(deep, max_depth=256).status == "ok", "safe maximum depth")
+    check(redis.decode(deep, max_depth=64).status == "ok", "safe maximum depth")
     auto done = channel[bool]()
     spawn depth_worker(deep, done)
     check(<-done, "maximum depth on default coroutine stack")
-    check(redis.decode(deep, max_depth=255).status == "invalid", "nested depth limit")
+    check(redis.decode(deep, max_depth=63).status == "invalid", "nested depth limit")
     check(
-        redis.decode(deep, max_depth=257).status == "invalid",
+        redis.decode(deep, max_depth=65).status == "invalid",
         "unsafe configured depth rejected",
     )
     auto wide = b"*2048\r\n"

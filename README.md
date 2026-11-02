@@ -699,7 +699,7 @@ The deterministic RESP2 suite uses seed 322 for generated valid trees, every
 proper prefix, arbitrary byte inputs, hostile headers, wide/deep arrays, and
 fragmented binary bulk strings. Live tests compare generated nested Lua replies
 from Redis with the decoder's representation. Decoder/connection `max_depth`
-is now restricted to 0–256 (default 64), keeping recursive parsing within a
+is now restricted to 0–64 (default 64), keeping recursive parsing within a
 fixed stack budget. `decode` returns an invalid diagnostic for unsupported
 limits; connection options raise `ValueError` before connecting.
 

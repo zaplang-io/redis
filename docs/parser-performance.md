@@ -53,7 +53,12 @@ than hiding that limitation behind the frame-size bound.
 The fixed-seed corpus uses recurrence `(seed * 251 + 13849) % 65521`, seed 322.
 It covers 256 generated valid reply trees, all their proper prefixes and
 coalesced next replies, unknown-tag mutations, 512 arbitrary byte strings,
-int64 overflow/invalid lengths/CRLF cases, a 256-level array, 2048-element wide
+int64 overflow/invalid lengths/CRLF cases, a 64-level array on both native and coroutine stacks, 2048-element wide
 arrays, and a 64 KiB binary bulk string fragmented every 257 bytes. Live Redis
 uses 64 generated nested Lua replies as a differential oracle. Tests assert
 structural equality, diagnostics, consumption bounds, and resource limits.
+
+Depth 256 passed on the native main stack but failed on the pinned runtime's
+128 KiB default coroutine stack in CI run #54. The supported maximum is therefore
+64, matching the existing default, with a regression at that limit on both
+stacks. Larger configured depths are rejected before recursive parsing.

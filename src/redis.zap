@@ -87,7 +87,7 @@ def _number(bytes raw) -> int64:
 # coalesced buffer may exceed max_frame if its first reply fits within it.
 # max_depth counts nested non-null arrays (a scalar needs depth zero).
 def decode(bytes data, int64 max_frame = 16777216, int64 max_depth = 64) -> Decoded:
-    if max_frame < 3 or max_depth < 0 or max_depth > 256:
+    if max_frame < 3 or max_depth < 0 or max_depth > 64:
         return _invalid("invalid decoder limits")
     return _parse(data, 0, max_frame, max_depth)
 
@@ -265,7 +265,7 @@ def options(
         raise ValueError("invalid Redis host")
     if database < 0 or database > 2147483647:
         raise ValueError("invalid Redis database")
-    if max_frame < 3 or max_depth < 0 or max_depth > 256 or read_size < 1 or read_size > 65536:
+    if max_frame < 3 or max_depth < 0 or max_depth > 64 or read_size < 1 or read_size > 65536:
         raise ValueError("invalid Redis connection limits")
     if client_name !~ m/\A[\x21-\x7e]*\z/:
         raise ValueError("invalid Redis client name")
