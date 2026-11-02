@@ -21,11 +21,34 @@ in 128-byte increments. `decode` remains stateless: repeated prefixes reparse
 and reallocate prior array elements. Connection buffer concatenation also
 copies accumulated data on fragmented reads. These costs are bounded by the
 configured per-frame byte/depth limits, but are not claimed to be linear-time
-streaming. A resumable parser and chunked buffer need a separate concrete
-follow-up after the measured baseline is recorded.
+streaming. A resumable parser and chunked buffer are tracked separately in
+[issue #45](https://github.com/zaplang-io/redis/issues/45).
 
-Native baseline: pending first CI run for this combined change. Results will
-be recorded here before the PR is marked ready for review.
+Native baseline from [CI run #52](https://github.com/zaplang-io/redis/actions/runs/41381721628/job/125073765164),
+Ubuntu runner, pinned Zap image `sha-d8885f5`, 2026-11-02. These are single-run
+observations, affected by JIT-free native execution, allocator/collector setup,
+and runner load; they are not portable performance guarantees.
+
+| Arguments | Encoded bytes | Former encoder (ms) | Balanced encoder (ms) | Former copy model (bytes) | Balanced upper bound (bytes) |
+| --- | --- | --- | --- | --- | --- |
+| 512 | 19,974 | 5.596 | 0.178 | 15,356,160 | 219,714 |
+| 1,024 | 39,943 | 6.786 | 0.319 | 61,386,240 | 479,316 |
+| 2,048 | 79,879 | 14.829 | 0.634 | 245,455,872 | 1,038,427 |
+
+The modeled concatenation allocation/copy volume drops sharply; the fragment
+list and small header allocations are not included in this model. No peak-RSS
+claim is made.
+
+| Wide array items | Prefix decode calls | Elapsed (ms) |
+| --- | --- | --- |
+| 512 | 18 | 1.393 |
+| 1,024 | 34 | 4.905 |
+| 2,048 | 66 | 18.557 |
+
+Doubling this incremental workload takes roughly 3.5–3.8 times as long. This
+confirms repeated-prefix work remains approximately quadratic; #45 specifies
+a persistent-framing/chunked-buffer implementation and scaling checks rather
+than hiding that limitation behind the frame-size bound.
 
 The fixed-seed corpus uses recurrence `(seed * 251 + 13849) % 65521`, seed 322.
 It covers 256 generated valid reply trees, all their proper prefixes and
