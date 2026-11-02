@@ -32,9 +32,15 @@ def stalled_peer(
         entered <- True
         if delayed:
             time.sleep(0.3)
-        auto chunk = bytes(tls.recv(socket, 65536))
-        while len(chunk) > 0:
-            chunk = bytes(tls.recv(socket, 65536))
+        try:
+            auto chunk = bytes(tls.recv(socket, 65536))
+            while len(chunk) > 0:
+                chunk = bytes(tls.recv(socket, 65536))
+        except Exception:
+            # An aborted backpressured write can end mid-TLS-record. The peer
+            # may report a truncation error instead of clean close_notify/EOF.
+            # Client timeout/cancellation and closed state are asserted below.
+            check(write, "only an aborted writer may truncate TLS records")
     finally:
         tls.close_conn(socket)
     done <- True
