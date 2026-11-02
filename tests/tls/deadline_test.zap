@@ -8,7 +8,7 @@ def listener() -> bytes:
     auto certs = os.getenv("REDIS_TLS_TEST_CERTS")
     return tls.listen("127.0.0.1", 0, certs + "/server.pem", certs + "/server.key")
 
-def connect(int64 port, int64 command_ms = 100) -> redis.Connection:
+def open_client(int64 port, int64 command_ms = 100) -> redis.Connection:
     return redis.connect(
         host="localhost",
         port=port,
@@ -63,7 +63,7 @@ def cancelled(bool write, bytes payload):
     auto entered = channel[bool]()
     auto done = channel[bool]()
     spawn stalled_peer(listen, entered, done, write, False)
-    auto conn = connect(tls.port(listen), 0)
+    auto conn = open_client(tls.port(listen), 0)
     Atomic[int64] count = Atomic(0)
     auto failed = False
     try:
@@ -81,7 +81,7 @@ def timeout(bool write, bytes payload):
     auto done = channel[bool]()
     spawn stalled_peer(listen, entered, done, write, True)
     spawn release(entered)
-    auto conn = connect(tls.port(listen))
+    auto conn = open_client(tls.port(listen))
     auto timed_out = False
     try:
         if write:
@@ -108,7 +108,7 @@ def handshake_peer(bytes listen, channel[bool] entered, channel[bool] done):
 
 def dialing(int64 port, Atomic[int64] count):
     try:
-        auto conn = connect(port)
+        auto conn = open_client(port)
         conn.disconnect()
     except Cancelled:
         count.add(1)
