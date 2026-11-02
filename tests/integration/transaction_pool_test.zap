@@ -218,7 +218,11 @@ def main():
         io.write(2, "transaction/pool: transaction outcomes\n")
         transactions(f)
         for round in range(0, 4):
-            io.write(2, "transaction/pool: borrower round " + str(round) + "\n")
+            auto stats = gc.stats()
+            io.write(
+                2,
+                "transaction/pool: borrower round " + str(round) + " gc=" + str(stats.gc_count) + "\n",
+            )
             pooling(f)
         io.write(2, "transaction/pool: rounds complete\n")
     except Exception as message:

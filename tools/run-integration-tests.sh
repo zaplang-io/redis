@@ -42,6 +42,16 @@ for source in "$here"/tests/integration/*_test.zap; do
             fi
         else
             failed=1
+            if [ "$name" = transaction_pool_test ]; then
+                # Failure-only diagnostics; never replace the original failure
+                # status with a successful alternate collector/scheduler mode.
+                if "$zap" build "$build/$name.zap" -o "$build/pool-lifetime-debug"; then
+                    echo 'pool lifetime diagnostic: no evacuation' >&2
+                    ZAP_GC_NO_EVAC=1 "$build/pool-lifetime-debug" >&2 || :
+                    echo 'pool lifetime diagnostic: one worker' >&2
+                    MAXPROCS=1 "$build/pool-lifetime-debug" >&2 || :
+                fi
+            fi
         fi
         cat "$build/actual"
     fi
