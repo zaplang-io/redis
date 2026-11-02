@@ -215,8 +215,18 @@ def main():
     auto f = integration_fixtures.fixture()
     f.config.command_timeout_ms = 2000
     try:
+        io.write(2, "transaction/pool: transaction outcomes\n")
         transactions(f)
-        pooling(f)
+        for round in range(0, 4):
+            io.write(2, "transaction/pool: borrower round " + str(round) + "\n")
+            pooling(f)
+        io.write(2, "transaction/pool: rounds complete\n")
+    except Exception as message:
+        # Preserve the primary failure before cleanup, which previously hid an
+        # intermittent failure behind a native crash in this fixture's finally.
+        io.write(2, "transaction/pool: failure before cleanup: " + message + "\n")
+        raise ValueError("transaction/pool regression: " + message)
     finally:
+        io.write(2, "transaction/pool: fixture cleanup\n")
         f.cleanup()
     print("Live transactions, WATCH, and bounded pooling: PASS")
