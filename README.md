@@ -764,6 +764,38 @@ those options.
 
 Reference: [Redis SCAN family and guarantees](https://redis.io/docs/latest/commands/scan/).
 
+## Pub/Sub subscriptions
+
+`conn.publish(topic, payload)` returns Redis's recipient count. Subscribe through
+`conn.pubsub()` or a dedicated lease's `pubsub()` session, which exclusively owns
+its connection until disconnected. `subscribe`, `psubscribe`, `unsubscribe`, and
+`punsubscribe` send controls; `next_event()` returns typed acknowledgement,
+literal-message, and pattern-message events in wire order. Empty unsubscribe
+lists mean all names of that kind.
+
+Messages and topics remain bytes. The pull API creates no background receiver
+or unbounded queue. Slow callers can be disconnected by Redis's output-buffer
+policy. Delivery is at-most-once; there is no replay or transparent resubscription.
+Cancel/join a blocked reader's scope before disconnecting. Always disconnect the
+session and release its dedicated lease in finally.
+
+## Basic Streams
+
+Connection helpers `xadd`, `xlen`, `xrange`, `xrevrange`, `xdel`, and `xread` use
+byte-token IDs and ordered `StreamField` pairs, preserving repeated binary fields.
+XREAD takes `StreamCursor(key, after_id)` values and returns `StreamBatch` values
+containing `StreamEntry` objects. IDs above signed int64 stay exact bytes.
+
+`xread(..., block_ms=-1)` is nonblocking; zero blocks indefinitely at Redis and
+positive values set a server wait in milliseconds. Server timeout/missing data
+returns an empty list. Client deadlines/cancellation independently discard
+incomplete connections. Blocking XREAD requires a dedicated pool lease; ordinary
+leases support nonblocking `xread` and reject blocking raw/pipelined XREAD.
+Consumer groups, trimming and automatic cursor/retry policy are not included.
+
+See [API, delivery/backpressure, ID, timeout, and shutdown semantics](docs/pubsub-streams.md)
+and the [complete installed-package example](examples/pubsub_streams.zap).
+
 ## Lua scripts
 
 `eval(source, keys, arguments)` and `evalsha(sha, keys, arguments)` return raw

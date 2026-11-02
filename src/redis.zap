@@ -946,6 +946,8 @@ def _requires_dedicated(list[bytes] args) -> bool:
     auto name = _command_name(args)
     if _stream_command(args):
         return True
+    if name == "XREAD":
+        return _xread_blocks(args)
     return name == "BLPOP" or name == "BRPOP" or name == "BLMOVE" or name == "BLMPOP" or name == "BRPOPLPUSH" or name == "BZPOPMIN" or name == "BZPOPMAX" or name == "BZMPOP"
 
 # Hash fields stay separate from keys, with no implicit text conversion.
@@ -1468,6 +1470,322 @@ struct Transaction:
         finally:
             self._finish(healthy)
 
+# Stream IDs remain byte tokens; each component is uint64 and can exceed int64.
+# Ordered pairs preserve binary and repeated field names without a dict.
+struct StreamField:
+    bytes field
+    bytes value
+
+struct StreamEntry:
+    bytes id
+    list[StreamField] fields
+
+struct StreamCursor:
+    bytes key
+    bytes after_id
+
+struct StreamBatch:
+    bytes key
+    list[StreamEntry] entries
+
+def _stream_component(str part) -> bool:
+    if part !~ m/\A(?:0|[1-9][0-9]*)\z/:
+        return False
+    if len(part) > 20:
+        return False
+    if len(part) == 20 and part > "18446744073709551615":
+        return False
+    return True
+
+def _stream_id_valid(bytes raw) -> bool:
+    auto text = ""
+    try:
+        text = str(raw)
+    except Exception:
+        return False
+    auto parsed = text =~ m/\A(?<ms>0|[1-9][0-9]*)-(?<seq>0|[1-9][0-9]*)\z/
+    if not parsed:
+        return False
+    if not _stream_component(parsed.group("ms")):
+        return False
+    return _stream_component(parsed.group("seq"))
+
+def _stream_position(bytes raw, bool allow_dollar):
+    if allow_dollar and raw == b"$":
+        return
+    if _stream_id_valid(raw):
+        return
+    auto text = ""
+    try:
+        text = str(raw)
+    except Exception:
+        raise ValueError("Invalid Redis stream ID")
+    if not _stream_component(text):
+        raise ValueError("Invalid Redis stream ID")
+
+def _stream_boundary(bytes raw):
+    if raw == b"-" or raw == b"+":
+        return
+    auto token = raw
+    if len(token) > 0 and token[0] == 40:
+        token = token[1:len(token)]
+    _stream_position(token, False)
+
+def _stream_entry(Reply reply) -> StreamEntry:
+    match reply:
+        case Reply.Array(parts):
+            if len(parts) != 2:
+                raise ProtocolError("Expected stream ID/fields entry")
+            bytes id = _required_bulk(parts[0])
+            if not _stream_id_valid(id):
+                raise ProtocolError("Invalid returned Redis stream ID")
+            match parts[1]:
+                case Reply.Array(values):
+                    if len(values) == 0 or len(values) % 2 != 0:
+                        raise ProtocolError("Expected ordered stream field/value pairs")
+                    list[StreamField] fields = []
+                    auto i = 0
+                    while i < len(values):
+                        fields.append(
+                            StreamField(
+                                _required_bulk(values[i]),
+                                _required_bulk(values[i + 1]),
+                            ),
+                        )
+                        i = i + 2
+                    return StreamEntry(id, fields)
+                case _:
+                    raise ProtocolError("Expected stream field array")
+        case _:
+            raise ProtocolError("Expected stream entry array")
+
+def _stream_entries(Reply reply) -> list[StreamEntry]:
+    match reply:
+        case Reply.Array(items):
+            list[StreamEntry] entries = []
+            for item in items:
+                entries.append(_stream_entry(item))
+            return entries
+        case _:
+            raise ProtocolError("Expected stream entries array")
+
+def _stream_batches(Reply reply, list[bytes] requested) -> list[StreamBatch]:
+    list[StreamBatch] batches = []
+    match reply:
+        case Reply.NullArray:
+            return batches
+        case Reply.Array(items):
+            for item in items:
+                match item:
+                    case Reply.Array(parts):
+                        if len(parts) != 2:
+                            raise ProtocolError("Expected stream key/entries batch")
+                        bytes key = _required_bulk(parts[0])
+                        if not _requested_key(requested, key):
+                            raise ProtocolError("XREAD returned an unrequested stream")
+                        batches.append(StreamBatch(key, _stream_entries(parts[1])))
+                    case _:
+                        raise ProtocolError("Expected XREAD stream array")
+            return batches
+        case _:
+            raise ProtocolError("Expected XREAD array or null array")
+
+def _stream_count(list[bytes] args, int64 count):
+    if count < 0:
+        raise ValueError("Redis stream COUNT must not be negative")
+    if count > 0:
+        args.append(b"COUNT")
+        args.append(bytes(str(count)))
+
+def _stream_nonnegative(Reply reply) -> int64:
+    auto value = _integer_value(reply)
+    if value < 0:
+        raise ProtocolError("Expected non-negative stream integer")
+    return value
+
+# Look only at XREAD options, never at binary keys/IDs following STREAMS.
+def _xread_blocks(list[bytes] args) -> bool:
+    auto i = 1
+    while i < len(args):
+        auto option = _command_name([args[i]])
+        if option == "STREAMS":
+            return False
+        if option == "BLOCK":
+            return True
+        if option == "COUNT":
+            i = i + 2
+        else:
+            i = i + 1
+    return False
+
+# RESP2 Pub/Sub is a separate pull session. No receiver coroutine or message
+# queue is created; messages remain in the bounded parser/socket/server buffers.
+enum PubSubEvent:
+    Subscribed(bytes topic, int64 count)
+    PatternSubscribed(bytes pattern, int64 count)
+    Unsubscribed(Optional[bytes] topic, int64 count)
+    PatternUnsubscribed(Optional[bytes] pattern, int64 count)
+    Message(bytes topic, bytes payload)
+    PatternMessage(bytes pattern, bytes topic, bytes payload)
+
+def _pubsub_count(Reply reply) -> int64:
+    auto count = _integer_value(reply)
+    if count < 0:
+        raise ProtocolError("Negative Pub/Sub subscription count")
+    return count
+
+def _pubsub_event(Reply reply) -> PubSubEvent:
+    match reply:
+        case Reply.Array(items):
+            if len(items) < 3:
+                raise ProtocolError("Incomplete Pub/Sub event")
+            bytes kind = _required_bulk(items[0])
+            if kind == b"pmessage":
+                if len(items) != 4:
+                    raise ProtocolError("Expected four-part pattern message")
+                return PubSubEvent.PatternMessage(
+                    _required_bulk(items[1]),
+                    _required_bulk(items[2]),
+                    _required_bulk(items[3]),
+                )
+            if len(items) != 3:
+                raise ProtocolError("Expected three-part Pub/Sub event")
+            if kind == b"message":
+                return PubSubEvent.Message(
+                    _required_bulk(items[1]),
+                    _required_bulk(items[2]),
+                )
+            auto count = _pubsub_count(items[2])
+            if kind == b"subscribe":
+                return PubSubEvent.Subscribed(_required_bulk(items[1]), count)
+            if kind == b"psubscribe":
+                return PubSubEvent.PatternSubscribed(_required_bulk(items[1]), count)
+            if kind == b"unsubscribe":
+                return PubSubEvent.Unsubscribed(_bulk_value(items[1]), count)
+            if kind == b"punsubscribe":
+                return PubSubEvent.PatternUnsubscribed(_bulk_value(items[1]), count)
+            raise ProtocolError("Unknown RESP2 Pub/Sub event")
+        case _:
+            raise ProtocolError("Expected Pub/Sub array event")
+
+def _pubsub_ack_count(PubSubEvent event) -> int64:
+    match event:
+        case PubSubEvent.Subscribed(name, count):
+            return count
+        case PubSubEvent.PatternSubscribed(name, count):
+            return count
+        case PubSubEvent.Unsubscribed(name, count):
+            return count
+        case PubSubEvent.PatternUnsubscribed(name, count):
+            return count
+        case _:
+            return -1
+
+def _unsubscribe_wire(bytes command, list[bytes] names) -> bytes:
+    list[bytes] args = [command]
+    for name in names:
+        args.append(name)
+    return encode_command(args)
+
+struct PubSub:
+    Connection _connection
+    Atomic[int64] _state
+    Atomic[int64] _lease_guard
+    Atomic[int64] _count
+
+    def _enter(self):
+        if not self._state.compare_and_swap(0, 1):
+            if self._state.load() == 2:
+                raise ConnectionError("Redis Pub/Sub session is closed")
+            raise BusyError("Redis Pub/Sub session is in use")
+
+    def _leave(self):
+        self._state.compare_and_swap(1, 0)
+
+    def _close_session(self):
+        if self._state.load() == 2:
+            return
+        self._connection._invalidate()
+        self._count.store(0)
+        self._state.store(2)
+        self._lease_guard.store(0)
+
+    def is_closed(self) -> bool:
+        return self._state.load() == 2
+
+    # This is the count from the last consumed acknowledgement, not a prediction
+    # based on commands whose acknowledgements have not been read yet.
+    def subscription_count(self) -> int64:
+        return self._count.load()
+
+    def _send_control(self, bytes wire):
+        self._enter()
+        auto healthy = False
+        try:
+            auto deadline = _budget(self._connection._config.command_timeout_ms)
+            net.set_deadline_ns(self._connection._socket, deadline)
+            self._connection._write_wire(wire, deadline)
+            _check_budget(deadline)
+            net.set_deadline_ns(self._connection._socket, 0)
+            healthy = True
+        finally:
+            if not healthy:
+                self._close_session()
+            self._leave()
+
+    # Send control commands without silently consuming/dropping intervening
+    # messages. Acknowledgements are events read with next_event().
+    def subscribe(self, list[bytes] channels):
+        self._send_control(encode_command(_keys_command(b"SUBSCRIBE", channels)))
+
+    def psubscribe(self, list[bytes] patterns):
+        self._send_control(encode_command(_keys_command(b"PSUBSCRIBE", patterns)))
+
+    # An empty list asks Redis to unsubscribe all of this kind. Patterns and
+    # literal channels are independent; total count reaches zero after both.
+    def unsubscribe(self, list[bytes] channels):
+        self._send_control(_unsubscribe_wire(b"UNSUBSCRIBE", channels))
+
+    def punsubscribe(self, list[bytes] patterns):
+        self._send_control(_unsubscribe_wire(b"PUNSUBSCRIBE", patterns))
+
+    def next_event(self, int64 timeout_ms = -1) -> PubSubEvent:
+        if timeout_ms < -1:
+            raise ValueError("Pub/Sub timeout must be -1, zero, or positive")
+        auto budget_ms = timeout_ms
+        if budget_ms == -1:
+            budget_ms = self._connection._config.command_timeout_ms
+        self._enter()
+        auto healthy = False
+        try:
+            auto deadline = _budget(budget_ms)
+            net.set_deadline_ns(self._connection._socket, deadline)
+            auto reply = self._connection._read_reply(deadline)
+            match reply:
+                case Reply.Error(data):
+                    self._connection._last_error = data
+                    raise ResponseError(_error_text(data))
+                case _:
+                    auto event = _pubsub_event(reply)
+                    auto count = _pubsub_ack_count(event)
+                    if count >= 0:
+                        self._count.store(count)
+                    net.set_deadline_ns(self._connection._socket, 0)
+                    healthy = True
+                    return event
+        finally:
+            if not healthy:
+                self._close_session()
+            self._leave()
+
+    # Cancel/join a blocked reader's scope first; concurrent close is rejected
+    # instead of freeing an SSL/parser while an operation still owns it.
+    def disconnect(self):
+        if self._state.load() == 2:
+            return
+        self._enter()
+        self._close_session()
+
 # One connection has one active owner. The atomic state protects both socket
 # access and the reply buffer: 0=idle, 1=owned, 2=closed. Sharing requires callers
 # to serialize access; a concurrent execute/disconnect is rejected, never queued.
@@ -1485,6 +1803,19 @@ struct Connection:
         _close_socket(self._socket, self._config.secure)
         self._reader = decoder(self._max_frame, self._max_depth)
         self._state.store(2)
+
+    def pubsub(self) -> PubSub:
+        if not self._state.compare_and_swap(0, 1):
+            if self._state.load() == 2:
+                raise ConnectionError("Redis connection is closed")
+            raise BusyError("Redis connection is in use")
+        return PubSub(self, Atomic(0), Atomic(0), Atomic(0))
+
+    def publish(self, bytes topic, bytes payload) -> int64:
+        auto count = _integer_value(self.execute([b"PUBLISH", topic, payload]))
+        if count < 0:
+            raise ProtocolError("Negative PUBLISH recipient count")
+        return count
 
     def transaction(self) -> Transaction:
         if not self._state.compare_and_swap(0, 1):
@@ -1839,6 +2170,84 @@ struct Connection:
             _blocking_timeout(server_timeout_seconds),
         ]
         return _blocking_move_reply(self.execute(args))
+
+    def xadd(self, bytes key, list[StreamField] fields, bytes id = b"*") -> bytes:
+        if id != b"*" and not _stream_id_valid(id):
+            raise ValueError("XADD requires * or a full canonical stream ID")
+        if len(fields) == 0:
+            raise ValueError("XADD requires at least one field/value pair")
+        list[bytes] args = [b"XADD", key, id]
+        for field in fields:
+            args.append(field.field)
+            args.append(field.value)
+        bytes created = _required_bulk(self.execute(args))
+        if not _stream_id_valid(created):
+            raise ProtocolError("Invalid XADD returned ID")
+        return created
+
+    def xlen(self, bytes key) -> int64:
+        return _stream_nonnegative(self.execute([b"XLEN", key]))
+
+    def xrange(
+        self,
+        bytes key,
+        bytes start = b"-",
+        bytes end = b"+",
+        int64 count = 0,
+    ) -> list[StreamEntry]:
+        _stream_boundary(start)
+        _stream_boundary(end)
+        list[bytes] args = [b"XRANGE", key, start, end]
+        _stream_count(args, count)
+        return _stream_entries(self.execute(args))
+
+    def xrevrange(
+        self,
+        bytes key,
+        bytes end = b"+",
+        bytes start = b"-",
+        int64 count = 0,
+    ) -> list[StreamEntry]:
+        _stream_boundary(end)
+        _stream_boundary(start)
+        list[bytes] args = [b"XREVRANGE", key, end, start]
+        _stream_count(args, count)
+        return _stream_entries(self.execute(args))
+
+    def xdel(self, bytes key, list[bytes] ids) -> int64:
+        if len(ids) == 0:
+            raise ValueError("XDEL requires at least one ID")
+        list[bytes] args = [b"XDEL", key]
+        for id in ids:
+            if not _stream_id_valid(bytes(id)):
+                raise ValueError("XDEL requires full canonical stream IDs")
+            args.append(id)
+        return _stream_nonnegative(self.execute(args))
+
+    # -1 omits BLOCK, zero asks Redis to block indefinitely, positive values
+    # bound Redis's wait in milliseconds. Client command deadlines are separate.
+    def xread(
+        self,
+        list[StreamCursor] streams,
+        int64 count = 0,
+        int64 block_ms = -1,
+    ) -> list[StreamBatch]:
+        if len(streams) == 0 or block_ms < -1:
+            raise ValueError("Invalid XREAD streams or BLOCK value")
+        list[bytes] args = [b"XREAD"]
+        _stream_count(args, count)
+        if block_ms >= 0:
+            args.append(b"BLOCK")
+            args.append(bytes(str(block_ms)))
+        args.append(b"STREAMS")
+        list[bytes] keys = []
+        for stream in streams:
+            _stream_position(stream.after_id, True)
+            args.append(stream.key)
+            keys.append(stream.key)
+        for stream in streams:
+            args.append(stream.after_id)
+        return _stream_batches(self.execute(args), keys)
 
     def _set_members(self, bytes command, bytes key, list[bytes] members) -> int64:
         if len(members) == 0:
@@ -2425,6 +2834,27 @@ struct Lease:
         finally:
             self._guard.store(0)
 
+    def pubsub(self) -> PubSub:
+        if not self._dedicated:
+            raise ValueError("Pub/Sub requires a dedicated lease")
+        self._enter()
+        auto started = False
+        try:
+            auto session = self._connection.pubsub()
+            session._lease_guard = self._guard
+            started = True
+            return session
+        finally:
+            if not started:
+                self._guard.store(0)
+
+    def publish(self, bytes topic, bytes payload) -> int64:
+        self._enter()
+        try:
+            return self._connection.publish(topic, payload)
+        finally:
+            self._guard.store(0)
+
     def transaction(self) -> Transaction:
         self._enter()
         auto started = False
@@ -2482,6 +2912,20 @@ struct Lease:
                 destination_side,
                 server_timeout_seconds,
             )
+        finally:
+            self._guard.store(0)
+
+    def xread(
+        self,
+        list[StreamCursor] streams,
+        int64 count = 0,
+        int64 block_ms = -1,
+    ) -> list[StreamBatch]:
+        if block_ms >= 0 and not self._dedicated:
+            raise ValueError("Blocking XREAD requires a dedicated lease")
+        self._enter()
+        try:
+            return self._connection.xread(streams, count, block_ms)
         finally:
             self._guard.store(0)
 

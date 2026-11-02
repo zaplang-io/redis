@@ -26,10 +26,12 @@ the changelog when upgrading and commit application `zap.lock` files.
 
 The implemented subset includes key/string/counter/expiry, hashes, non-blocking
 and blocking lists, sets, sorted sets, cursor pages, scripts, pipelines,
-transactions, and pools. Raw commands provide an escape hatch with the same
+transactions, pools, dedicated Pub/Sub, and basic Streams. Raw commands provide an escape hatch with the same
 ownership/deadline rules; that is not full redis-py or Redis-module parity.
 
-Later optional work remains separate: Pub/Sub (#20), Streams (#21/#22), RESP3
+Later optional work remains separate: Streams consumer groups (#22), RESP3
 negotiation/push dispatch (#26), Sentinel (#27), Cluster routing/redirections
 (#28/#29), and per-connection trust/mTLS (core #560). These are not v0.1 blockers.
-Blocking lists (#15) are included by the paired release-preparation change.
+Blocking lists (#15), Pub/Sub (#20), and basic Streams (#21) are now included
+in the unreleased candidate. Pub/Sub is at-most-once with no transparent
+resubscription; Streams has no automatic cursor or consumer acknowledgement policy.
