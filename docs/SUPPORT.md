@@ -5,8 +5,8 @@ the first tag; the release preflight does not create a release or publish remote
 
 | Area | v0.1 contract |
 | --- | --- |
-| Zap runtime | Tested with core commit `23ed96aa685f66b0d9a18d796c88bba145fa3040`, including core #575/#578; use the exact CI image below. The runtime's generic version string alone does not identify these fixes. |
-| Toolchain image | `ghcr.io/zaplang-io/zap@sha256:1ec44a8cc4699a7096bc69e565e8dcda8eb54a4f52514eb3516f1d322e9cd123` |
+| Zap runtime | Tested with core commit `2b6a607b5f11eb1e52016450c41403c0a2b77997`, including core #575/#578/#583; use the exact CI image below. The runtime's generic version string alone does not identify these fixes. |
+| Toolchain image | `ghcr.io/zaplang-io/zap@sha256:593d82a7938f1fc7f4fb1ead916309089ee17537a1c83ec797bb97a55a82faec` |
 | Client CI platform | Linux x86_64. Other architectures/OSes are not certified by this library's matrix. |
 | Redis servers | CI tests Redis 7.4.12 and 8.10.3. Earlier/later versions are not promised by this matrix. Individual commands can have lower version floors. |
 | Transport | Standalone TCP and verified TLS/rediss, OpenSSL trust paths. No per-connection CA/mTLS API; see core #560. |
