@@ -6,6 +6,16 @@ zap="${ZAP:-zap}"
 build=$(mktemp -d "${TMPDIR:-/tmp}/redis-tests.XXXXXX")
 trap 'rm -rf "$build"' EXIT HUP INT TERM
 cp "$here/src/redis.zap" "$build/redis.zap"
+if [ "${1:-}" != --check ]; then
+    if command -v timeout > /dev/null 2>&1; then
+        timeout_command=timeout
+    elif command -v gtimeout > /dev/null 2>&1; then
+        timeout_command=gtimeout
+    else
+        echo 'Runtime tests require GNU timeout (coreutils on macOS)' >&2
+        exit 2
+    fi
+fi
 failed=0
 for source in "$here"/tests/*_test.zap; do
     name=$(basename "$source" .zap)
@@ -14,7 +24,7 @@ for source in "$here"/tests/*_test.zap; do
         "$zap" ir "$build/$name.zap" > /dev/null
         echo "$name: frontend PASS"
     else
-        if "$zap" run "$build/$name.zap" > "$build/actual"; then
+        if "$timeout_command" -k 5s 60s "$zap" run "$build/$name.zap" > "$build/actual"; then
             :
         else
             cat "$build/actual"

@@ -11,7 +11,7 @@ build=$(mktemp -d "${TMPDIR:-/tmp}/redis-tls-tests.XXXXXX")
 trap 'rm -rf "$build"' EXIT HUP INT TERM
 cp "$here/src/redis.zap" "$build/redis.zap"
 if [ "${1:-}" != --check ]; then
-    # Bound native parked-I/O failures outside Zap's pending deadline support.
+    # Bound regression hangs independently of the operation deadline under test.
     if command -v timeout > /dev/null 2>&1; then
         timeout_command=timeout
     elif command -v gtimeout > /dev/null 2>&1; then
@@ -34,11 +34,18 @@ for source in "$here"/tests/tls/*_test.zap; do
         "$zap" ir "$build/$name.zap" > /dev/null
         echo "$name: frontend PASS"
     else
-        if "$timeout_command" -k 5s 60s "$zap" run "$build/$name.zap" > "$build/actual"; then
+        if ! "$zap" build "$build/$name.zap" -o "$build/$name"; then
+            echo "$name: compilation failed" >&2
+            failed=1
+            continue
+        fi
+        if "$timeout_command" -k 5s 60s "$build/$name" > "$build/actual"; then
             if ! diff -u "$here/tests/tls/$name.expected" "$build/actual"; then
                 failed=1
             fi
         else
+            status=$?
+            echo "$name: runtime failed (exit $status)" >&2
             failed=1
         fi
         cat "$build/actual"
