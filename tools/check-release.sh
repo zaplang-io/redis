@@ -12,7 +12,7 @@ test -s "$here/LICENSE"
 test -s "$here/src/redis.zap"
 test -s "$here/CHANGELOG.md"
 grep -Fq "## $version " "$here/CHANGELOG.md"
-for file in examples/offline.zap examples/basic.zap examples/pipeline_transaction.zap examples/pool.zap examples/blocking.zap docs/SUPPORT.md docs/RELEASING.md; do
+for file in examples/offline.zap examples/basic.zap examples/pipeline_transaction.zap examples/pool.zap examples/blocking.zap examples/pubsub_streams.zap docs/SUPPORT.md docs/RELEASING.md; do
     test -s "$here/$file"
 done
 if [ "$#" -gt 1 ]; then echo 'usage: tools/check-release.sh [vX.Y.Z]' >&2; exit 2; fi

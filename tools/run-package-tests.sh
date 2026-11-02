@@ -67,7 +67,7 @@ MANIFEST
         export ZAP_ZENV
         test -f zap.lock
         test -f "$ZAP_ZENV/pkg/redis/src/redis.zap"
-        for source in offline basic pipeline_transaction pool blocking; do
+        for source in offline basic pipeline_transaction pool blocking pubsub_streams; do
             if [ "$mode" = --check ] || [ "$source" = offline ] || [ "$mode" = --live ]; then
                 run_example "$source"
             else
