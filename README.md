@@ -42,8 +42,7 @@ The connection fields and direct construction are internal; use `connect()`.
 
 Transport failures, EOF before a complete reply, and invalid framing close the
 connection and discard buffered bytes. Commands are never automatically retried.
-A failed operation might already have executed on the server. Pooling has a separate backlog issue. Configurable deadlines are described
-below. Use a dedicated connection for stateful commands and manage its lifetime with `try/finally`.
+A failed operation might already have executed on the server. Pooling and configurable deadlines are described below. Use a dedicated connection for stateful commands and manage its lifetime with `try/finally`.
 
 `max_frame` (default 16 MiB) and `max_depth` (default 64) apply to each incoming
 reply. The receive buffer is bounded by `max_frame`; outgoing command size is
@@ -385,7 +384,28 @@ failure or `BusyError`; it cannot be queued or executed again. Transport, protoc
 timeout, or cancellation failure returns no partial result and discards the
 connection. One command budget covers the entire batch. This is non-transactional
 pipelining: commands can partially execute and are not automatically retried.
-Use a dedicated connection for stateful commands; transactions have a separate issue.
+Use an exclusive transaction session or a dedicated lease for stateful commands.
+
+## Transactions and pooling
+
+`conn.transaction()` provides an exclusive WATCH/MULTI session. Read application
+state with `tx.execute()` before `tx.multi()`, send commands with `tx.queue()`,
+and finish with `tx.exec()`. Results distinguish committed replies, WATCH
+conflicts, and EXECABORT; runtime errors remain values inside committed replies.
+Always call `tx.discard()` in `finally` to clean up abandoned sessions. No
+transaction or caller side effect is automatically replayed.
+
+`redis.pool(config, capacity=8, acquire_timeout_ms=1000, reset_timeout_ms=1000)`
+creates a lazy bounded pool. `pool.acquire()` returns a guarded lease with
+`execute`, `execute_raw`, `execute_pipeline`, and `transaction` methods. Release
+it in `finally`; release resets/reinitializes the session or discards it. A
+transaction prevents lease release until it finishes. Dedicated leases always
+close on release, and retained old handles cannot use a released connection.
+`pool.shutdown()` stops admission and closes idle sockets; active leases close
+when returned. Acquisition timeout bounds capacity waiting; connect options
+separately govern setup and DNS scope.
+
+See [transactions, lease ownership, session reset, and shutdown semantics](docs/transactions-pooling.md).
 
 ## Typed key and string commands
 

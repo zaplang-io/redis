@@ -1168,6 +1168,7 @@ struct Pipeline:
     int64 _max_commands
     int64 _max_bytes
     bool _sealed
+    bool _streaming
 
     def queue(self, list[bytes] args):
         if self._sealed:
@@ -1188,7 +1189,9 @@ struct Pipeline:
             size = size + len(arg)
         if size > remaining:
             raise ValueError("Redis pipeline byte limit exceeded")
+        auto streaming = _stream_command(args)
         self._commands.append(encode_command(args))
+        self._streaming = self._streaming or streaming
         self._bytes = self._bytes + size
 
     def execute(self, Connection connection) -> list[Reply]:
@@ -1206,7 +1209,208 @@ def pipeline(int64 max_commands = 1024, int64 max_bytes = 16777216) -> Pipeline:
     if max_commands < 1 or max_bytes < 1:
         raise ValueError("invalid Redis pipeline limits")
     list[bytes] commands = []
-    return Pipeline(commands, 0, max_commands, max_bytes, False)
+    return Pipeline(commands, 0, max_commands, max_bytes, False, False)
+
+# A session holds the Connection ownership token across caller code as well as
+# network operations. Its per-method token rejects concurrent session calls.
+enum TransactionResult:
+    Committed(list[Reply] replies)
+    Conflict
+    Aborted(bytes error)
+
+def _command_name(list[bytes] args) -> str:
+    if len(args) == 0:
+        raise ValueError("a Redis command must have at least one argument")
+    try:
+        return str(args[0]).upper()
+    except Exception:
+        return ""
+
+def _stream_command(list[bytes] args) -> bool:
+    auto name = _command_name(args)
+    return name == "SUBSCRIBE" or name == "PSUBSCRIBE" or name == "SSUBSCRIBE" or name == "MONITOR" or name == "HELLO" or name == "SYNC" or name == "PSYNC" or name == "REPLCONF"
+
+def _transaction_args(list[bytes] args):
+    auto name = _command_name(args)
+    if _stream_command(args) or name == "MULTI" or name == "EXEC" or name == "DISCARD" or name == "WATCH" or name == "UNWATCH" or name == "RESET" or name == "AUTH" or name == "SELECT" or name == "CLIENT" or name == "QUIT" or name == "ASKING" or name == "READONLY" or name == "READWRITE":
+        raise ValueError(
+            "Use the transaction session methods for transaction control; session-changing commands are unsupported",
+        )
+
+struct Transaction:
+    Connection _connection
+    Atomic[int64] _state
+    Atomic[int64] _lease_guard
+    bool _multi
+    int64 _queued
+
+    def _enter(self):
+        if not self._state.compare_and_swap(0, 1):
+            if self._state.load() == 2:
+                raise ValueError("Redis transaction session has finished")
+            raise BusyError("Redis transaction session is in use")
+
+    def _leave(self):
+        self._state.compare_and_swap(1, 0)
+
+    def _finish(self, bool healthy):
+        if self._state.load() == 2:
+            return
+        if healthy:
+            self._connection._state.store(0)
+        else:
+            self._connection._invalidate()
+        self._state.store(2)
+        self._lease_guard.store(0)
+
+    def _request(self, bytes wire) -> Reply:
+        auto healthy = False
+        try:
+            auto deadline = _budget(self._connection._config.command_timeout_ms)
+            net.set_deadline_ns(self._connection._socket, deadline)
+            auto reply = self._connection._wire_reply(wire, deadline)
+            net.set_deadline_ns(self._connection._socket, 0)
+            healthy = True
+            match reply:
+                case Reply.Error(data):
+                    self._connection._last_error = data
+                case _:
+                    return reply
+            return reply
+        finally:
+            if not healthy:
+                self._finish(False)
+
+    def _transaction_ok(self, bytes wire):
+        auto reply = self._request(wire)
+        match reply:
+            case Reply.Error(data):
+                raise ResponseError(_error_text(data))
+            case Reply.Simple(data):
+                if data != b"OK":
+                    self._finish(False)
+                    raise ProtocolError("Expected transaction OK status")
+            case _:
+                self._finish(False)
+                raise ProtocolError("Expected transaction OK status")
+
+    def watch(self, list[bytes] keys):
+        auto wire = encode_command(_keys_command(b"WATCH", keys))
+        self._enter()
+        try:
+            if self._multi:
+                raise ValueError("WATCH must precede MULTI")
+            self._transaction_ok(wire)
+        finally:
+            self._leave()
+
+    def unwatch(self):
+        self._enter()
+        try:
+            if self._multi:
+                raise ValueError("UNWATCH must precede MULTI")
+            self._transaction_ok(encode_command([b"UNWATCH"]))
+        finally:
+            self._leave()
+
+    # Read application state between WATCH and MULTI. Complete server errors
+    # preserve the session so the caller can retry locally or discard explicitly.
+    def execute(self, list[bytes] args) -> Reply:
+        _transaction_args(args)
+        auto wire = encode_command(args)
+        self._enter()
+        try:
+            if self._multi:
+                raise ValueError("Use queue after MULTI")
+            auto reply = self._request(wire)
+            match reply:
+                case Reply.Error(data):
+                    raise ResponseError(_error_text(data))
+                case _:
+                    return reply
+        finally:
+            self._leave()
+
+    def multi(self):
+        self._enter()
+        try:
+            if self._multi:
+                raise ValueError("MULTI has already started")
+            self._transaction_ok(encode_command([b"MULTI"]))
+            self._multi = True
+        finally:
+            self._leave()
+
+    # Queue errors remain Reply.Error values. EXEC then reports EXECABORT;
+    # errors produced while executing valid commands remain inside the result.
+    def queue(self, list[bytes] args) -> Reply:
+        _transaction_args(args)
+        auto wire = encode_command(args)
+        self._enter()
+        try:
+            if not self._multi:
+                raise ValueError("MULTI must precede queue")
+            auto reply = self._request(wire)
+            match reply:
+                case Reply.Simple(data):
+                    if data != b"QUEUED":
+                        self._finish(False)
+                        raise ProtocolError("Expected transaction QUEUED status")
+                    self._queued = self._queued + 1
+                case Reply.Error(data):
+                    return reply
+                case _:
+                    self._finish(False)
+                    raise ProtocolError("Expected transaction QUEUED status")
+            return reply
+        finally:
+            self._leave()
+
+    def exec(self) -> TransactionResult:
+        self._enter()
+        try:
+            if not self._multi:
+                raise ValueError("MULTI must precede EXEC")
+            auto reply = self._request(encode_command([b"EXEC"]))
+            match reply:
+                case Reply.Array(items):
+                    if len(items) != self._queued:
+                        self._finish(False)
+                        raise ProtocolError(
+                            "EXEC result count differs from queued commands",
+                        )
+                    self._finish(True)
+                    return TransactionResult.Committed(items)
+                case Reply.NullArray:
+                    self._finish(True)
+                    return TransactionResult.Conflict
+                case Reply.Error(data):
+                    if error_prefix(data) == b"EXECABORT":
+                        self._finish(True)
+                        return TransactionResult.Aborted(data)
+                    self._finish(False)
+                    raise ResponseError(_error_text(data))
+                case _:
+                    self._finish(False)
+                    raise ProtocolError("Expected EXEC array, conflict, or EXECABORT")
+        finally:
+            self._leave()
+
+    # Idempotent cleanup for try/finally. A failure or cancellation while cleaning
+    # discards the socket; uncertain transaction state is never returned to idle.
+    def discard(self):
+        if self._state.load() == 2:
+            return
+        self._enter()
+        auto healthy = False
+        try:
+            auto command = b"UNWATCH"
+            if self._multi:
+                command = b"DISCARD"
+            self._transaction_ok(encode_command([command]))
+            healthy = True
+        finally:
+            self._finish(healthy)
 
 # One connection has one active owner. The atomic state protects both socket
 # access and the reply buffer: 0=idle, 1=owned, 2=closed. Sharing requires callers
@@ -1220,6 +1424,39 @@ struct Connection:
     int64 _read_size
     Options _config
     bytes _last_error
+
+    def _invalidate(self):
+        _close_socket(self._socket, self._config.secure)
+        self._reader = decoder(self._max_frame, self._max_depth)
+        self._state.store(2)
+
+    def transaction(self) -> Transaction:
+        if not self._state.compare_and_swap(0, 1):
+            if self._state.load() == 2:
+                raise ConnectionError("Redis connection is closed")
+            raise BusyError("Redis connection is in use")
+        return Transaction(self, Atomic(0), Atomic(0), False, 0)
+
+    # Reset has its own finite budget, even when ordinary command timeouts are
+    # disabled. It is only called while the pool lease is exclusively owned.
+    def _pool_reset(self, int64 timeout_ms):
+        if not self._state.compare_and_swap(0, 1):
+            raise BusyError("Redis connection is not idle for pool reset")
+        auto healthy = False
+        try:
+            auto deadline = _budget(timeout_ms)
+            net.set_deadline_ns(self._socket, deadline)
+            auto reply = self._wire_reply(encode_command([b"RESET"]), deadline)
+            _status_value(reply, b"RESET")
+            self._initialize(deadline)
+            net.set_deadline_ns(self._socket, 0)
+            self._last_error = b""
+            healthy = True
+        finally:
+            if healthy:
+                self._state.store(0)
+            else:
+                self._invalidate()
 
     def is_closed(self) -> bool:
         return self._state.load() == 2
@@ -1806,8 +2043,8 @@ struct Connection:
 
 # Snapshot and validate options before touching the network. Session setup is
 # performed with exclusive ownership and closes the socket on ANY failure.
-def connect_options(Options config) -> Connection:
-    auto cfg = options(
+def _snapshot_options(Options config) -> Options:
+    return options(
         config.host,
         config.port,
         config.database,
@@ -1823,6 +2060,9 @@ def connect_options(Options config) -> Connection:
         config.command_timeout_ms,
         config.resolved_ip,
     )
+
+def connect_options(Options config) -> Connection:
+    auto cfg = _snapshot_options(config)
     auto deadline = _budget(cfg.connect_timeout_ms)
     auto socket = _dial(cfg, deadline)
     Atomic[int64] state = Atomic(1)
@@ -1889,3 +2129,253 @@ def connect(
 
 def connect_url(str address) -> Connection:
     return connect_options(parse_url(address))
+
+struct PoolClosed:
+    str message
+
+struct PoolTimeout:
+    str message
+
+struct LeaseError:
+    str message
+
+def _pool_waiter(channel[bool] changed):
+    auto notified = <-changed
+
+# The only helper coroutine owns a notification wait, never a socket or a lease.
+# The scope always joins it before timeout/cancellation can leave this function.
+def _pool_wait(channel[bool] changed, int64 deadline):
+    if deadline == 0:
+        auto notified = <-changed
+    else:
+        auto remaining = deadline - time.monotonic_ns()
+        if remaining <= 0:
+            raise PoolTimeout("Redis pool acquisition timed out")
+        auto milliseconds = remaining // 1000000
+        if remaining % 1000000 > 0:
+            milliseconds = milliseconds + 1
+        try:
+            scope(timeout=milliseconds):
+                spawn _pool_waiter(changed)
+        except ScopeTimeout:
+            raise PoolTimeout("Redis pool acquisition timed out")
+    checkpoint()
+    if deadline > 0 and time.monotonic_ns() >= deadline:
+        raise PoolTimeout("Redis pool acquisition timed out")
+
+struct Pool:
+    Options _config
+    int64 _capacity
+    int64 _acquire_timeout_ms
+    int64 _reset_timeout_ms
+    bytes _mutex
+    list[Connection] _idle
+    int64 _idle_count
+    int64 _size
+    bool _closed
+    channel[bool] _changed
+
+    # All state changes occur under the mutex. Closing a generation broadcasts
+    # without a cancellable channel send, so finally cleanup cannot lose slots.
+    def _notify(self):
+        auto previous = self._changed
+        self._changed = channel[bool]()
+        close(previous)
+
+    def size(self) -> int64:
+        sync.lock(self._mutex)
+        auto size = self._size
+        sync.unlock(self._mutex)
+        return size
+
+    def is_shutdown(self) -> bool:
+        sync.lock(self._mutex)
+        auto closed = self._closed
+        sync.unlock(self._mutex)
+        return closed
+
+    def _return(self, Connection connection, bool reusable) -> bool:
+        sync.lock(self._mutex)
+        auto keep = reusable and not self._closed
+        if keep:
+            if self._idle_count == len(self._idle):
+                self._idle.append(connection)
+            else:
+                self._idle[self._idle_count] = connection
+            self._idle_count = self._idle_count + 1
+            self._notify()
+        sync.unlock(self._mutex)
+        if not keep:
+            try:
+                connection.disconnect()
+            finally:
+                self._failed_creation()
+        return keep
+
+    def _failed_creation(self):
+        sync.lock(self._mutex)
+        self._size = self._size - 1
+        self._notify()
+        sync.unlock(self._mutex)
+
+    def acquire(self, bool dedicated = False) -> Lease:
+        auto deadline = _budget(self._acquire_timeout_ms)
+        while True:
+            checkpoint()
+            sync.lock(self._mutex)
+            if self._closed:
+                sync.unlock(self._mutex)
+                raise PoolClosed("Redis pool has shut down")
+            list[Connection] selected = []
+            auto reserved = False
+            if self._idle_count > 0:
+                self._idle_count = self._idle_count - 1
+                selected.append(self._idle[self._idle_count])
+                reserved = True
+            elif self._size < self._capacity:
+                self._size = self._size + 1
+                reserved = True
+            auto changed = self._changed
+            sync.unlock(self._mutex)
+            if reserved:
+                auto lent = False
+                try:
+                    if len(selected) == 0:
+                        selected.append(connect_options(self._config))
+                    checkpoint()
+                    sync.lock(self._mutex)
+                    auto stopped = self._closed
+                    sync.unlock(self._mutex)
+                    if stopped:
+                        raise PoolClosed(
+                            "Redis pool shut down during connection initialization",
+                        )
+                    auto lease = Lease(self, selected[0], Atomic(0), dedicated)
+                    lent = True
+                    return lease
+                finally:
+                    if not lent:
+                        try:
+                            if len(selected) > 0:
+                                selected[0].disconnect()
+                        finally:
+                            self._failed_creation()
+            _pool_wait(changed, deadline)
+
+    # Stop admission and close idle sockets now. Existing leases retain exclusive
+    # ownership; they are discarded on release. Pending creation is also rejected.
+    def shutdown(self):
+        sync.lock(self._mutex)
+        if self._closed:
+            sync.unlock(self._mutex)
+            return
+        self._closed = True
+        list[Connection] idle = []
+        for i in range(0, self._idle_count):
+            idle.append(self._idle[i])
+        self._size = self._size - self._idle_count
+        self._idle_count = 0
+        self._notify()
+        sync.unlock(self._mutex)
+        for connection in idle:
+            connection.disconnect()
+
+# No Connection accessor: a retained old lease must not operate on a socket
+# after another borrower acquires it. The guard also spans transaction lifetime.
+struct Lease:
+    Pool _pool
+    Connection _connection
+    Atomic[int64] _guard
+    bool _dedicated
+
+    def _enter(self):
+        if not self._guard.compare_and_swap(0, 1):
+            if self._guard.load() == 2:
+                raise LeaseError("Redis lease has already been released")
+            raise BusyError("Redis lease is in use")
+
+    def execute(self, list[bytes] args) -> Reply:
+        if not self._dedicated and _stream_command(args):
+            raise ValueError("Streaming/protocol commands require a dedicated lease")
+        self._enter()
+        try:
+            return self._connection.execute(args)
+        finally:
+            self._guard.store(0)
+
+    def execute_raw(self, list[bytes] args) -> Reply:
+        if not self._dedicated and _stream_command(args):
+            raise ValueError("Streaming/protocol commands require a dedicated lease")
+        self._enter()
+        try:
+            return self._connection.execute_raw(args)
+        finally:
+            self._guard.store(0)
+
+    def execute_pipeline(self, Pipeline batch) -> list[Reply]:
+        if not self._dedicated and batch._streaming:
+            raise ValueError("Streaming/protocol commands require a dedicated lease")
+        self._enter()
+        try:
+            return batch.execute(self._connection)
+        finally:
+            self._guard.store(0)
+
+    def transaction(self) -> Transaction:
+        self._enter()
+        auto started = False
+        try:
+            auto session = self._connection.transaction()
+            session._lease_guard = self._guard
+            started = True
+            return session
+        finally:
+            if not started:
+                self._guard.store(0)
+
+    def _release(self, bool reuse) -> bool:
+        self._enter()
+        auto reusable = False
+        auto kept = False
+        try:
+            if reuse and not self._dedicated and not self._connection.is_closed() and not self._pool.is_shutdown():
+                try:
+                    self._connection._pool_reset(self._pool._reset_timeout_ms)
+                    reusable = True
+                except Exception:
+                    reusable = False
+        finally:
+            self._guard.store(2)
+            kept = self._pool._return(self._connection, reusable)
+        return kept
+
+    def release(self) -> bool:
+        return self._release(True)
+
+    def discard(self):
+        self._release(False)
+
+# No eager sockets; every new connection receives the same validated snapshot.
+# Acquisition timeout bounds capacity waiting; dialing/session setup use Options'
+# connect budget (and retain its documented synchronous-DNS limitation).
+def pool(
+    Options config,
+    int64 capacity = 8,
+    int64 acquire_timeout_ms = 1000,
+    int64 reset_timeout_ms = 1000,
+) -> Pool:
+    if capacity < 1 or acquire_timeout_ms < 0 or reset_timeout_ms < 1:
+        raise ValueError("invalid Redis pool limits")
+    list[Connection] idle = []
+    return Pool(
+        _snapshot_options(config),
+        capacity,
+        acquire_timeout_ms,
+        reset_timeout_ms,
+        sync.mutex(),
+        idle,
+        0,
+        0,
+        False,
+        channel[bool](),
+    )
