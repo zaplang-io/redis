@@ -28,6 +28,8 @@ def wire_peer(bytes listener, bytes key, bytes value, channel[bool] done):
         net.send(socket, bulk(value))
         command(socket, [b"BLMOVE", key, b"dest", b"LEFT", b"RIGHT", b"0"])
         net.send(socket, b"$-1\r\n")
+        command(socket, [b"BLMOVE", key, b"dest", b"LEFT", b"RIGHT", b"0"])
+        net.send(socket, b"*-1\r\n")
         command(socket, [b"BLPOP", key, b"0"])
         net.send(socket, b"*1\r\n" + bulk(value))
         command(socket, [b"BLPOP", key, b"0"])
@@ -91,6 +93,11 @@ def wire():
             check(True, "null bulk timeout")
         case _:
             raise ValueError("expected null bulk timeout")
+    match conn.blmove(key, b"dest"):
+        case Optional.None:
+            check(True, "blocked BLMOVE timeout is a null array")
+        case _:
+            raise ValueError("expected blocked BLMOVE null array")
     rejected = 0
     for i in range(0, 2):
         try:

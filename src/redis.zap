@@ -927,6 +927,15 @@ def _blocking_pop_reply(Reply reply, list[bytes] keys) -> Optional[KeyValue]:
         case _:
             raise ProtocolError("Expected blocking pop pair or null array")
 
+# Redis's blocked-list timeout path emits a null array even for BLMOVE,
+# whose successful reply is bulk bytes. Keep ordinary bulk helpers strict.
+def _blocking_move_reply(Reply reply) -> Optional[bytes]:
+    match reply:
+        case Reply.NullArray:
+            return None
+        case _:
+            return _bulk_value(reply)
+
 def _list_side(str side) -> bytes:
     auto normalized = side.upper()
     if normalized != "LEFT" and normalized != "RIGHT":
@@ -1829,7 +1838,7 @@ struct Connection:
             _list_side(destination_side),
             _blocking_timeout(server_timeout_seconds),
         ]
-        return _bulk_value(self.execute(args))
+        return _blocking_move_reply(self.execute(args))
 
     def _set_members(self, bytes command, bytes key, list[bytes] members) -> int64:
         if len(members) == 0:
