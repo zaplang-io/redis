@@ -656,3 +656,54 @@ SCAN TYPE and HSCAN NOVALUES are outside this slice; use raw `execute` for
 those options.
 
 Reference: [Redis SCAN family and guarantees](https://redis.io/docs/latest/commands/scan/).
+
+## Lua scripts
+
+`eval(source, keys, arguments)` and `evalsha(sha, keys, arguments)` return raw
+`redis.Reply` values, preserving nested arrays, nulls, integers, binary bulk
+strings, and nested error values. Top-level server errors raise `ResponseError`.
+The client derives `numkeys` from `len(keys)` and writes all keys before all
+arguments; callers cannot supply a mismatched or negative key count.
+
+`script_load(source) -> bytes` validates Redis's SHA1 against the exact source.
+`script_exists(shas) -> list[bool]` preserves input order, including repeated
+SHAs. SHA arguments must contain 40 ASCII hex bytes; empty SCRIPT EXISTS lists
+and invalid SHAs fail locally. Source, keys, and arguments are binary bytes.
+
+```zap
+auto script = redis.register_script(b"return redis.call('GET', KEYS[1])")
+list[bytes] arguments = []
+auto reply = script.run(conn, [b"application:key"], arguments)
+auto sha = script.sha()
+```
+
+Registration computes SHA1 locally and performs no I/O. Each `run` first uses
+EVALSHA. Only a top-level error whose exact prefix is NOSCRIPT causes one EVAL
+fallback with the original source, keys, and arguments. Redis caches that
+source for later calls. An EVAL error is propagated without another fallback.
+Other errors and transport/protocol failures are never retried or automatically
+reconnected; a failed reply can follow a completed side effect. Bare EVALSHA
+never falls back. Do not use NOSCRIPT as an application-defined script error
+code; it is the registered helper's cache-miss signal.
+
+Redis Functions and automatic script warmup are outside this API. Current
+transport cancellation/deadline limitations still apply. Tests simulate cache
+loss and interrupted execution without issuing global SCRIPT FLUSH.
+
+References: [EVAL](https://redis.io/docs/latest/commands/eval/),
+[EVALSHA](https://redis.io/docs/latest/commands/evalsha/).
+
+## Generated parser checks and performance
+
+The deterministic RESP2 suite uses seed 322 for generated valid trees, every
+proper prefix, arbitrary byte inputs, hostile headers, wide/deep arrays, and
+fragmented binary bulk strings. Live tests compare generated nested Lua replies
+from Redis with the decoder's representation. Decoder/connection `max_depth`
+is now restricted to 0–256 (default 64), keeping recursive parsing within a
+fixed stack budget. `decode` returns an invalid diagnostic for unsupported
+limits; connection options raise `ValueError` before connecting.
+
+Command encoding uses balanced byte-fragment concatenation, reducing copying
+for many-argument commands. Diagnostic timings and the copied-byte model run
+with the offline suite. See [the reproducible workload](tools/bench/resp2.zap)
+and [parser performance notes](docs/parser-performance.md) for scope and limits.

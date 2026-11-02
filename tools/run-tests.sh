@@ -27,4 +27,14 @@ for source in "$here"/tests/*_test.zap; do
         cat "$build/actual"
     fi
 done
+# Keep diagnostic timing separate from golden-output assertions.
+cp "$here/tools/bench/resp2.zap" "$build/resp2_bench.zap"
+if [ "${1:-}" = "--check" ]; then
+    "$zap" ir "$build/resp2_bench.zap" > /dev/null
+    echo 'resp2_bench: frontend PASS'
+else
+    if ! "$zap" run "$build/resp2_bench.zap"; then
+        failed=1
+    fi
+fi
 exit "$failed"
