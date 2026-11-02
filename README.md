@@ -7,6 +7,18 @@ The package includes a binary-safe RESP2 codec, TCP connections, typed errors,
 explicit reconnect, URL configuration, verified TLS, and session initialization. Typed command
 helpers are still planned.
 
+## Installation and support
+
+Version 0.1.0 is an **unreleased candidate**. Use a reviewed checkout with a Zap
+path dependency (`zap add redis --path ../redis`, then `zap zenv create --no-venv`)
+and activate that environment before `import redis`. Do not copy the library
+module beside your application. CI verifies external path and static-registry
+consumers and executes the [complete examples](examples).
+
+See [installation and release checks](docs/RELEASING.md), the exact
+[Zap/Redis support matrix](docs/SUPPORT.md), and [changelog](CHANGELOG.md).
+No public tag or hosted-registry publication is implied by the manifest version.
+
 ## TCP connection
 
 ```zap
@@ -271,10 +283,10 @@ handles partial OS writes internally; the client also checks write progress.
 
 ## Development
 
-Use medium-sized individual issues. Issues for this library belong in
-`zaplang-io/redis`. Follow-up slices: TCP connection lifecycle and incremental
-buffering; command helpers and integration tests against Redis. Keep this codec
-independent of transport and command policy.
+Use medium-sized issues in `zaplang-io/redis` and group two compatible issues
+per implementation PR. Notify the reviewer when ready; merge only after that
+specific PR is reviewed/approved. Keep CI on PRs and main pushes. The remaining
+optional roadmap is listed in [SUPPORT.md](docs/SUPPORT.md).
 
 ## Live integration tests
 
@@ -551,12 +563,41 @@ in `last_error()`.
 LRANGE validates a non-null array of non-null bulk elements. Unexpected typed
 replies raise `ProtocolError` after consuming the complete frame, following the
 same connection recovery contract as other helpers. No command is replayed.
-Typed blocking list operations are tracked separately in #15. The list helpers
-above add no blocking command or multi-pop variant; raw `execute` remains available for unsupported commands.
+Blocking list helpers are described below. Multi-pop variants remain available
+through raw commands on a standalone connection or dedicated lease.
 
 References: [LPUSH](https://redis.io/docs/latest/commands/lpush/),
 [LRANGE](https://redis.io/docs/latest/commands/lrange/),
 [LSET](https://redis.io/docs/latest/commands/lset/).
+
+## Blocking list consumers
+
+| Method | Result |
+| --- | --- |
+| `blpop(keys, server_timeout_seconds=0.0)` | `Optional[redis.KeyValue]` with binary key/value |
+| `brpop(keys, server_timeout_seconds=0.0)` | Same, popping the rightmost value |
+| `blmove(source, destination, source_side="LEFT", destination_side="RIGHT", server_timeout_seconds=0.0)` | `Optional[bytes]` moved value |
+
+Sides accept LEFT/RIGHT case-insensitively. Pop calls require at least one key (an empty byte key is valid); values and keys remain bytes. Negative/non-finite timeouts and invalid
+sides are local ValueErrors. Server timeouts use seconds, including fractional
+seconds: zero asks Redis to wait indefinitely. A server timeout returns None and
+keeps the connection reusable. Positive client `command_timeout_ms` and structured
+scope cancellation independently bound the whole network exchange; either closes
+and discards an incomplete connection, without replay. A popped/moved value may
+already have changed Redis when the transport fails.
+
+Use a standalone connection or `pool.acquire(dedicated=True)`. Typed helpers,
+raw blocking list/sorted-set commands, and pipeline batches containing those
+commands are rejected on ordinary pool leases. Dedicated leases reserve capacity
+for their lifetime and close on release, including server-timeout success.
+No timer/socket worker survives a cancelled operation. Always release/disconnect
+in `finally`; see the [complete producer/consumer example](examples/blocking.zap).
+
+These methods use Redis [BLPOP](https://redis.io/docs/latest/commands/blpop/),
+[BRPOP](https://redis.io/docs/latest/commands/brpop/), and
+[BLMOVE](https://redis.io/docs/latest/commands/blmove/). BLPOP/BRPOP support fractional
+timeouts on Redis 6.0+; BLMOVE requires 6.2+. The tested server matrix is narrower
+and is recorded in [SUPPORT.md](docs/SUPPORT.md).
 
 ## Set commands
 

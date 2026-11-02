@@ -120,8 +120,8 @@ structured `Cancelled` propagates after closing and returning capacity. Use
 `discard()` to skip reset and close deliberately. This makes cleanup safe even
 when ordinary command budgets are disabled.
 
-Streaming/protocol commands (SUBSCRIBE variants, MONITOR, HELLO, replication
-stream commands) require `acquire(dedicated=True)` and are rejected locally on
+Blocking list/sorted-set and streaming/protocol commands (BLPOP/BRPOP/BLMOVE
+variants, SUBSCRIBE variants, MONITOR, HELLO, replication stream commands) require `acquire(dedicated=True)` and are rejected locally on
 ordinary leases, including pipeline batches. Dedicated leases always close on
 release and reserve capacity for their lifetime. They provide exclusive ownership;
 this change does not implement a subscription/push reader or RESP3 negotiation.
