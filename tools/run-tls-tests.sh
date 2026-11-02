@@ -34,7 +34,12 @@ for source in "$here"/tests/tls/*_test.zap; do
         "$zap" ir "$build/$name.zap" > /dev/null
         echo "$name: frontend PASS"
     else
-        if "$timeout_command" -k 5s 60s "$zap" run "$build/$name.zap" > "$build/actual"; then
+        if ! "$zap" build "$build/$name.zap" -o "$build/$name"; then
+            echo "$name: compilation failed" >&2
+            failed=1
+            continue
+        fi
+        if "$timeout_command" -k 5s 60s "$build/$name" > "$build/actual"; then
             if ! diff -u "$here/tests/tls/$name.expected" "$build/actual"; then
                 failed=1
             fi
