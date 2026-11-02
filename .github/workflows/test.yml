@@ -10,15 +10,13 @@ jobs:
     name: Offline codec and connection tests
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    container: ghcr.io/zaplang-io/zap@sha256:77f68f492779b2d3c58cb6fa1f25363766c83b7ea0a7b5a25f7d92582bbd73d6
+    container: ghcr.io/zaplang-io/zap@sha256:6f5ee485dfbdbd8c0593dee8b16f6f8523d6db30487b228b1d47184b961c26b8
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
       - name: Execute offline tests
         run: sh tools/run-tests.sh
       - name: Execute verified TLS transport tests
         run: sh tools/run-tls-tests.sh
-      - name: Diagnose scope cancellation of TCP reads
-        run: zap run tools/audit/net-cancel-probe.zap
   integration:
     name: Live Redis ${{ matrix.server.version }}
     runs-on: ubuntu-latest
@@ -31,7 +29,7 @@ jobs:
             image: redis:7.4.12@sha256:b6b6e3dc0c0952737748e55d5d885272840c7e42ba41ab1d5489f693419882f5
           - version: 8.10.3
             image: redis:8.10.3@sha256:de1068af6f552240dfab67bcc9bfef99bfc60f776bb4580ef077ea4c8c97e848
-    container: ghcr.io/zaplang-io/zap@sha256:77f68f492779b2d3c58cb6fa1f25363766c83b7ea0a7b5a25f7d92582bbd73d6
+    container: ghcr.io/zaplang-io/zap@sha256:6f5ee485dfbdbd8c0593dee8b16f6f8523d6db30487b228b1d47184b961c26b8
     services:
       redis:
         image: ${{ matrix.server.image }}

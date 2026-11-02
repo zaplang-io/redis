@@ -42,9 +42,8 @@ The connection fields and direct construction are internal; use `connect()`.
 
 Transport failures, EOF before a complete reply, and invalid framing close the
 connection and discard buffered bytes. Commands are never automatically retried.
-A failed operation might already have executed on the server. Pooling and
-configurable deadlines have separate backlog issues. Use a dedicated connection for stateful
-commands and manage its lifetime with `try/finally`.
+A failed operation might already have executed on the server. Pooling has a separate backlog issue. Configurable deadlines are described
+below. Use a dedicated connection for stateful commands and manage its lifetime with `try/finally`.
 
 `max_frame` (default 16 MiB) and `max_depth` (default 64) apply to each incoming
 reply. The receive buffer is bounded by `max_frame`; outgoing command size is
@@ -136,9 +135,9 @@ options in the current Zap TLS client API; mutual TLS is not supported by this
 Redis slice. Do not change global trust settings around concurrent connections
 to imitate isolated CA configuration. Core support is tracked in [zap#560](https://github.com/zaplang-io/zap/issues/560).
 
-TLS handshakes and reads/writes currently share the runtime deadline/cancellation
-limitations documented for #7. This feature does not add bounded handshakes or
-command deadlines.
+TLS supports the connect and command budgets described below. For a bounded
+hostname connection, supply `resolved_ip` while retaining the certificate hostname
+in `host`; verification and SNI continue to use that hostname.
 
 ### TLS tests
 
@@ -197,8 +196,8 @@ Reconnecting creates a fresh Redis session and reapplies the configured AUTH,
 SELECT, and client name. WATCH/MULTI state, subscriptions, and other session state
 are not restored. Callers must decide how to recover after an ambiguously executed
 operation. Cancellation that reaches the operation propagates and closes the
-socket during cleanup. The current runtime does not wake a TCP read merely
-because its enclosing scope was cancelled; see the deadline audit below.
+socket during cleanup. The pinned runtime wakes parked TCP/TLS operations on
+scope cancellation; synchronous hostname resolution remains unbounded.
 
 ## Codec
 
@@ -299,7 +298,8 @@ REDIS_TEST_URL=redis://127.0.0.1:6379/0 ZAP=/path/to/zap \
 ```
 
 There is no implicit localhost connection. The endpoint must permit PING, INFO,
-ECHO, GET/SET/DEL, LPUSH (for WRONGTYPE checks), and CLIENT ID. Credentials can be
+ECHO, GET/SET/DEL, LPUSH (for WRONGTYPE checks), BLPOP (for timeout checks),
+and CLIENT ID. Credentials can be
 supplied in the URL using the usual percent-encoding rules. The runner does not
 print the URL. Basic tests use unique random key prefixes, delete only their
 registered keys in finally cleanup, and set a 60-second fallback TTL. They do
@@ -328,17 +328,64 @@ directory with a matching `.expected` output file. Any suite that mutates ACLs
 or otherwise needs administrative isolation must explicitly require isolated
 mode and be selected accordingly in the runner.
 
-## Deadline support status
+## Deadlines and cancellation
 
-Connection and total command deadlines ([#7](https://github.com/zaplang-io/redis/issues/7))
-are blocked by missing core socket primitives. No timeout options are currently
-exposed. A scope timeout alone does not interrupt the pinned runtime's parked
-TCP read: the bounded audit requested 100 ms but the scope drained only after
-the peer replied roughly one second later. Normal failure/EOF cleanup still
-works; it cannot substitute for interruptible I/O.
+`connect()`, `options()`, and `connect_options()` support `connect_timeout_ms`
+and `command_timeout_ms` (zero disables; negative values are rejected). A connect
+budget includes TCP, verified TLS handshake, and AUTH/SELECT/CLIENT SETNAME.
+Bounded connects require a numeric `host` or `resolved_ip`; with a resolved address,
+`host` remains the TLS certificate/SNI name. DNS is a caller-owned prerequisite.
+The existing unbounded hostname path remains available when the connect budget
+is zero and no resolved address is supplied.
 
-See [the deadline capability audit](docs/deadlines.md) for the reproducer,
-upstream prerequisites, and the acceptance checks required before #7 can close.
+The command budget covers the full write and reply sequence, including fragmented
+reads and every reply of a pipeline. It starts after local encoding/acquiring the
+connection, resets for each operation, and does not run while the connection is idle.
+Timeouts raise `redis.ConnectTimeout` or `redis.CommandTimeout`; scope cancellation
+propagates as `Cancelled`. Incomplete exchanges close/discard the connection before
+returning. Reconnect explicitly, and never automatically replay ambiguous operations.
+
+```zap
+auto conn = redis.connect(connect_timeout_ms=1000, command_timeout_ms=500)
+try:
+    conn.ping()
+finally:
+    conn.disconnect()
+```
+
+URL queries accept `connect_timeout_ms`, `command_timeout_ms`, and `resolved_ip`.
+For example: `rediss://localhost:6379?resolved_ip=127.0.0.1&connect_timeout_ms=1000`.
+See [deadline semantics and regression coverage](docs/deadlines.md), including the
+unbounded synchronous DNS limitation and ownership rules.
+
+## Bounded pipelines
+
+```zap
+auto batch = redis.pipeline(max_commands=128, max_bytes=1048576)
+batch.queue([b"SET", b"key", b"value"])
+batch.queue([b"GET", b"key"])
+auto replies = batch.execute(conn)
+```
+
+Queueing snapshots each command's encoded bytes. Limits count the complete RESP
+request, including framing, and are checked before encoding/appending that command.
+Defaults are 1024 commands and 16 MiB of encoded requests. Invalid/over-limit queue
+attempts leave previously queued commands intact and perform no network I/O.
+
+Execution sends the batch together, consumes exactly one reply per command in
+order, and returns `list[redis.Reply]`. Server errors remain `Reply.Error` values,
+including a middle-command error followed by success; `last_error()` retains the
+last consumed top-level error. All replies are drained before reuse. An empty batch
+returns an empty list without sending. Every reply retains the connection's
+`max_frame`/`max_depth` limits; the command count also bounds the result list.
+The request-byte limit is not an aggregate response-byte limit.
+
+The builder is for one caller and seals on the first execution attempt, including
+failure or `BusyError`; it cannot be queued or executed again. Transport, protocol,
+timeout, or cancellation failure returns no partial result and discards the
+connection. One command budget covers the entire batch. This is non-transactional
+pipelining: commands can partially execute and are not automatically retried.
+Use a dedicated connection for stateful commands; transactions have a separate issue.
 
 ## Typed key and string commands
 
@@ -484,9 +531,8 @@ in `last_error()`.
 LRANGE validates a non-null array of non-null bulk elements. Unexpected typed
 replies raise `ProtocolError` after consuming the complete frame, following the
 same connection recovery contract as other helpers. No command is replayed.
-Blocking list operations are tracked separately in #15, and depend on core
-cancellation/deadline support. This slice adds no blocking command or multi-pop
-variant; raw `execute` remains available for unsupported commands.
+Typed blocking list operations are tracked separately in #15. The list helpers
+above add no blocking command or multi-pop variant; raw `execute` remains available for unsupported commands.
 
 References: [LPUSH](https://redis.io/docs/latest/commands/lpush/),
 [LRANGE](https://redis.io/docs/latest/commands/lrange/),
@@ -687,7 +733,7 @@ never falls back. Do not use NOSCRIPT as an application-defined script error
 code; it is the registered helper's cache-miss signal.
 
 Redis Functions and automatic script warmup are outside this API. Current
-transport cancellation/deadline limitations still apply. Tests simulate cache
+the connection's cancellation/deadline policy applies. Tests simulate cache
 loss and interrupted execution without issuing global SCRIPT FLUSH.
 
 References: [EVAL](https://redis.io/docs/latest/commands/eval/),

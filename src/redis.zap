@@ -629,6 +629,12 @@ struct ProtocolError:
 struct ConnectionError:
     str message
 
+struct ConnectTimeout:
+    str message
+
+struct CommandTimeout:
+    str message
+
 struct BusyError:
     str message
 
@@ -648,14 +654,36 @@ def _error_text(bytes raw) -> str:
     except Exception:
         return "Redis server error (hex): " + hex.encode(raw)
 
+# Convert relative budgets once; partial I/O never restarts the clock.
+def _budget(int64 milliseconds) -> int64:
+    if milliseconds == 0:
+        return 0
+    auto now = time.monotonic_ns()
+    if milliseconds > (9223372036854775807 - now) // 1000000:
+        return 9223372036854775807
+    return now + milliseconds * 1000000
+
+def _check_budget(int64 deadline):
+    if deadline > 0 and time.monotonic_ns() >= deadline:
+        raise CommandTimeout("Redis command deadline exceeded")
+
 # TLS uses the verified stdlib entry point only. Failure never retries as TCP.
-def _dial(str host, int64 port, bool secure) -> bytes:
+def _dial(Options cfg, int64 deadline) -> bytes:
     try:
-        if secure:
-            return tls.connect(host, port)
-        return net.connect(host, port)
+        if deadline > 0 or len(cfg.resolved_ip) > 0:
+            auto ip = cfg.resolved_ip
+            if len(ip) == 0:
+                ip = cfg.host
+            if cfg.secure:
+                return tls.connect_resolved(cfg.host, ip, cfg.port, deadline)
+            return net.connect_ip_deadline(ip, cfg.port, deadline)
+        if cfg.secure:
+            return tls.connect(cfg.host, cfg.port)
+        return net.connect(cfg.host, cfg.port)
+    except TimeoutError:
+        raise ConnectTimeout("Redis connect deadline exceeded")
     except Exception as e:
-        if secure:
+        if cfg.secure:
             raise ConnectionError("Redis TLS connect failed: " + e)
         raise ConnectionError("Redis connect failed: " + e)
 
@@ -689,6 +717,9 @@ struct Options:
     int64 max_depth
     int64 read_size
     bool secure
+    int64 connect_timeout_ms
+    int64 command_timeout_ms
+    str resolved_ip
 
 # Diagnostics deliberately omit BOTH credentials, even when authentication is off.
 def describe_options(Options cfg) -> str:
@@ -715,6 +746,9 @@ def options(
     int64 max_depth = 64,
     int64 read_size = 4096,
     bool secure = False,
+    int64 connect_timeout_ms = 0,
+    int64 command_timeout_ms = 0,
+    str resolved_ip = "",
 ) -> Options:
     if len(host) == 0 or port < 1 or port > 65535:
         raise ValueError("invalid Redis host or port")
@@ -726,6 +760,17 @@ def options(
         raise ValueError("invalid Redis connection limits")
     if client_name !~ m/\A[\x21-\x7e]*\z/:
         raise ValueError("invalid Redis client name")
+    if connect_timeout_ms < 0 or command_timeout_ms < 0:
+        raise ValueError("Redis timeouts must not be negative")
+    # Core validates numeric addresses without DNS. Reject hostname-only bounded
+    # dials here instead of silently placing synchronous DNS outside the budget.
+    if connect_timeout_ms > 0 and len(resolved_ip) == 0:
+        if host !~ m/\A(?:[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|[0-9a-fA-F]*:[0-9a-fA-F:.]+)\z/:
+            raise ValueError(
+                "Bounded Redis connect requires numeric host or resolved_ip",
+            )
+    if len(resolved_ip) > 0 and resolved_ip !~ m/\A(?:[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|[0-9a-fA-F]*:[0-9a-fA-F:.]+)\z/:
+        raise ValueError("Redis resolved_ip must be numeric")
     auto auth = authenticate or len(username) > 0 or len(password) > 0
     return Options(
         host,
@@ -739,6 +784,9 @@ def options(
         max_depth,
         read_size,
         secure,
+        connect_timeout_ms,
+        command_timeout_ms,
+        resolved_ip,
     )
 
 def _unquote(str value) -> str:
@@ -797,6 +845,9 @@ def parse_url(str address) -> Options:
     auto password = _unquote(endpoint.group("password"))
     auto authenticate = authority.find("@") >= 0
     auto client_name = ""
+    auto connect_timeout_ms = 0
+    auto command_timeout_ms = 0
+    auto resolved_ip = ""
     if address.find("?") >= 0:
         auto pairs = parsed.group("query").split("&")
         dict[str, bool] seen = {}
@@ -813,6 +864,12 @@ def parse_url(str address) -> Options:
                 database = _uint(value, 2147483647)
             elif key == "client_name":
                 client_name = value
+            elif key == "connect_timeout_ms":
+                connect_timeout_ms = _uint(value, 9223372036854775807)
+            elif key == "command_timeout_ms":
+                command_timeout_ms = _uint(value, 9223372036854775807)
+            elif key == "resolved_ip":
+                resolved_ip = value
             else:
                 raise ValueError("unsupported Redis URL query option")
     auto cfg = options(
@@ -823,6 +880,9 @@ def parse_url(str address) -> Options:
         password,
         client_name,
         authenticate,
+        connect_timeout_ms=connect_timeout_ms,
+        command_timeout_ms=command_timeout_ms,
+        resolved_ip=resolved_ip,
     )
     cfg.secure = parsed.group("scheme") == "rediss"
     return cfg
@@ -1100,6 +1160,54 @@ struct RegisteredScript:
 def register_script(bytes source) -> RegisteredScript:
     return RegisteredScript(source, bytes(crypto.sha1(source)))
 
+# A builder is local to one caller. Execution seals it before touching the
+# connection; failures never leave a replayable queue. Replies retain errors.
+struct Pipeline:
+    list[bytes] _commands
+    int64 _bytes
+    int64 _max_commands
+    int64 _max_bytes
+    bool _sealed
+
+    def queue(self, list[bytes] args):
+        if self._sealed:
+            raise ValueError("Redis pipeline has already been executed")
+        if len(self._commands) >= self._max_commands:
+            raise ValueError("Redis pipeline command limit exceeded")
+        if len(args) == 0:
+            raise ValueError("a Redis command must have at least one argument")
+        auto remaining = self._max_bytes - self._bytes
+        auto size = len(str(len(args))) + 3
+        for arg in args:
+            auto header = len(str(len(arg))) + 5
+            if size > remaining or header > remaining - size:
+                raise ValueError("Redis pipeline byte limit exceeded")
+            size = size + header
+            if len(arg) > remaining - size:
+                raise ValueError("Redis pipeline byte limit exceeded")
+            size = size + len(arg)
+        if size > remaining:
+            raise ValueError("Redis pipeline byte limit exceeded")
+        self._commands.append(encode_command(args))
+        self._bytes = self._bytes + size
+
+    def execute(self, Connection connection) -> list[Reply]:
+        if self._sealed:
+            raise ValueError("Redis pipeline has already been executed")
+        self._sealed = True
+        auto count = len(self._commands)
+        auto wire = _join_bytes(self._commands, 0, count)
+        list[bytes] empty = []
+        self._commands = empty
+        self._bytes = 0
+        return connection._pipeline(wire, count)
+
+def pipeline(int64 max_commands = 1024, int64 max_bytes = 16777216) -> Pipeline:
+    if max_commands < 1 or max_bytes < 1:
+        raise ValueError("invalid Redis pipeline limits")
+    list[bytes] commands = []
+    return Pipeline(commands, 0, max_commands, max_bytes, False)
+
 # One connection has one active owner. The atomic state protects both socket
 # access and the reply buffer: 0=idle, 1=owned, 2=closed. Sharing requires callers
 # to serialize access; a concurrent execute/disconnect is rejected, never queued.
@@ -1139,12 +1247,11 @@ struct Connection:
         self._last_error = b""
         auto opened = False
         try:
-            self._socket = _dial(
-                self._config.host,
-                self._config.port,
-                self._config.secure,
-            )
-            self._initialize()
+            auto deadline = _budget(self._config.connect_timeout_ms)
+            self._socket = _dial(self._config, deadline)
+            net.set_deadline_ns(self._socket, deadline)
+            self._initialize(deadline)
+            net.set_deadline_ns(self._socket, 0)
             opened = True
         finally:
             if opened:
@@ -1155,8 +1262,12 @@ struct Connection:
                 self._last_error = b""
                 self._state.store(2)
 
-    def _session_ok(self, list[bytes] args, str stage):
-        auto reply = self._wire_reply(encode_command(args))
+    def _session_ok(self, list[bytes] args, str stage, int64 deadline):
+        auto reply = Reply.NullBulk
+        try:
+            reply = self._wire_reply(encode_command(args), deadline)
+        except CommandTimeout:
+            raise ConnectTimeout("Redis session initialization deadline exceeded")
         match reply:
             case Reply.Simple(data):
                 if data != b"OK":
@@ -1166,7 +1277,7 @@ struct Connection:
             case _:
                 raise ProtocolError("Unexpected Redis session reply: " + stage)
 
-    def _initialize(self):
+    def _initialize(self, int64 deadline):
         if self._config.authenticate:
             if len(self._config.username) > 0:
                 self._session_ok(
@@ -1176,15 +1287,25 @@ struct Connection:
                         bytes(self._config.password),
                     ],
                     "AUTH",
+                    deadline,
                 )
             else:
-                self._session_ok([b"AUTH", bytes(self._config.password)], "AUTH")
+                self._session_ok(
+                    [b"AUTH", bytes(self._config.password)],
+                    "AUTH",
+                    deadline,
+                )
         if self._config.database != 0:
-            self._session_ok([b"SELECT", bytes(str(self._config.database))], "SELECT")
+            self._session_ok(
+                [b"SELECT", bytes(str(self._config.database))],
+                "SELECT",
+                deadline,
+            )
         if len(self._config.client_name) > 0:
             self._session_ok(
                 [b"CLIENT", b"SETNAME", bytes(self._config.client_name)],
                 "CLIENT SETNAME",
+                deadline,
             )
 
     def ping(self) -> bool:
@@ -1577,7 +1698,10 @@ struct Connection:
             raise BusyError("Redis connection is in use")
         auto healthy = False
         try:
-            auto result = self._wire_reply(wire)
+            auto deadline = _budget(self._config.command_timeout_ms)
+            net.set_deadline_ns(self._socket, deadline)
+            auto result = self._wire_reply(wire, deadline)
+            net.set_deadline_ns(self._socket, 0)
             healthy = True
             match result:
                 case Reply.Error(data):
@@ -1595,10 +1719,48 @@ struct Connection:
                 self._reader = decoder(self._max_frame, self._max_depth)
                 self._state.store(2)
 
+    # All replies, including server errors, are returned in submission order.
+    # Ownership spans the entire write and drain. Never return a partial result.
+    def _pipeline(self, bytes wire, int64 count) -> list[Reply]:
+        if not self._state.compare_and_swap(0, 1):
+            if self._state.load() == 2:
+                raise ConnectionError("Redis connection is closed")
+            raise BusyError("Redis connection is in use")
+        auto healthy = False
+        list[Reply] replies = []
+        try:
+            auto deadline = _budget(self._config.command_timeout_ms)
+            net.set_deadline_ns(self._socket, deadline)
+            if count > 0:
+                self._write_wire(wire, deadline)
+                for i in range(0, count):
+                    auto result = self._read_reply(deadline)
+                    match result:
+                        case Reply.Error(data):
+                            self._last_error = data
+                            replies.append(result)
+                        case _:
+                            replies.append(result)
+            net.set_deadline_ns(self._socket, 0)
+            healthy = True
+            return replies
+        finally:
+            if healthy:
+                self._state.store(0)
+            else:
+                _close_socket(self._socket, self._config.secure)
+                self._reader = decoder(self._max_frame, self._max_depth)
+                self._state.store(2)
+
     # Caller holds the ownership state for the entire command/session setup.
-    def _wire_reply(self, bytes wire) -> Reply:
+    def _wire_reply(self, bytes wire, int64 deadline) -> Reply:
+        self._write_wire(wire, deadline)
+        return self._read_reply(deadline)
+
+    def _write_wire(self, bytes wire, int64 deadline):
         auto sent = 0
         while sent < len(wire):
+            _check_budget(deadline)
             # Zap net.send writes all bytes today; retain the loop and the
             # progress checks for transports that can return short writes.
             auto n = 0
@@ -1608,13 +1770,17 @@ struct Connection:
                     wire[sent:len(wire)],
                     self._config.secure,
                 )
+            except TimeoutError:
+                raise CommandTimeout("Redis command deadline exceeded during send")
             except Exception as e:
                 raise ConnectionError("Redis send failed: " + e)
             if n <= 0 or n > len(wire) - sent:
                 raise ConnectionError("Redis command write made invalid progress")
             sent = sent + n
+    def _read_reply(self, int64 deadline) -> Reply:
         auto result = self._reader.feed(b"")
         while True:
+            _check_budget(deadline)
             if result.status == "ok":
                 return result.value
             if result.status == "invalid":
@@ -1628,6 +1794,8 @@ struct Connection:
             auto chunk = b""
             try:
                 chunk = _receive_socket(self._socket, count, self._config.secure)
+            except TimeoutError:
+                raise CommandTimeout("Redis command deadline exceeded during receive")
             except Exception as e:
                 raise ConnectionError("Redis receive failed: " + e)
             if len(chunk) == 0:
@@ -1651,8 +1819,12 @@ def connect_options(Options config) -> Connection:
         config.max_depth,
         config.read_size,
         config.secure,
+        config.connect_timeout_ms,
+        config.command_timeout_ms,
+        config.resolved_ip,
     )
-    auto socket = _dial(cfg.host, cfg.port, cfg.secure)
+    auto deadline = _budget(cfg.connect_timeout_ms)
+    auto socket = _dial(cfg, deadline)
     Atomic[int64] state = Atomic(1)
     auto conn = Connection(
         socket,
@@ -1666,7 +1838,9 @@ def connect_options(Options config) -> Connection:
     )
     auto ready = False
     try:
-        conn._initialize()
+        net.set_deadline_ns(socket, deadline)
+        conn._initialize(deadline)
+        net.set_deadline_ns(socket, 0)
         ready = True
         return conn
     finally:
@@ -1690,6 +1864,9 @@ def connect(
     str client_name = "",
     bool authenticate = False,
     bool secure = False,
+    int64 connect_timeout_ms = 0,
+    int64 command_timeout_ms = 0,
+    str resolved_ip = "",
 ) -> Connection:
     return connect_options(
         options(
@@ -1704,6 +1881,9 @@ def connect(
             max_depth,
             read_size,
             secure,
+            connect_timeout_ms,
+            command_timeout_ms,
+            resolved_ip,
         ),
     )
 
