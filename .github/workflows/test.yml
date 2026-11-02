@@ -17,6 +17,8 @@ jobs:
         run: sh tools/run-tests.sh
       - name: Execute verified TLS transport tests
         run: sh tools/run-tls-tests.sh
+      - name: Verify reference-local relocation in the pinned runtime
+        run: timeout -k 5s 60s zap run tools/audit/immix-local-slot-probe.zap
   integration:
     name: Live Redis ${{ matrix.server.version }}
     runs-on: ubuntu-latest
