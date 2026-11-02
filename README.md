@@ -707,3 +707,71 @@ Command encoding uses balanced byte-fragment concatenation, reducing copying
 for many-argument commands. Diagnostic timings and the copied-byte model run
 with the offline suite. See [the reproducible workload](tools/bench/resp2.zap)
 and [parser performance notes](docs/parser-performance.md) for scope and limits.
+
+## Resumable RESP2 decoder
+
+Connections now use a persistent `redis.Decoder` to frame incoming RESP2 data.
+Headers and aggregate progress survive reads, bulk payloads are skipped by
+length, and completed children are not repeatedly turned into reply objects.
+Chunks merge in logarithmic size classes; unread coalesced data uses an offset,
+so draining replies does not repeatedly copy the remaining receive buffer.
+The complete frame is decoded into a `Reply` tree once.
+
+```zap
+auto parser = redis.decoder(max_frame=1048576, max_depth=64)
+auto result = parser.feed(b"$5\r\nhe")  # incomplete
+auto complete = parser.feed(b"llo\r\n+NEXT\r\n")  # first reply
+# Drain any coalesced replies before adding another input chunk.
+auto next_reply = parser.feed(b"")
+```
+
+`feed(chunk) -> Decoded` returns at most one reply. Its `consumed` is the
+complete frame length, including prior chunks, not a count within the latest
+chunk. When `has_pending()` is true, drain with `feed(b"")`; supplying more data
+raises `ValueError` without losing that pending input. Incomplete results have
+zero consumption. Malformed input poisons the decoder; create a new decoder
+for a new stream. `buffered_bytes()` reports the current incomplete frame size.
+
+`processed_bytes`, `copied_bytes`, and `frames_decoded` are cumulative diagnostic
+counters. The first counts bytes examined by framing, the second counts retained
+slice/merge payload copies (not RSS or all runtime allocations), and the third
+counts final tree builds. Framing is linear and retained copies are bounded by
+size-class merging rather than growing-buffer quadratic concatenation.
+
+Limits apply to each frame, including across chunks. A single input chunk can
+contain many frames; the caller already owns that chunk and should keep chunk
+sizes bounded. Connections use their configured read size. No background read,
+automatic retry, deadline, or cancellation primitive is added by this decoder.
+The stateless `decode` API remains supported. Performance results are in
+[parser performance notes](docs/parser-performance.md).
+
+## Decoder-only RESP3 values
+
+`decode3(data, max_frame=16777216, max_depth=64) -> Decoded3` decodes one
+fixed-length RESP3 value with the same status/consumption/diagnostic convention.
+The separate `redis.Resp3` enum preserves the existing RESP2 `Reply` API and
+exhaustive matches. **Connections remain RESP2**; no public HELLO negotiation or
+push delivery is introduced. Those session features remain in #26.
+
+RESP3 supports Simple/Error/Integer/Bulk/Array (including legacy NullBulk and
+NullArray), Null, Boolean, Double, BigNumber, BlobError, Verbatim, Map, Set,
+Attributed, and Push variants. Bulk/error payloads and members remain bytes.
+Big numbers retain their signed decimal bytes rather than narrowing to int64.
+Doubles use float64, including infinities and NaN; malformed syntax and decimal
+overflow/underflow are rejected before native conversion.
+
+Map and attribute entries are ordered `Resp3Pair(key, value)` lists, preserving
+binary/arbitrary keys and duplicate entries. `Resp3.Attributed(attributes,
+value)` associates metadata with the following value, even when nested; stacked
+attributes remain nested wrappers. Attribute bytes and their following value
+share the frame/depth budget. A Verbatim value retains its three-byte format
+and data separately. Sets/pushes retain their received item order without
+claiming set ordering or interpreting push messages as command replies.
+
+Streamed strings/aggregates (`$?`, `*?`, `%?`, chunk/terminator forms) are explicitly
+unsupported. Resource limits and invalid-frame diagnostics apply to every
+nested value and all fragment boundaries. Live decoder tests explicitly
+negotiate RESP3 only on a separate test socket; the library connection and typed
+command helpers continue to use RESP2.
+
+Reference: [Redis RESP3 data types](https://redis.io/docs/latest/develop/reference/protocol-spec/).

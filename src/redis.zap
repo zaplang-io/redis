@@ -162,6 +162,463 @@ def _parse(bytes data, int64 start, int64 limit, int64 depth) -> Decoded:
         i = i + 1
     return _ok(Reply.Array(items), pos)
 
+# Additive RESP2 incremental framer. Input bytes are scanned once, chunks are
+# merged in logarithmic size classes, and a complete tree is decoded once.
+struct Decoder:
+    int64 _max_frame
+    int64 _max_depth
+    list[bytes] _chunks
+    list[int64] _levels
+    list[int64] _stack
+    bytes _pending
+    int64 _offset
+    int64 _used
+    int64 _state
+    int64 _tag
+    int64 _number
+    int64 _digits
+    int64 _sign
+    int64 _left
+    str _error
+    int64 processed_bytes
+    int64 copied_bytes
+    int64 frames_decoded
+    int64 _chunk_count
+    int64 _stack_count
+
+    def buffered_bytes(self) -> int64:
+        return self._used
+
+    def has_pending(self) -> bool:
+        return self._offset < len(self._pending)
+
+    def _fail(self, str message) -> int64:
+        self._error = message
+        return -1
+
+    def _complete(self) -> int64:
+        self._state = 0
+        while self._stack_count > 0:
+            self._stack_count = self._stack_count - 1
+            auto remaining = self._stack[self._stack_count] - 1
+            if remaining > 0:
+                self._stack[self._stack_count] = remaining
+                self._stack_count = self._stack_count + 1
+                return 0
+        return 1
+
+    def _header_done(self) -> int64:
+        if self._tag == 43 or self._tag == 45:
+            return self._complete()
+        if self._digits == 0:
+            return self._fail("missing numeric digits")
+        if self._tag == 58:
+            return self._complete()
+        if self._sign == -1 and self._digits == 1 and self._number == -1:
+            return self._complete()
+        if self._sign != 0:
+            return self._fail("invalid length")
+        auto count = -self._number
+        if self._tag == 36:
+            if count > self._max_frame - self._used - 2:
+                return self._fail("bulk string exceeds byte limit")
+            self._left = count
+            self._state = 3
+            if count == 0:
+                self._state = 4
+            return 0
+        if self._stack_count >= self._max_depth:
+            return self._fail("array nesting exceeds depth limit")
+        if count > (self._max_frame - self._used) // 3:
+            return self._fail("array exceeds byte limit")
+        if count == 0:
+            return self._complete()
+        if self._stack_count == len(self._stack):
+            self._stack.append(count)
+        else:
+            self._stack[self._stack_count] = count
+        self._stack_count = self._stack_count + 1
+        self._state = 0
+        return 0
+
+    def _step(self, int64 byte) -> int64:
+        if self._state == 0:
+            if byte != 43 and byte != 45 and byte != 58 and byte != 36 and byte != 42:
+                return self._fail("unknown RESP2 type")
+            self._tag = byte
+            self._state = 1
+            self._number = 0
+            self._digits = 0
+            self._sign = 0
+            return 0
+        if self._state == 2:
+            if byte != 10:
+                return self._fail("CR must be followed by LF")
+            return self._header_done()
+        if self._state == 4:
+            if byte != 13:
+                return self._fail("bulk string missing CRLF")
+            self._state = 5
+            return 0
+        if self._state == 5:
+            if byte != 10:
+                return self._fail("bulk string missing CRLF")
+            return self._complete()
+        if byte == 13:
+            self._state = 2
+            return 0
+        if byte == 10:
+            return self._fail("bare LF in header")
+        if self._tag == 43 or self._tag == 45:
+            return 0
+        if self._digits == 0 and self._sign == 0 and (byte == 43 or byte == 45):
+            self._sign = 1
+            if byte == 45:
+                self._sign = -1
+            return 0
+        auto digit = byte - 48
+        if digit < 0 or digit > 9:
+            return self._fail("invalid decimal number")
+        auto last = 7
+        if self._sign == -1:
+            last = 8
+        if self._number < -922337203685477580 or self._number == -922337203685477580 and digit > last:
+            return self._fail("integer overflow")
+        self._number = self._number * 10 - digit
+        self._digits = self._digits + 1
+        return 0
+
+    def _retain(self, bytes data):
+        if len(data) == 0:
+            return
+        self.copied_bytes = self.copied_bytes + len(data)
+        auto current = data
+        auto level = _chunk_level(len(current))
+        while self._chunk_count > 0:
+            auto last = self._chunk_count - 1
+            if self._levels[last] > level:
+                break
+            self._chunk_count = self._chunk_count - 1
+            bytes previous = self._chunks[self._chunk_count]
+            self._chunks[self._chunk_count] = b""
+            self.copied_bytes = self.copied_bytes + len(previous) + len(current)
+            current = previous + current
+            level = _chunk_level(len(current))
+        if self._chunk_count == len(self._chunks):
+            self._chunks.append(current)
+            self._levels.append(level)
+        else:
+            self._chunks[self._chunk_count] = current
+            self._levels[self._chunk_count] = level
+        self._chunk_count = self._chunk_count + 1
+
+    def _finish(self) -> Decoded:
+        auto frame = b""
+        while self._chunk_count > 0:
+            self._chunk_count = self._chunk_count - 1
+            bytes previous = self._chunks[self._chunk_count]
+            self._chunks[self._chunk_count] = b""
+            self.copied_bytes = self.copied_bytes + len(previous) + len(frame)
+            frame = previous + frame
+        auto result = decode(frame, self._max_frame, self._max_depth)
+        if result.status != "ok":
+            self._error = "incremental frame validation failed: " + result.message
+            return _invalid(self._error)
+        self.frames_decoded = self.frames_decoded + 1
+        self._used = 0
+        self._state = 0
+        return result
+
+    # Drain coalesced frames with feed(b"") before supplying another chunk.
+    # Errors poison this decoder; create a new one to start another stream.
+    def feed(self, bytes chunk) -> Decoded:
+        if len(self._error) > 0:
+            return _invalid(self._error)
+        if len(chunk) > 0:
+            if self.has_pending():
+                raise ValueError(
+                    "Drain buffered replies before supplying another chunk",
+                )
+            self._pending = chunk
+            self._offset = 0
+        auto start = self._offset
+        while self._offset < len(self._pending):
+            if self._used >= self._max_frame:
+                self._error = "frame exceeds byte limit"
+                return _invalid(self._error)
+            if self._state == 3:
+                auto count = len(self._pending) - self._offset
+                if count > self._left:
+                    count = self._left
+                if count > self._max_frame - self._used:
+                    count = self._max_frame - self._used
+                self._offset = self._offset + count
+                self._used = self._used + count
+                self.processed_bytes = self.processed_bytes + count
+                self._left = self._left - count
+                if self._left == 0:
+                    self._state = 4
+            else:
+                auto byte = self._pending[self._offset]
+                self._offset = self._offset + 1
+                self._used = self._used + 1
+                self.processed_bytes = self.processed_bytes + 1
+                auto status = self._step(byte)
+                if status < 0:
+                    return _invalid(self._error)
+                if status == 1:
+                    self._retain(self._pending[start:self._offset])
+                    return self._finish()
+        self._retain(self._pending[start:self._offset])
+        self._pending = b""
+        self._offset = 0
+        if self._used >= self._max_frame:
+            self._error = "frame exceeds byte limit"
+            return _invalid(self._error)
+        return _incomplete()
+
+def _chunk_level(int64 size) -> int64:
+    auto level = 0
+    while size > 1:
+        size = (size + 1) // 2
+        level = level + 1
+    return level
+
+def decoder(int64 max_frame = 16777216, int64 max_depth = 64) -> Decoder:
+    if max_frame < 3 or max_depth < 0 or max_depth > 64:
+        raise ValueError("invalid decoder limits")
+    list[bytes] chunks = []
+    list[int64] levels = []
+    list[int64] stack = []
+    return Decoder(
+        max_frame,
+        max_depth,
+        chunks,
+        levels,
+        stack,
+        b"",
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        "",
+        0,
+        0,
+        0,
+        0,
+        0,
+    )
+
+# RESP3 values are separate from Reply so RESP2 consumers and exhaustive matches
+# retain their existing contract. Attributes belong to their following value.
+enum Resp3:
+    Simple(bytes data)
+    Error(bytes data)
+    Integer(int64 value)
+    Bulk(bytes data)
+    Array(list[Resp3] items)
+    NullBulk
+    NullArray
+    Null
+    Boolean(bool value)
+    Double(float64 value)
+    BigNumber(bytes decimal)
+    BlobError(bytes data)
+    Verbatim(bytes format, bytes data)
+    Map(list[Resp3Pair] pairs)
+    Set(list[Resp3] items)
+    Attributed(list[Resp3Pair] attributes, Resp3 value)
+    Push(list[Resp3] items)
+
+struct Resp3Pair:
+    Resp3 key
+    Resp3 value
+
+struct Decoded3:
+    str status
+    Resp3 value
+    int64 consumed
+    str message
+
+struct _Header3:
+    str status
+    int64 tag
+    bytes raw
+    int64 end
+    str message
+
+def _invalid3(str message) -> Decoded3:
+    return Decoded3("invalid", Resp3.Null, 0, message)
+
+def _incomplete3() -> Decoded3:
+    return Decoded3("incomplete", Resp3.Null, 0, "")
+
+def _ok3(Resp3 value, int64 end) -> Decoded3:
+    return Decoded3("ok", value, end, "")
+
+def _header3(bytes data, int64 start, int64 limit) -> _Header3:
+    if start >= limit:
+        return _Header3("invalid", 0, b"", 0, "frame exceeds byte limit")
+    if start >= len(data):
+        return _Header3("incomplete", 0, b"", 0, "")
+    auto tag = data[start]
+    if tag != 43 and tag != 45 and tag != 58 and tag != 36 and tag != 42 and tag != 95 and tag != 35 and tag != 44 and tag != 40 and tag != 33 and tag != 61 and tag != 37 and tag != 126 and tag != 124 and tag != 62:
+        return _Header3(
+            "invalid",
+            tag,
+            b"",
+            0,
+            "unknown RESP3 type or streamed encoding",
+        )
+    auto end = start + 1
+    while True:
+        if end >= limit:
+            return _Header3("invalid", tag, b"", 0, "frame exceeds byte limit")
+        if end >= len(data):
+            return _Header3("incomplete", tag, b"", 0, "")
+        if data[end] == 10:
+            return _Header3("invalid", tag, b"", 0, "bare LF in header")
+        if data[end] == 13:
+            if end + 1 >= limit:
+                return _Header3("invalid", tag, b"", 0, "frame exceeds byte limit")
+            if end + 1 >= len(data):
+                return _Header3("incomplete", tag, b"", 0, "")
+            if data[end + 1] != 10:
+                return _Header3("invalid", tag, b"", 0, "CR must be followed by LF")
+            return _Header3("ok", tag, data[start + 1:end], end + 2, "")
+        end = end + 1
+
+def decode3(bytes data, int64 max_frame = 16777216, int64 max_depth = 64) -> Decoded3:
+    if max_frame < 3 or max_depth < 0 or max_depth > 64:
+        return _invalid3("invalid decoder limits")
+    return _parse3(data, 0, max_frame, max_depth)
+
+def _parse3(bytes data, int64 start, int64 limit, int64 depth) -> Decoded3:
+    auto header = _header3(data, start, limit)
+    if header.status == "invalid":
+        return _invalid3(header.message)
+    if header.status == "incomplete":
+        return _incomplete3()
+    auto tag = header.tag
+    auto raw = header.raw
+    auto pos = header.end
+    if tag == 43:
+        return _ok3(Resp3.Simple(raw), pos)
+    if tag == 45:
+        return _ok3(Resp3.Error(raw), pos)
+    if tag == 95:
+        if len(raw) != 0:
+            return _invalid3("RESP3 null has a payload")
+        return _ok3(Resp3.Null, pos)
+    if tag == 35:
+        if raw == b"t":
+            return _ok3(Resp3.Boolean(True), pos)
+        if raw == b"f":
+            return _ok3(Resp3.Boolean(False), pos)
+        return _invalid3("invalid RESP3 boolean")
+    if tag == 44:
+        if raw == b"nan":
+            return _ok3(Resp3.Double(math.nan), pos)
+        auto number = 0.0
+        try:
+            number = _score_value(Reply.Bulk(raw))
+        except ProtocolError as message:
+            return _invalid3(message)
+        return _ok3(Resp3.Double(number), pos)
+    if tag == 40:
+        auto text = ""
+        try:
+            text = str(raw)
+        except Exception:
+            return _invalid3("invalid RESP3 big-number text")
+        if text !~ m/\A[+-]?[0-9]+\z/:
+            return _invalid3("invalid RESP3 big number")
+        return _ok3(Resp3.BigNumber(raw), pos)
+    auto count = 0
+    try:
+        count = _number(raw)
+    except ValueError as message:
+        if raw == b"?":
+            return _invalid3("streamed encodings are unsupported")
+        return _invalid3(message)
+    if tag == 58:
+        return _ok3(Resp3.Integer(count), pos)
+    if raw == b"-1":
+        if tag == 36:
+            return _ok3(Resp3.NullBulk, pos)
+        if tag == 42:
+            return _ok3(Resp3.NullArray, pos)
+    if len(raw) == 0 or raw[0] == 45 or raw[0] == 43:
+        return _invalid3("invalid unsigned RESP3 length")
+    if tag == 36 or tag == 33 or tag == 61:
+        return _blob3(data, tag, count, pos, limit)
+    return _aggregate3(data, tag, count, pos, limit, depth)
+
+def _blob3(bytes data, int64 tag, int64 count, int64 pos, int64 limit) -> Decoded3:
+    if count > limit - pos - 2:
+        return _invalid3("blob exceeds byte limit")
+    auto tail = pos + count
+    if tail + 2 > len(data):
+        return _incomplete3()
+    if data[tail] != 13 or data[tail + 1] != 10:
+        return _invalid3("blob missing CRLF")
+    auto payload = data[pos:tail]
+    if tag == 36:
+        return _ok3(Resp3.Bulk(payload), tail + 2)
+    if tag == 33:
+        return _ok3(Resp3.BlobError(payload), tail + 2)
+    if count < 4 or payload[3] != 58:
+        return _invalid3("verbatim string requires a three-byte format and colon")
+    return _ok3(Resp3.Verbatim(payload[0:3], payload[4:len(payload)]), tail + 2)
+
+def _aggregate3(
+    bytes data,
+    int64 tag,
+    int64 count,
+    int64 pos,
+    int64 limit,
+    int64 depth,
+) -> Decoded3:
+    if depth == 0:
+        return _invalid3("aggregate nesting exceeds depth limit")
+    auto children = count
+    if tag == 37 or tag == 124:
+        if count > (limit - pos) // 6:
+            return _invalid3("map exceeds byte limit")
+        children = count * 2
+    if children > (limit - pos) // 3:
+        return _invalid3("aggregate exceeds byte limit")
+    list[Resp3] items = []
+    auto i = 0
+    while i < children:
+        auto child = _parse3(data, pos, limit, depth - 1)
+        if child.status != "ok":
+            return child
+        items.append(child.value)
+        pos = child.consumed
+        i = i + 1
+    if tag == 42:
+        return _ok3(Resp3.Array(items), pos)
+    if tag == 126:
+        return _ok3(Resp3.Set(items), pos)
+    if tag == 62:
+        return _ok3(Resp3.Push(items), pos)
+    list[Resp3Pair] pairs = []
+    i = 0
+    while i < children:
+        pairs.append(Resp3Pair(items[i], items[i + 1]))
+        i = i + 2
+    if tag == 37:
+        return _ok3(Resp3.Map(pairs), pos)
+    auto value = _parse3(data, pos, limit, depth - 1)
+    if value.status != "ok":
+        return value
+    return _ok3(Resp3.Attributed(pairs, value.value), value.consumed)
+
 # Zap user exceptions carry a string message and have Exception as their parent.
 struct ResponseError:
     str message
@@ -648,7 +1105,7 @@ def register_script(bytes source) -> RegisteredScript:
 # to serialize access; a concurrent execute/disconnect is rejected, never queued.
 struct Connection:
     bytes _socket
-    bytes _buffer
+    Decoder _reader
     Atomic[int64] _state
     int64 _max_frame
     int64 _max_depth
@@ -665,7 +1122,7 @@ struct Connection:
                 return
             raise BusyError("Redis connection is in use")
         _close_socket(self._socket, self._config.secure)
-        self._buffer = b""
+        self._reader = decoder(self._max_frame, self._max_depth)
         self._state.store(2)
 
     # The last consumed top-level server error is retained losslessly until a
@@ -678,7 +1135,7 @@ struct Connection:
             if not self._state.compare_and_swap(2, 1):
                 raise BusyError("Redis connection is in use")
         _close_socket(self._socket, self._config.secure)
-        self._buffer = b""
+        self._reader = decoder(self._max_frame, self._max_depth)
         self._last_error = b""
         auto opened = False
         try:
@@ -694,7 +1151,7 @@ struct Connection:
                 self._state.store(0)
             else:
                 _close_socket(self._socket, self._config.secure)
-                self._buffer = b""
+                self._reader = decoder(self._max_frame, self._max_depth)
                 self._last_error = b""
                 self._state.store(2)
 
@@ -1135,7 +1592,7 @@ struct Connection:
                 self._state.store(0)
             else:
                 _close_socket(self._socket, self._config.secure)
-                self._buffer = b""
+                self._reader = decoder(self._max_frame, self._max_depth)
                 self._state.store(2)
 
     # Caller holds the ownership state for the entire command/session setup.
@@ -1156,31 +1613,28 @@ struct Connection:
             if n <= 0 or n > len(wire) - sent:
                 raise ConnectionError("Redis command write made invalid progress")
             sent = sent + n
+        auto result = self._reader.feed(b"")
         while True:
-            auto result = decode(self._buffer, self._max_frame, self._max_depth)
             if result.status == "ok":
-                self._buffer = self._buffer[result.consumed:len(self._buffer)]
                 return result.value
             if result.status == "invalid":
                 raise ProtocolError("Invalid Redis reply: " + result.message)
-            auto room = self._max_frame - len(self._buffer)
+            auto room = self._max_frame - self._reader.buffered_bytes()
             if room <= 0:
                 raise ProtocolError("Redis reply exceeds byte limit")
             auto count = self._read_size
             if count > room:
                 count = room
-            # net.recv returns an opaque length-prefixed str buffer. bytes()
-            # relabels it without UTF-8 decoding; do not call str(bytes).
             auto chunk = b""
             try:
                 chunk = _receive_socket(self._socket, count, self._config.secure)
             except Exception as e:
                 raise ConnectionError("Redis receive failed: " + e)
             if len(chunk) == 0:
-                if len(self._buffer) == 0:
+                if self._reader.buffered_bytes() == 0:
                     raise ConnectionError("Redis peer closed before replying")
                 raise ConnectionError("Redis peer closed during a reply")
-            self._buffer = self._buffer + chunk
+            result = self._reader.feed(chunk)
 
 # Snapshot and validate options before touching the network. Session setup is
 # performed with exclusive ownership and closes the socket on ANY failure.
@@ -1202,7 +1656,7 @@ def connect_options(Options config) -> Connection:
     Atomic[int64] state = Atomic(1)
     auto conn = Connection(
         socket,
-        b"",
+        decoder(cfg.max_frame, cfg.max_depth),
         state,
         cfg.max_frame,
         cfg.max_depth,

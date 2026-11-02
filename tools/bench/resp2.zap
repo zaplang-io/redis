@@ -58,3 +58,17 @@ def main():
         print(
             "incremental wide_items=" + str(n) + " calls=" + str(calls + 1) + " elapsed_ns=" + str(time.monotonic_ns() - start),
         )
+        auto parser = redis.decoder()
+        start = time.monotonic_ns()
+        auto pos = 0
+        while pos < len(frame):
+            auto end = pos + 128
+            if end > len(frame):
+                end = len(frame)
+            result = parser.feed(frame[pos:end])
+            pos = end
+        if result.status != "ok" or parser.frames_decoded != 1 or parser.processed_bytes != len(frame):
+            raise ValueError("resumable benchmark frame mismatch")
+        print(
+            "resumable wide_items=" + str(n) + " elapsed_ns=" + str(time.monotonic_ns() - start) + " processed_bytes=" + str(parser.processed_bytes) + " copied_bytes=" + str(parser.copied_bytes) + " trees=" + str(parser.frames_decoded),
+        )
