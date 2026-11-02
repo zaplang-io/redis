@@ -39,6 +39,8 @@ for source in "$here"/tests/tls/*_test.zap; do
                 failed=1
             fi
         else
+            status=$?
+            echo "$name: runtime failed (exit $status)" >&2
             failed=1
         fi
         cat "$build/actual"

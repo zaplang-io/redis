@@ -148,10 +148,16 @@ def main():
     auto payload = b"x"
     for i in range(0, 25):
         payload = payload + payload
+    io.write(2, "TLS deadline: stalled handshake\n")
     handshake(False)
+    io.write(2, "TLS deadline: cancelled handshake\n")
     handshake(True)
+    io.write(2, "TLS deadline: read timeout\n")
     timeout(False, b"")
+    io.write(2, "TLS deadline: write timeout\n")
     timeout(True, payload)
+    io.write(2, "TLS deadline: read cancellation\n")
     cancelled(False, b"")
+    io.write(2, "TLS deadline: write cancellation\n")
     cancelled(True, payload)
     print("TLS connect and command deadlines/cancellation: PASS")
