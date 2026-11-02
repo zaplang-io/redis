@@ -1,0 +1,36 @@
+name: Release validation
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing reviewed release tag (vX.Y.Z)
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container: ghcr.io/zaplang-io/zap@sha256:1ec44a8cc4699a7096bc69e565e8dcda8eb54a4f52514eb3516f1d322e9cd123
+    steps:
+      - name: Install Git for tag validation
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - name: Check existing tag against version, commit, and main ancestry
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          sh tools/check-release.sh "$RELEASE_TAG"
+          git merge-base --is-ancestor HEAD origin/main
+      - name: Validate package installation and examples
+        run: sh tools/run-package-tests.sh
+      - name: Execute offline tests
+        run: sh tools/run-tests.sh
+      - name: Execute verified TLS tests
+        run: sh tools/run-tls-tests.sh

@@ -892,6 +892,53 @@ struct KeyValue:
     bytes key
     bytes value
 
+# Redis server blocking timeouts are seconds, independent of client deadlines.
+# Zero means wait indefinitely at Redis; reject non-finite/negative values before
+# encoding or acquiring the connection. Keep sub-second precision on the wire.
+def _blocking_timeout(float64 seconds) -> bytes:
+    if math.isnan(seconds):
+        raise ValueError("Redis server timeout must be finite and non-negative")
+    if math.isinf(seconds):
+        raise ValueError("Redis server timeout must be finite and non-negative")
+    if seconds < 0.0:
+        raise ValueError("Redis server timeout must be finite and non-negative")
+    if seconds == 0.0:
+        return b"0"
+    return bytes(format(seconds, ".17g"))
+
+def _requested_key(list[bytes] keys, bytes key) -> bool:
+    for candidate in keys:
+        if bytes(candidate) == key:
+            return True
+    return False
+
+def _blocking_pop_reply(Reply reply, list[bytes] keys) -> Optional[KeyValue]:
+    match reply:
+        case Reply.NullArray:
+            return None
+        case Reply.Array(items):
+            if len(items) != 2:
+                raise ProtocolError("Expected blocking pop key/value pair")
+            bytes key = _required_bulk(items[0])
+            bytes value = _required_bulk(items[1])
+            if not _requested_key(keys, key):
+                raise ProtocolError("Blocking pop returned an unrequested key")
+            return Optional.Some(KeyValue(key, value))
+        case _:
+            raise ProtocolError("Expected blocking pop pair or null array")
+
+def _list_side(str side) -> bytes:
+    auto normalized = side.upper()
+    if normalized != "LEFT" and normalized != "RIGHT":
+        raise ValueError("Redis list side must be LEFT or RIGHT")
+    return bytes(normalized)
+
+def _requires_dedicated(list[bytes] args) -> bool:
+    auto name = _command_name(args)
+    if _stream_command(args):
+        return True
+    return name == "BLPOP" or name == "BRPOP" or name == "BLMOVE" or name == "BLMPOP" or name == "BRPOPLPUSH" or name == "BZPOPMIN" or name == "BZPOPMAX" or name == "BZMPOP"
+
 # Hash fields stay separate from keys, with no implicit text conversion.
 struct HashField:
     bytes field
@@ -1168,7 +1215,7 @@ struct Pipeline:
     int64 _max_commands
     int64 _max_bytes
     bool _sealed
-    bool _streaming
+    bool _dedicated_commands
 
     def queue(self, list[bytes] args):
         if self._sealed:
@@ -1189,9 +1236,9 @@ struct Pipeline:
             size = size + len(arg)
         if size > remaining:
             raise ValueError("Redis pipeline byte limit exceeded")
-        auto streaming = _stream_command(args)
+        auto dedicated = _requires_dedicated(args)
         self._commands.append(encode_command(args))
-        self._streaming = self._streaming or streaming
+        self._dedicated_commands = self._dedicated_commands or dedicated
         self._bytes = self._bytes + size
 
     def execute(self, Connection connection) -> list[Reply]:
@@ -1741,6 +1788,48 @@ struct Connection:
             self.execute([b"LTRIM", key, bytes(str(start)), bytes(str(stop))]),
             b"OK",
         )
+
+    def _blocking_pop(
+        self,
+        bytes command,
+        list[bytes] keys,
+        float64 server_timeout_seconds,
+    ) -> Optional[KeyValue]:
+        auto args = _keys_command(command, keys)
+        args.append(_blocking_timeout(server_timeout_seconds))
+        return _blocking_pop_reply(self.execute(args), keys)
+
+    def blpop(
+        self,
+        list[bytes] keys,
+        float64 server_timeout_seconds = 0.0,
+    ) -> Optional[KeyValue]:
+        return self._blocking_pop(b"BLPOP", keys, server_timeout_seconds)
+
+    def brpop(
+        self,
+        list[bytes] keys,
+        float64 server_timeout_seconds = 0.0,
+    ) -> Optional[KeyValue]:
+        return self._blocking_pop(b"BRPOP", keys, server_timeout_seconds)
+
+    def blmove(
+        self,
+        bytes source,
+        bytes destination,
+        str source_side = "LEFT",
+        str destination_side = "RIGHT",
+        float64 server_timeout_seconds = 0.0,
+    ) -> Optional[bytes]:
+        auto args = [
+            b"BLMOVE",
+            source,
+            destination,
+            _list_side(source_side),
+            _list_side(destination_side),
+            _blocking_timeout(server_timeout_seconds),
+        ]
+        return _bulk_value(self.execute(args))
 
     def _set_members(self, bytes command, bytes key, list[bytes] members) -> int64:
         if len(members) == 0:
@@ -2295,8 +2384,10 @@ struct Lease:
             raise BusyError("Redis lease is in use")
 
     def execute(self, list[bytes] args) -> Reply:
-        if not self._dedicated and _stream_command(args):
-            raise ValueError("Streaming/protocol commands require a dedicated lease")
+        if not self._dedicated and _requires_dedicated(args):
+            raise ValueError(
+                "Blocking/streaming/protocol commands require a dedicated lease",
+            )
         self._enter()
         try:
             return self._connection.execute(args)
@@ -2304,8 +2395,10 @@ struct Lease:
             self._guard.store(0)
 
     def execute_raw(self, list[bytes] args) -> Reply:
-        if not self._dedicated and _stream_command(args):
-            raise ValueError("Streaming/protocol commands require a dedicated lease")
+        if not self._dedicated and _requires_dedicated(args):
+            raise ValueError(
+                "Blocking/streaming/protocol commands require a dedicated lease",
+            )
         self._enter()
         try:
             return self._connection.execute_raw(args)
@@ -2313,8 +2406,10 @@ struct Lease:
             self._guard.store(0)
 
     def execute_pipeline(self, Pipeline batch) -> list[Reply]:
-        if not self._dedicated and batch._streaming:
-            raise ValueError("Streaming/protocol commands require a dedicated lease")
+        if not self._dedicated and batch._dedicated_commands:
+            raise ValueError(
+                "Blocking/streaming/protocol commands require a dedicated lease",
+            )
         self._enter()
         try:
             return batch.execute(self._connection)
@@ -2332,6 +2427,54 @@ struct Lease:
         finally:
             if not started:
                 self._guard.store(0)
+
+    def blpop(
+        self,
+        list[bytes] keys,
+        float64 server_timeout_seconds = 0.0,
+    ) -> Optional[KeyValue]:
+        if not self._dedicated:
+            raise ValueError("Blocking list helpers require a dedicated lease")
+        self._enter()
+        try:
+            return self._connection.blpop(keys, server_timeout_seconds)
+        finally:
+            self._guard.store(0)
+
+    def brpop(
+        self,
+        list[bytes] keys,
+        float64 server_timeout_seconds = 0.0,
+    ) -> Optional[KeyValue]:
+        if not self._dedicated:
+            raise ValueError("Blocking list helpers require a dedicated lease")
+        self._enter()
+        try:
+            return self._connection.brpop(keys, server_timeout_seconds)
+        finally:
+            self._guard.store(0)
+
+    def blmove(
+        self,
+        bytes source,
+        bytes destination,
+        str source_side = "LEFT",
+        str destination_side = "RIGHT",
+        float64 server_timeout_seconds = 0.0,
+    ) -> Optional[bytes]:
+        if not self._dedicated:
+            raise ValueError("Blocking list helpers require a dedicated lease")
+        self._enter()
+        try:
+            return self._connection.blmove(
+                source,
+                destination,
+                source_side,
+                destination_side,
+                server_timeout_seconds,
+            )
+        finally:
+            self._guard.store(0)
 
     def _release(self, bool reuse) -> bool:
         self._enter()

@@ -45,3 +45,18 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
       - name: Execute live basic and isolated session tests
         run: sh tools/run-integration-tests.sh --isolated
+      - name: Execute installed-package examples
+        env:
+          REDIS_EXAMPLE_URL: redis://redis:6379/0
+        run: sh tools/run-package-tests.sh --live
+  package:
+    name: Package consumers and examples
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    container: ghcr.io/zaplang-io/zap@sha256:1ec44a8cc4699a7096bc69e565e8dcda8eb54a4f52514eb3516f1d322e9cd123
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+      - name: Validate release candidate metadata
+        run: sh tools/check-release.sh
+      - name: Install path and registry consumers; check examples
+        run: sh tools/run-package-tests.sh
