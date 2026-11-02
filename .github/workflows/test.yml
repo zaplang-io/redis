@@ -10,7 +10,7 @@ jobs:
     name: Offline codec and connection tests
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    container: ghcr.io/zaplang-io/zap@sha256:593d82a7938f1fc7f4fb1ead916309089ee17537a1c83ec797bb97a55a82faec
+    container: ghcr.io/zaplang-io/zap@sha256:24e69368e619deaea5d570731fd0d0033e22bde76c644bb60239ed8735e32cda
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
       - name: Execute offline tests
@@ -31,7 +31,7 @@ jobs:
             image: redis:7.4.12@sha256:b6b6e3dc0c0952737748e55d5d885272840c7e42ba41ab1d5489f693419882f5
           - version: 8.10.3
             image: redis:8.10.3@sha256:de1068af6f552240dfab67bcc9bfef99bfc60f776bb4580ef077ea4c8c97e848
-    container: ghcr.io/zaplang-io/zap@sha256:593d82a7938f1fc7f4fb1ead916309089ee17537a1c83ec797bb97a55a82faec
+    container: ghcr.io/zaplang-io/zap@sha256:24e69368e619deaea5d570731fd0d0033e22bde76c644bb60239ed8735e32cda
     services:
       redis:
         image: ${{ matrix.server.image }}
@@ -55,7 +55,7 @@ jobs:
     name: Package consumers and examples
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    container: ghcr.io/zaplang-io/zap@sha256:593d82a7938f1fc7f4fb1ead916309089ee17537a1c83ec797bb97a55a82faec
+    container: ghcr.io/zaplang-io/zap@sha256:24e69368e619deaea5d570731fd0d0033e22bde76c644bb60239ed8735e32cda
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
       - name: Validate release candidate metadata
