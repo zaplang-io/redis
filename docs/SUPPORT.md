@@ -26,15 +26,14 @@ the changelog when upgrading and commit application `zap.lock` files.
 
 The implemented subset includes key/string/counter/expiry, hashes, non-blocking
 and blocking lists, sets, sorted sets, cursor pages, scripts, pipelines,
-transactions, pools, dedicated Pub/Sub, Streams consumer groups, and explicit
-RESP3 connections. Sentinel primary discovery and initial Redis Cluster
-single-key routing are available with explicit recovery/topology refresh. Raw
+transactions, pools, dedicated Pub/Sub, Streams consumer groups, explicit
+RESP3 connections, Sentinel primary discovery and Redis Cluster slot routing
+with MOVED/ASK handling and a documented same-slot multi-key subset. Raw
 commands provide an escape hatch with the same
 ownership/deadline rules; that is not full redis-py or Redis-module parity.
 
-Later optional work remains separate: Cluster MOVED/ASK redirections and
-multi-key same-slot validation (#29), and per-connection trust/mTLS (core #560).
-These are not v0.1 blockers.
+Later optional work remains separate: per-connection trust/mTLS (core #560).
+This is not a v0.1 blocker.
 Blocking lists (#15), Pub/Sub (#20), and basic Streams (#21) are now included
 in the unreleased candidate. Pub/Sub is at-most-once with no transparent
 resubscription; Streams has no automatic cursor or consumer acknowledgement policy.

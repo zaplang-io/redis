@@ -19,9 +19,9 @@ See [installation and release checks](docs/RELEASING.md), the exact
 [Zap/Redis support matrix](docs/SUPPORT.md), and [changelog](CHANGELOG.md).
 No public tag or hosted-registry publication is implied by the manifest version.
 
-Sentinel primary discovery and Redis Cluster single-key routing are documented
-in [High availability](docs/high-availability.md). Cluster redirections and
-multi-key slot validation remain separate work.
+Sentinel primary discovery and Redis Cluster routing are documented in
+[High availability](docs/high-availability.md), including the supported
+multi-key command subset and redirection behavior.
 
 ## TCP connection
 

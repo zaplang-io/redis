@@ -22,5 +22,7 @@ is created by this change.
   and RESP3 Pub/Sub dispatch; RESP2 remains the default.
 - Sentinel primary discovery with separate Sentinel/data credentials and explicit
   reconnect, plus Redis Cluster slot discovery and cached single-key routing.
+- Cluster MOVED/ASK redirects with bounded retries and same-slot validation for
+  a supported multi-key command subset.
 - Executable consumer examples, path/static-registry installation tests, pinned
   runtime/server CI, and version/tag release preflight.

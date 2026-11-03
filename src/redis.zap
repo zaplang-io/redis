@@ -757,6 +757,15 @@ struct ClusterSlotRange:
     int64 last
     RedisEndpoint primary
 
+struct ClusterRedirect:
+    bytes kind
+    int64 slot
+    RedisEndpoint endpoint
+
+struct ClusterSlotOverride:
+    int64 slot
+    RedisEndpoint primary
+
 # Diagnostics deliberately omit BOTH credentials, even when authentication is off.
 def describe_options(Options cfg) -> str:
     auto host = cfg.host
@@ -3554,6 +3563,81 @@ def _cluster_discover(list[Options] seeds) -> list[ClusterSlotRange]:
             auto ignored = 0
     raise ConnectionError("Redis Cluster could not discover slot topology")
 
+def _cluster_redirect(bytes error, int64 expected_slot) -> ClusterRedirect:
+    auto text = ""
+    try:
+        text = str(error)
+    except Exception:
+        raise ProtocolError("Malformed Redis Cluster redirection")
+    if text !~ m/\A(?:MOVED|ASK)(?:\s|\z)/:
+        raise ResponseError(_error_text(error))
+    auto parsed = text =~ m/\A(?<kind>MOVED|ASK) (?<slot>[0-9]+) (?<host>\[[^\]]+\]|[^:\s]+):(?<port>[0-9]+)\z/
+    if not parsed:
+        raise ProtocolError("Malformed Redis Cluster redirection")
+    auto slot_text = parsed.group("slot")
+    if not _stream_component(slot_text):
+        raise ProtocolError("Malformed Redis Cluster redirection slot")
+    auto slot = _uint(slot_text, 16383)
+    if slot != expected_slot:
+        raise ProtocolError("Redis Cluster redirection slot does not match key")
+    auto port_text = parsed.group("port")
+    auto port = 0
+    try:
+        port = _uint(port_text, 65535)
+    except ValueError:
+        raise ProtocolError("Malformed Redis Cluster redirection port")
+    if port == 0:
+        raise ProtocolError("Malformed Redis Cluster redirection port")
+    auto host_text = parsed.group("host")
+    auto bracketed = host_text =~ m/\A\[(?<host>[^\]]+)\]\z/
+    if bracketed:
+        host_text = bracketed.group("host")
+    auto host = bytes(host_text)
+    if len(host) == 0:
+        raise ProtocolError("Malformed Redis Cluster redirection host")
+    return ClusterRedirect(bytes(parsed.group("kind")), slot, RedisEndpoint(host, port))
+
+def _cluster_command_keys(bytes command, list[bytes] args) -> list[bytes]:
+    list[bytes] keys = []
+    if command == b"MGET" or command == b"DEL" or command == b"UNLINK" or command == b"EXISTS" or command == b"SUNION" or command == b"SINTER" or command == b"SDIFF":
+        if len(args) < 2:
+            raise ValueError(
+                "Redis Cluster multi-key command requires at least one key",
+            )
+        auto i = 1
+        while i < len(args):
+            keys.append(bytes(args[i]))
+            i = i + 1
+        return keys
+    if command == b"MSET":
+        if len(args) < 3 or len(args) % 2 == 0:
+            raise ValueError("Redis Cluster MSET requires key/value pairs")
+        auto i = 1
+        while i < len(args):
+            keys.append(bytes(args[i]))
+            i = i + 2
+        return keys
+    if command == b"RENAME" or command == b"RENAMENX" or command == b"RPOPLPUSH" or command == b"SMOVE":
+        auto expected = 3
+        if command == b"SMOVE":
+            expected = 4
+        if len(args) != expected:
+            raise ValueError("Redis Cluster multi-key command has invalid arity")
+        keys.append(bytes(args[1]))
+        keys.append(bytes(args[2]))
+        return keys
+    if command == b"BITOP":
+        if len(args) < 4:
+            raise ValueError(
+                "Redis Cluster BITOP requires a destination and source keys",
+            )
+        auto i = 2
+        while i < len(args):
+            keys.append(bytes(args[i]))
+            i = i + 1
+        return keys
+    raise ValueError("Redis Cluster command is not a supported multi-key operation")
+
 def cluster_connect(list[Options] seeds) -> ClusterClient:
     if len(seeds) == 0:
         raise ValueError("Redis Cluster requires at least one seed")
@@ -3567,7 +3651,7 @@ def cluster_connect(list[Options] seeds) -> ClusterClient:
             )
         copied_seeds.append(_snapshot_options(seed))
     auto slots = _cluster_discover(copied_seeds)
-    return ClusterClient(copied_seeds, copied_seeds[0], slots, [], [], Atomic(0))
+    return ClusterClient(copied_seeds, copied_seeds[0], slots, [], [], [], Atomic(0))
 
 struct SentinelClient:
     list[Options] _seeds
@@ -3630,11 +3714,15 @@ struct ClusterClient:
     list[Options] _seeds
     Options _data_config
     list[ClusterSlotRange] _slots
+    list[ClusterSlotOverride] _moved_slots
     list[RedisEndpoint] _endpoints
     list[Connection] _connections
     Atomic[int64] _state
 
     def _primary(self, int64 slot) -> RedisEndpoint:
+        for item in self._moved_slots:
+            if item.slot == slot:
+                return item.primary
         for item in self._slots:
             if slot >= item.first and slot <= item.last:
                 return item.primary
@@ -3668,11 +3756,80 @@ struct ClusterClient:
                 raise ConnectionError("Redis Cluster client is closed")
             raise BusyError("Redis Cluster client is in use")
         try:
-            auto endpoint = self._primary(cluster_slot(key))
-            return self._connection_for(endpoint).execute(args)
+            return self._execute_routed(cluster_slot(key), args)
         finally:
             if self._state.load() != 2:
                 self._state.store(0)
+
+    def execute_multi(self, list[bytes] args) -> Reply:
+        if len(args) == 0:
+            raise ValueError("Redis Cluster command must not be empty")
+        auto command = bytes(_command_name(args))
+        auto keys = _cluster_command_keys(command, args)
+        auto slot = cluster_slot(keys[0])
+        for key in keys:
+            if cluster_slot(key) != slot:
+                raise ValueError(
+                    "CROSSSLOT keys in request do not hash to the same slot",
+                )
+        if not self._state.compare_and_swap(0, 1):
+            if self._state.load() == 2:
+                raise ConnectionError("Redis Cluster client is closed")
+            raise BusyError("Redis Cluster client is in use")
+        try:
+            return self._execute_routed(slot, args)
+        finally:
+            if self._state.load() != 2:
+                self._state.store(0)
+
+    # Redirect retries occur only for complete MOVED/ASK server errors. Any
+    # transport failure escapes without replay because command execution may be
+    # ambiguous. Caller owns _state for this whole loop.
+    def _execute_routed(self, int64 slot, list[bytes] args) -> Reply:
+        auto endpoint = self._primary(slot)
+        auto asking = False
+        auto redirects = 0
+        while redirects <= 5:
+            auto connection = self._connection_for(endpoint)
+            if asking:
+                _status_value(connection.execute([b"ASKING"]), b"OK")
+            try:
+                return connection.execute(args)
+            except ResponseError:
+                auto redirect = _cluster_redirect(connection.last_error(), slot)
+                redirects = redirects + 1
+                if redirects > 5:
+                    raise ProtocolError("Redis Cluster redirection limit exceeded")
+                if redirect.kind == b"MOVED":
+                    self._refresh_topology()
+                    self._moved_slots.append(
+                        ClusterSlotOverride(slot, redirect.endpoint),
+                    )
+                    asking = False
+                else:
+                    asking = True
+                endpoint = redirect.endpoint
+        raise ProtocolError("Redis Cluster redirection limit exceeded")
+
+    def _refresh_topology(self):
+        auto slots = _cluster_discover(self._seeds)
+        list[RedisEndpoint] retained_endpoints = []
+        list[Connection] retained_connections = []
+        for i in range(0, len(self._endpoints)):
+            auto keep = False
+            for item in slots:
+                if _redis_endpoint_equal(self._endpoints[i], item.primary):
+                    keep = True
+            if keep:
+                retained_endpoints.append(self._endpoints[i])
+                retained_connections.append(self._connections[i])
+            else:
+                self._connections[i].disconnect()
+        self._endpoints = retained_endpoints
+        self._connections = retained_connections
+        self._slots = slots
+        list[ClusterSlotOverride] no_overrides = []
+        self._moved_slots = no_overrides
 
     def refresh(self):
         if not self._state.compare_and_swap(0, 1):
@@ -3680,22 +3837,7 @@ struct ClusterClient:
                 raise ConnectionError("Redis Cluster client is closed")
             raise BusyError("Redis Cluster client is in use")
         try:
-            auto slots = _cluster_discover(self._seeds)
-            list[RedisEndpoint] retained_endpoints = []
-            list[Connection] retained_connections = []
-            for i in range(0, len(self._endpoints)):
-                auto keep = False
-                for item in slots:
-                    if _redis_endpoint_equal(self._endpoints[i], item.primary):
-                        keep = True
-                if keep:
-                    retained_endpoints.append(self._endpoints[i])
-                    retained_connections.append(self._connections[i])
-                else:
-                    self._connections[i].disconnect()
-            self._endpoints = retained_endpoints
-            self._connections = retained_connections
-            self._slots = slots
+            self._refresh_topology()
         finally:
             self._state.store(0)
 
