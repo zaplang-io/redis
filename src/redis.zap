@@ -1818,6 +1818,13 @@ def _stream_optional_id(Reply reply) -> Optional[bytes]:
         case _:
             raise ProtocolError("Expected stream ID or null")
 
+def _stream_optional_set(Optional[bytes] value) -> bool:
+    match value:
+        case Optional.Some(_):
+            return True
+        case _:
+            return False
+
 def _stream_pending_summary(Reply reply) -> StreamPendingSummary:
     match reply:
         case Reply.Array(items):
@@ -1844,9 +1851,16 @@ def _stream_pending_summary(Reply reply) -> StreamPendingSummary:
                                 raise ProtocolError("Invalid XPENDING consumer entry")
                 case _:
                     raise ProtocolError("Expected XPENDING consumer array")
-            if total == 0 and (smallest != None or largest != None or len(consumers) != 0):
+            if total == 0 and (
+                _stream_optional_set(smallest)
+                or _stream_optional_set(largest)
+                or len(consumers) != 0
+            ):
                 raise ProtocolError("Empty XPENDING summary contains pending state")
-            if total > 0 and (smallest == None or largest == None):
+            if total > 0 and (
+                not _stream_optional_set(smallest)
+                or not _stream_optional_set(largest)
+            ):
                 raise ProtocolError("Non-empty XPENDING summary omits its ID range")
             return StreamPendingSummary(total, smallest, largest, consumers)
         case _:
