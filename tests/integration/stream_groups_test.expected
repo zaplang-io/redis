@@ -2,6 +2,8 @@ group-stage: xadd
 group-stage: create
 group-stage: duplicate
 group-stage: read
+xpending-raw:integer,bulk,bulk,array:1
+xpending-consumer:bulk,integer:1
 group-stage: pending
 group-stage: claim
 group-stage: claimed-pending

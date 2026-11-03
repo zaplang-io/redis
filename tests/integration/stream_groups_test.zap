@@ -1,6 +1,17 @@
 import redis
 import integration_fixtures
 
+def reply_tag(redis.Reply reply) -> str:
+    match reply:
+        case redis.Reply.Integer(value):
+            return "integer:" + str(value)
+        case redis.Reply.Bulk(data):
+            return "bulk"
+        case redis.Reply.Array(items):
+            return "array:" + str(len(items))
+        case _:
+            return "other"
+
 def main():
     auto f = integration_fixtures.fixture()
     auto conn = f.open()
@@ -43,6 +54,28 @@ def main():
             and fresh[0].entries[0].fields[1].field == field,
             "binary entry and repeated fields",
         )
+        match conn.execute([b"XPENDING", key, group]):
+            case redis.Reply.Array(parts):
+                print(
+                    "xpending-raw:" + reply_tag(parts[0]) + ","
+                    + reply_tag(parts[1]) + "," + reply_tag(parts[2])
+                    + "," + reply_tag(parts[3]),
+                )
+                match parts[3]:
+                    case redis.Reply.Array(consumers):
+                        if len(consumers) > 0:
+                            match consumers[0]:
+                                case redis.Reply.Array(fields):
+                                    print(
+                                        "xpending-consumer:" + reply_tag(fields[0])
+                                        + "," + reply_tag(fields[1]),
+                                    )
+                                case _:
+                                    print("xpending-consumer:other")
+                    case _:
+                        print("xpending-consumer:other")
+            case _:
+                print("xpending-raw:other")
         auto pending = conn.xpending(key, group)
         print("group-stage: pending")
         integration_fixtures.check(
