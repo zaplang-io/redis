@@ -110,8 +110,6 @@ def main():
         slot,
         seed_done,
     )
-    spawn primary_peer(primary_listener, slot, net.port(asking_listener), primary_done)
-    spawn asking_peer(asking_listener, asking_done)
     auto cluster = redis.cluster_connect(
         [
             redis.options(
@@ -122,6 +120,8 @@ def main():
             ),
         ],
     )
+    spawn primary_peer(primary_listener, slot, net.port(asking_listener), primary_done)
+    spawn asking_peer(asking_listener, asking_done)
     match cluster.execute_for(b"account:{42}", [b"GET", b"account:{42}"]):
         case redis.Reply.Bulk(value):
             check(value == b"moved", "MOVED refreshes and retries at new primary")
