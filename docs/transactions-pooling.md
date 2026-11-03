@@ -124,8 +124,9 @@ Blocking list/sorted-set and streaming/protocol commands (BLPOP/BRPOP/BLMOVE
 variants, XREAD with BLOCK, SUBSCRIBE variants, MONITOR, HELLO, replication stream commands) require `acquire(dedicated=True)` and are rejected locally on
 ordinary leases, including pipeline batches. Dedicated leases always close on
 release and reserve capacity for their lifetime. They provide exclusive ownership.
-The dedicated `pubsub()` pull session and blocking `xread()` are documented in
-[Pub/Sub and Streams](pubsub-streams.md); RESP3 negotiation remains separate.
+The dedicated `pubsub()` pull session and blocking stream reads are documented
+in [Pub/Sub and Streams](pubsub-streams.md). RESP3 is available on explicit
+standalone connections; pools continue to create RESP2 connections.
 Use them for stateful sessions that must never return to the reusable pool.
 
 `shutdown()` is idempotent: it stops admission, wakes waiters with `PoolClosed`,

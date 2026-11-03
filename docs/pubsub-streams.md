@@ -141,8 +141,9 @@ literally named BLOCK after STREAMS is not confused with that option. Dedicated
 leases close on release, including after a healthy server timeout. Request/reply
 parser limits and the whole-command budget apply to all Streams helpers.
 
-Consumer groups and pending/acknowledgement management are separate (#22). This
-API does not claim durable consumer processing or exactly-once effects. See
+Consumer groups expose explicit pending/acknowledgement operations through
+`xgroup_create`, `xreadgroup`, `xack`, `xpending`, and `xautoclaim`. This API
+does not claim durable consumer processing or exactly-once effects. See
 [Redis XREAD](https://redis.io/docs/latest/commands/xread/) and
 [XRANGE](https://redis.io/docs/latest/commands/xrange/).
 

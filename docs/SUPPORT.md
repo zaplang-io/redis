@@ -10,7 +10,7 @@ the first tag; the release preflight does not create a release or publish remote
 | Client CI platform | Linux x86_64. Other architectures/OSes are not certified by this library's matrix. |
 | Redis servers | CI tests Redis 7.4.12 and 8.10.3. Earlier/later versions are not promised by this matrix. Individual commands can have lower version floors. |
 | Transport | Standalone TCP and verified TLS/rediss, OpenSSL trust paths. No per-connection CA/mTLS API; see core #560. |
-| Protocol | RESP2 command/reply transport. RESP3 decoder is an isolated API, not negotiation or push support. |
+| Protocol | RESP2 by default; explicit RESP3 HELLO negotiation with bounded push dispatch. |
 | Data | Keys, arguments, values and server-error bytes remain `bytes`; callers choose text decoding. |
 | Ownership | One active owner per Connection/Lease; transactions retain ownership through caller code. Concurrent use rejects with BusyError. |
 | Timeouts | Connect budget includes numeric TCP/TLS/setup; command budget spans write/reply or whole pipeline. Synchronous hostname DNS remains unbounded unless caller supplies a resolved address. |
@@ -26,11 +26,11 @@ the changelog when upgrading and commit application `zap.lock` files.
 
 The implemented subset includes key/string/counter/expiry, hashes, non-blocking
 and blocking lists, sets, sorted sets, cursor pages, scripts, pipelines,
-transactions, pools, dedicated Pub/Sub, and basic Streams. Raw commands provide an escape hatch with the same
+transactions, pools, dedicated Pub/Sub, Streams consumer groups, and explicit
+RESP3 connections. Raw commands provide an escape hatch with the same
 ownership/deadline rules; that is not full redis-py or Redis-module parity.
 
-Later optional work remains separate: Streams consumer groups (#22), RESP3
-negotiation/push dispatch (#26), Sentinel (#27), Cluster routing/redirections
+Later optional work remains separate: Sentinel (#27), Cluster routing/redirections
 (#28/#29), and per-connection trust/mTLS (core #560). These are not v0.1 blockers.
 Blocking lists (#15), Pub/Sub (#20), and basic Streams (#21) are now included
 in the unreleased candidate. Pub/Sub is at-most-once with no transparent

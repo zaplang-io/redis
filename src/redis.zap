@@ -619,6 +619,33 @@ def _aggregate3(
         return value
     return _ok3(Resp3.Attributed(pairs, value.value), value.consumed)
 
+# RESP3 command frames can be interleaved with asynchronous pushes. Keep any
+# incomplete suffix in a bounded byte buffer and grow socket reads geometrically
+# so a large fragmented frame is decoded in O(n), not reparsed per small chunk.
+struct Resp3Reader:
+    int64 _max_frame
+    int64 _max_depth
+    bytes _buffer
+
+    def buffered_bytes(self) -> int64:
+        return len(self._buffer)
+
+    def decode(self) -> Decoded3:
+        return decode3(self._buffer, self._max_frame, self._max_depth)
+
+    def append(self, bytes chunk):
+        self._buffer = self._buffer + chunk
+
+    def consume(self, int64 count):
+        if count < 0 or count > len(self._buffer):
+            raise ValueError("invalid RESP3 reader consumption")
+        self._buffer = self._buffer[count:len(self._buffer)]
+
+def resp3_reader(int64 max_frame = 16777216, int64 max_depth = 64) -> Resp3Reader:
+    if max_frame < 3 or max_depth < 0 or max_depth > 64:
+        raise ValueError("invalid RESP3 reader limits")
+    return Resp3Reader(max_frame, max_depth, b"")
+
 # Zap user exceptions carry a string message and have Exception as their parent.
 struct ResponseError:
     str message
@@ -948,6 +975,8 @@ def _requires_dedicated(list[bytes] args) -> bool:
         return True
     if name == "XREAD":
         return _xread_blocks(args)
+    if name == "XREADGROUP":
+        return _xreadgroup_blocks(args)
     return name == "BLPOP" or name == "BRPOP" or name == "BLMOVE" or name == "BLMPOP" or name == "BRPOPLPUSH" or name == "BZPOPMIN" or name == "BZPOPMAX" or name == "BZMPOP"
 
 # Hash fields stay separate from keys, with no implicit text conversion.
@@ -1157,6 +1186,166 @@ def _boolean_value(Reply reply) -> bool:
     if value != 0 and value != 1:
         raise ProtocolError("Expected Redis zero or one reply")
     return value == 1
+
+def _resp3_unwrap(Resp3 value) -> Resp3:
+    match value:
+        case Resp3.Attributed(attributes, nested):
+            return _resp3_unwrap(nested)
+        case _:
+            return value
+
+def _resp3_attributes(Resp3 value) -> list[Resp3Pair]:
+    match value:
+        case Resp3.Attributed(attributes, nested):
+            return attributes
+        case _:
+            list[Resp3Pair] empty = []
+            return empty
+
+def _resp3_error_bytes(Resp3 value) -> Optional[bytes]:
+    match _resp3_unwrap(value):
+        case Resp3.Error(data):
+            return Optional.Some(data)
+        case Resp3.BlobError(data):
+            return Optional.Some(data)
+        case _:
+            return None
+
+def _resp3_reply(Resp3 value) -> Reply:
+    match _resp3_unwrap(value):
+        case Resp3.Simple(data):
+            return Reply.Simple(data)
+        case Resp3.Error(data):
+            return Reply.Error(data)
+        case Resp3.Integer(number):
+            return Reply.Integer(number)
+        case Resp3.Bulk(data):
+            return Reply.Bulk(data)
+        case Resp3.Array(items):
+            list[Reply] values = []
+            for item in items:
+                values.append(_resp3_reply(item))
+            return Reply.Array(values)
+        case Resp3.NullBulk:
+            return Reply.NullBulk
+        case Resp3.NullArray:
+            return Reply.NullArray
+        case Resp3.Null:
+            return Reply.NullBulk
+        case Resp3.Boolean(value):
+            if value:
+                return Reply.Integer(1)
+            return Reply.Integer(0)
+        case Resp3.Double(value):
+            if math.isnan(value):
+                return Reply.Bulk(b"nan")
+            if math.isinf(value):
+                if value < 0.0:
+                    return Reply.Bulk(b"-inf")
+                return Reply.Bulk(b"inf")
+            return Reply.Bulk(bytes(format(value, ".17g")))
+        case Resp3.BigNumber(decimal):
+            return Reply.Bulk(decimal)
+        case Resp3.BlobError(data):
+            return Reply.Error(data)
+        case Resp3.Verbatim(format, data):
+            return Reply.Bulk(data)
+        case Resp3.Map(pairs):
+            list[Reply] values = []
+            for pair in pairs:
+                values.append(_resp3_reply(pair.key))
+                values.append(_resp3_reply(pair.value))
+            return Reply.Array(values)
+        case Resp3.Set(items):
+            list[Reply] values = []
+            for item in items:
+                values.append(_resp3_reply(item))
+            return Reply.Array(values)
+        case Resp3.Push(items):
+            raise ProtocolError("RESP3 push has no command reply representation")
+        case _:
+            raise ProtocolError("Unknown RESP3 value")
+
+def _resp3_push(Resp3 value) -> bool:
+    match _resp3_unwrap(value):
+        case Resp3.Push(items):
+            return True
+        case _:
+            return False
+
+def _resp3_bulk(Resp3 value) -> bytes:
+    match _resp3_unwrap(value):
+        case Resp3.Bulk(data):
+            return data
+        case Resp3.Simple(data):
+            return data
+        case Resp3.Verbatim(format, data):
+            return data
+        case _:
+            raise ProtocolError("Expected RESP3 string value")
+
+def _resp3_integer(Resp3 value) -> int64:
+    match _resp3_unwrap(value):
+        case Resp3.Integer(number):
+            return number
+        case _:
+            raise ProtocolError("Expected RESP3 integer value")
+
+def _resp3_map_integer(Resp3 value, bytes key) -> int64:
+    match _resp3_unwrap(value):
+        case Resp3.Map(pairs):
+            for pair in pairs:
+                if _resp3_bulk(pair.key) == key:
+                    return _resp3_integer(pair.value)
+            raise ProtocolError("HELLO reply omitted protocol version")
+        case _:
+            raise ProtocolError("Expected HELLO map")
+
+def _pubsub_event3(Resp3 value) -> PubSubEvent:
+    match _resp3_unwrap(value):
+        case Resp3.Push(items):
+            if len(items) < 3:
+                raise ProtocolError("Incomplete RESP3 Pub/Sub push")
+            bytes kind = _resp3_bulk(items[0])
+            if kind == b"pmessage":
+                if len(items) != 4:
+                    raise ProtocolError("Expected four-part pattern push")
+                return PubSubEvent.PatternMessage(
+                    _resp3_bulk(items[1]),
+                    _resp3_bulk(items[2]),
+                    _resp3_bulk(items[3]),
+                )
+            if len(items) != 3:
+                raise ProtocolError("Expected three-part Pub/Sub push")
+            if kind == b"message":
+                return PubSubEvent.Message(
+                    _resp3_bulk(items[1]),
+                    _resp3_bulk(items[2]),
+                )
+            auto count = _resp3_integer(items[2])
+            if count < 0:
+                raise ProtocolError("Negative RESP3 subscription count")
+            if kind == b"subscribe":
+                return PubSubEvent.Subscribed(_resp3_bulk(items[1]), count)
+            if kind == b"psubscribe":
+                return PubSubEvent.PatternSubscribed(_resp3_bulk(items[1]), count)
+            if kind == b"unsubscribe":
+                if _resp3_unwrap(items[1]) == Resp3.Null:
+                    return PubSubEvent.Unsubscribed(None, count)
+                return PubSubEvent.Unsubscribed(
+                    Optional.Some(_resp3_bulk(items[1])),
+                    count,
+                )
+            if kind == b"punsubscribe":
+                if _resp3_unwrap(items[1]) == Resp3.Null:
+                    return PubSubEvent.PatternUnsubscribed(None, count)
+                return PubSubEvent.PatternUnsubscribed(
+                    Optional.Some(_resp3_bulk(items[1])),
+                    count,
+                )
+            raise ProtocolError("Unknown RESP3 Pub/Sub push")
+        case _:
+            raise ProtocolError("Expected RESP3 push event")
 
 def _keys_command(bytes name, list[bytes] keys) -> list[bytes]:
     if len(keys) == 0:
@@ -1488,6 +1677,21 @@ struct StreamBatch:
     bytes key
     list[StreamEntry] entries
 
+struct StreamPendingConsumer:
+    bytes name
+    int64 pending
+
+struct StreamPendingSummary:
+    int64 total
+    Optional[bytes] smallest_id
+    Optional[bytes] largest_id
+    list[StreamPendingConsumer] consumers
+
+struct StreamAutoClaim:
+    bytes next_id
+    list[StreamEntry] entries
+    list[bytes] deleted_ids
+
 def _stream_component(str part) -> bool:
     if part !~ m/\A(?:0|[1-9][0-9]*)\z/:
         return False
@@ -1574,6 +1778,9 @@ def _stream_batches(Reply reply, list[bytes] requested) -> list[StreamBatch]:
     match reply:
         case Reply.NullArray:
             return batches
+        case Reply.NullBulk:
+            # RESP3 null is normalized to the existing null-bulk variant.
+            return batches
         case Reply.Array(items):
             for item in items:
                 match item:
@@ -1589,6 +1796,78 @@ def _stream_batches(Reply reply, list[bytes] requested) -> list[StreamBatch]:
             return batches
         case _:
             raise ProtocolError("Expected XREAD array or null array")
+
+def _stream_group_batches(Reply reply, list[bytes] requested) -> list[StreamBatch]:
+    return _stream_batches(reply, requested)
+
+def _stream_optional_id(Reply reply) -> Optional[bytes]:
+    match reply:
+        case Reply.NullBulk:
+            return None
+        case Reply.Bulk(data):
+            if not _stream_id_valid(data):
+                raise ProtocolError("Invalid pending stream ID")
+            return Optional.Some(data)
+        case _:
+            raise ProtocolError("Expected stream ID or null")
+
+def _stream_pending_summary(Reply reply) -> StreamPendingSummary:
+    match reply:
+        case Reply.Array(items):
+            if len(items) != 4:
+                raise ProtocolError("XPENDING summary must contain four fields")
+            auto total = _stream_nonnegative(items[0])
+            auto smallest = _stream_optional_id(items[1])
+            auto largest = _stream_optional_id(items[2])
+            list[StreamPendingConsumer] consumers = []
+            match items[3]:
+                case Reply.Array(entries):
+                    for entry in entries:
+                        match entry:
+                            case Reply.Array(parts):
+                                if len(parts) != 2:
+                                    raise ProtocolError("Invalid XPENDING consumer entry")
+                                consumers.append(
+                                    StreamPendingConsumer(
+                                        _required_bulk(parts[0]),
+                                        _stream_nonnegative(parts[1]),
+                                    ),
+                                )
+                            case _:
+                                raise ProtocolError("Invalid XPENDING consumer entry")
+                case _:
+                    raise ProtocolError("Expected XPENDING consumer array")
+            if total == 0 and (smallest != None or largest != None or len(consumers) != 0):
+                raise ProtocolError("Empty XPENDING summary contains pending state")
+            if total > 0 and (smallest == None or largest == None):
+                raise ProtocolError("Non-empty XPENDING summary omits its ID range")
+            return StreamPendingSummary(total, smallest, largest, consumers)
+        case _:
+            raise ProtocolError("Expected XPENDING summary array")
+
+def _stream_autoclaim(Reply reply) -> StreamAutoClaim:
+    match reply:
+        case Reply.Array(parts):
+            if len(parts) != 2 and len(parts) != 3:
+                raise ProtocolError("XAUTOCLAIM reply must contain two or three fields")
+            auto next_id = _required_bulk(parts[0])
+            if not _stream_id_valid(next_id):
+                raise ProtocolError("Invalid XAUTOCLAIM continuation ID")
+            auto entries = _stream_entries(parts[1])
+            list[bytes] deleted = []
+            if len(parts) == 3:
+                deleted = _bulk_array(parts[2])
+                for id in deleted:
+                    if not _stream_id_valid(id):
+                        raise ProtocolError("Invalid XAUTOCLAIM deleted ID")
+            return StreamAutoClaim(next_id, entries, deleted)
+        case _:
+            raise ProtocolError("Expected XAUTOCLAIM array")
+
+def _stream_group_id(bytes raw):
+    if raw == b">":
+        return
+    _stream_position(raw, False)
 
 def _stream_count(list[bytes] args, int64 count):
     if count < 0:
@@ -1613,6 +1892,20 @@ def _xread_blocks(list[bytes] args) -> bool:
         if option == "BLOCK":
             return True
         if option == "COUNT":
+            i = i + 2
+        else:
+            i = i + 1
+    return False
+
+def _xreadgroup_blocks(list[bytes] args) -> bool:
+    auto i = 1
+    while i < len(args):
+        auto option = _command_name([args[i]])
+        if option == "STREAMS":
+            return False
+        if option == "BLOCK":
+            return True
+        if option == "GROUP" or option == "COUNT":
             i = i + 2
         else:
             i = i + 1
@@ -1760,6 +2053,15 @@ struct PubSub:
         try:
             auto deadline = _budget(budget_ms)
             net.set_deadline_ns(self._connection._socket, deadline)
+            if self._connection._protocol3:
+                auto frame = self._connection._next_push(deadline)
+                auto event = _pubsub_event3(frame)
+                auto count = _pubsub_ack_count(event)
+                if count >= 0:
+                    self._count.store(count)
+                net.set_deadline_ns(self._connection._socket, 0)
+                healthy = True
+                return event
             auto reply = self._connection._read_reply(deadline)
             match reply:
                 case Reply.Error(data):
@@ -1792,17 +2094,91 @@ struct PubSub:
 struct Connection:
     bytes _socket
     Decoder _reader
+    Resp3Reader _reader3
     Atomic[int64] _state
     int64 _max_frame
     int64 _max_depth
     int64 _read_size
     Options _config
     bytes _last_error
+    bool _protocol3
+    list[Resp3] _pushes
+    int64 _push_head
+    int64 _push_limit
+    list[Resp3Pair] _last_attributes
 
     def _invalidate(self):
         _close_socket(self._socket, self._config.secure)
         self._reader = decoder(self._max_frame, self._max_depth)
+        self._reader3 = resp3_reader(self._max_frame, self._max_depth)
+        list[Resp3] empty = []
+        self._pushes = empty
+        self._push_head = 0
+        list[Resp3Pair] no_attributes = []
+        self._last_attributes = no_attributes
         self._state.store(2)
+
+    def protocol(self) -> str:
+        if self._protocol3:
+            return "RESP3"
+        return "RESP2"
+
+    def last_attributes(self) -> list[Resp3Pair]:
+        return self._last_attributes
+
+    def _queue_push(self, Resp3 value):
+        if len(self._pushes) - self._push_head >= self._push_limit:
+            raise ProtocolError("RESP3 push queue limit exceeded")
+        self._pushes.append(value)
+
+    def _take_push(self) -> Optional[Resp3]:
+        if self._push_head >= len(self._pushes):
+            return None
+        auto value = self._pushes[self._push_head]
+        self._push_head = self._push_head + 1
+        if self._push_head == len(self._pushes):
+            list[Resp3] empty = []
+            self._pushes = empty
+            self._push_head = 0
+        return Optional.Some(value)
+
+    def _next_push(self, int64 deadline) -> Resp3:
+        match self._take_push():
+            case Optional.Some(value):
+                return value
+            case _:
+                pass
+        while True:
+            auto value = self._read_resp3_frame(deadline)
+            if not _resp3_push(value):
+                raise ProtocolError("Expected RESP3 push while awaiting push")
+            return value
+
+    def next_push(self, int64 timeout_ms = -1) -> Resp3:
+        if not self._protocol3:
+            raise ValueError("RESP3 push reads require an explicitly negotiated connection")
+        if timeout_ms < -1:
+            raise ValueError("RESP3 push timeout must be -1, zero, or positive")
+        auto budget_ms = timeout_ms
+        if budget_ms == -1:
+            budget_ms = self._config.command_timeout_ms
+        if not self._state.compare_and_swap(0, 1):
+            if self._state.load() == 2:
+                raise ConnectionError("Redis connection is closed")
+            raise BusyError("Redis connection is in use")
+        auto healthy = False
+        try:
+            auto deadline = _budget(budget_ms)
+            net.set_deadline_ns(self._socket, deadline)
+            auto value = self._next_push(deadline)
+            net.set_deadline_ns(self._socket, 0)
+            healthy = True
+            return value
+        finally:
+            if healthy:
+                self._state.store(0)
+            else:
+                self._invalidate()
 
     def pubsub(self) -> PubSub:
         if not self._state.compare_and_swap(0, 1):
@@ -1853,9 +2229,7 @@ struct Connection:
             if self._state.load() == 2:
                 return
             raise BusyError("Redis connection is in use")
-        _close_socket(self._socket, self._config.secure)
-        self._reader = decoder(self._max_frame, self._max_depth)
-        self._state.store(2)
+        self._invalidate()
 
     # The last consumed top-level server error is retained losslessly until a
     # subsequent server error or an explicit reconnect. Success does not clear it.
@@ -1868,6 +2242,12 @@ struct Connection:
                 raise BusyError("Redis connection is in use")
         _close_socket(self._socket, self._config.secure)
         self._reader = decoder(self._max_frame, self._max_depth)
+        self._reader3 = resp3_reader(self._max_frame, self._max_depth)
+        list[Resp3] empty_pushes = []
+        self._pushes = empty_pushes
+        self._push_head = 0
+        list[Resp3Pair] empty_attributes = []
+        self._last_attributes = empty_attributes
         self._last_error = b""
         auto opened = False
         try:
@@ -1883,6 +2263,9 @@ struct Connection:
             else:
                 _close_socket(self._socket, self._config.secure)
                 self._reader = decoder(self._max_frame, self._max_depth)
+                self._reader3 = resp3_reader(self._max_frame, self._max_depth)
+                list[Resp3Pair] empty_attributes = []
+                self._last_attributes = empty_attributes
                 self._last_error = b""
                 self._state.store(2)
 
@@ -1902,6 +2285,42 @@ struct Connection:
                 raise ProtocolError("Unexpected Redis session reply: " + stage)
 
     def _initialize(self, int64 deadline):
+        if self._protocol3:
+            list[bytes] hello = [b"HELLO", b"3"]
+            if self._config.authenticate:
+                hello.append(b"AUTH")
+                if len(self._config.username) > 0:
+                    hello.append(bytes(self._config.username))
+                else:
+                    hello.append(b"default")
+                hello.append(bytes(self._config.password))
+            if len(self._config.client_name) > 0:
+                hello.append(b"SETNAME")
+                hello.append(bytes(self._config.client_name))
+            auto negotiated = Resp3.Null
+            try:
+                negotiated = self._wire_resp3(encode_command(hello), deadline)
+            except CommandTimeout:
+                raise ConnectTimeout("Redis RESP3 negotiation deadline exceeded")
+            match _resp3_unwrap(negotiated):
+                case Resp3.Error(data):
+                    self._last_error = data
+                    raise ResponseError("Redis RESP3 negotiation failed: " + _error_text(data))
+                case Resp3.BlobError(data):
+                    self._last_error = data
+                    raise ResponseError("Redis RESP3 negotiation failed: " + _error_text(data))
+                case Resp3.Map(pairs):
+                    if _resp3_map_integer(negotiated, b"proto") != 3:
+                        raise ProtocolError("Redis HELLO did not negotiate RESP3")
+                case _:
+                    raise ProtocolError("Redis HELLO returned an invalid RESP3 reply")
+            if self._config.database != 0:
+                self._session_ok(
+                    [b"SELECT", bytes(str(self._config.database))],
+                    "SELECT",
+                    deadline,
+                )
+            return
         if self._config.authenticate:
             if len(self._config.username) > 0:
                 self._session_ok(
@@ -2249,6 +2668,96 @@ struct Connection:
             args.append(stream.after_id)
         return _stream_batches(self.execute(args), keys)
 
+    def xgroup_create(
+        self,
+        bytes key,
+        bytes group,
+        bytes start_id = b"$",
+        bool mkstream = False,
+    ):
+        _stream_position(start_id, True)
+        list[bytes] args = [b"XGROUP", b"CREATE", key, group, start_id]
+        if mkstream:
+            args.append(b"MKSTREAM")
+        _status_value(self.execute(args), b"OK")
+
+    def xgroup_destroy(self, bytes key, bytes group) -> bool:
+        auto removed = _stream_nonnegative(
+            self.execute([b"XGROUP", b"DESTROY", key, group]),
+        )
+        if removed != 0 and removed != 1:
+            raise ProtocolError("XGROUP DESTROY result must be zero or one")
+        return removed == 1
+
+    def xreadgroup(
+        self,
+        bytes group,
+        bytes consumer,
+        list[StreamCursor] streams,
+        int64 count = 0,
+        int64 block_ms = -1,
+        bool noack = False,
+    ) -> list[StreamBatch]:
+        if len(streams) == 0 or block_ms < -1:
+            raise ValueError("Invalid XREADGROUP streams or BLOCK value")
+        list[bytes] args = [b"XREADGROUP", b"GROUP", group, consumer]
+        _stream_count(args, count)
+        if block_ms >= 0:
+            args.append(b"BLOCK")
+            args.append(bytes(str(block_ms)))
+        if noack:
+            args.append(b"NOACK")
+        args.append(b"STREAMS")
+        list[bytes] keys = []
+        for stream in streams:
+            _stream_group_id(stream.after_id)
+            args.append(stream.key)
+            keys.append(stream.key)
+        for stream in streams:
+            args.append(stream.after_id)
+        return _stream_group_batches(self.execute(args), keys)
+
+    def xack(self, bytes key, bytes group, list[bytes] ids) -> int64:
+        if len(ids) == 0:
+            raise ValueError("XACK requires at least one stream ID")
+        list[bytes] args = [b"XACK", key, group]
+        for id in ids:
+            if not _stream_id_valid(bytes(id)):
+                raise ValueError("XACK requires full canonical stream IDs")
+            args.append(id)
+        return _stream_nonnegative(self.execute(args))
+
+    def xpending(self, bytes key, bytes group) -> StreamPendingSummary:
+        return _stream_pending_summary(
+            self.execute([b"XPENDING", key, group]),
+        )
+
+    def xautoclaim(
+        self,
+        bytes key,
+        bytes group,
+        bytes consumer,
+        int64 min_idle_ms,
+        bytes start_id = b"0-0",
+        int64 count = 0,
+    ) -> StreamAutoClaim:
+        if min_idle_ms < 0 or count < 0:
+            raise ValueError("XAUTOCLAIM idle time and COUNT must be non-negative")
+        if not _stream_id_valid(start_id):
+            raise ValueError("XAUTOCLAIM requires a full canonical start ID")
+        list[bytes] args = [
+            b"XAUTOCLAIM",
+            key,
+            group,
+            consumer,
+            bytes(str(min_idle_ms)),
+            start_id,
+        ]
+        if count > 0:
+            args.append(b"COUNT")
+            args.append(bytes(str(count)))
+        return _stream_autoclaim(self.execute(args))
+
     def _set_members(self, bytes command, bytes key, list[bytes] members) -> int64:
         if len(members) == 0:
             raise ValueError("Redis set mutation requires at least one member")
@@ -2459,9 +2968,7 @@ struct Connection:
             if healthy:
                 self._state.store(0)
             else:
-                _close_socket(self._socket, self._config.secure)
-                self._reader = decoder(self._max_frame, self._max_depth)
-                self._state.store(2)
+                self._invalidate()
 
     # All replies, including server errors, are returned in submission order.
     # Ownership spans the entire write and drain. Never return a partial result.
@@ -2478,7 +2985,15 @@ struct Connection:
             if count > 0:
                 self._write_wire(wire, deadline)
                 for i in range(0, count):
-                    auto result = self._read_reply(deadline)
+                    auto result = Reply.NullBulk
+                    if self._protocol3:
+                        auto frame = self._read_resp3_frame(deadline)
+                        while _resp3_push(frame):
+                            self._queue_push(frame)
+                            frame = self._read_resp3_frame(deadline)
+                        result = _resp3_reply(frame)
+                    else:
+                        result = self._read_reply(deadline)
                     match result:
                         case Reply.Error(data):
                             self._last_error = data
@@ -2492,14 +3007,104 @@ struct Connection:
             if healthy:
                 self._state.store(0)
             else:
-                _close_socket(self._socket, self._config.secure)
-                self._reader = decoder(self._max_frame, self._max_depth)
-                self._state.store(2)
+                self._invalidate()
 
     # Caller holds the ownership state for the entire command/session setup.
     def _wire_reply(self, bytes wire, int64 deadline) -> Reply:
+        if self._protocol3:
+            return _resp3_reply(self._wire_resp3(wire, deadline))
         self._write_wire(wire, deadline)
         return self._read_reply(deadline)
+
+    # Rich RESP3 entry point. Push frames are delivered through next_push and
+    # do not consume the command's reply slot.
+    def execute3(self, list[bytes] args) -> Resp3:
+        return self._exchange3(args, True)
+
+    def execute3_raw(self, list[bytes] args) -> Resp3:
+        return self._exchange3(args, False)
+
+    def _exchange3(self, list[bytes] args, bool raise_response_errors) -> Resp3:
+        if not self._protocol3:
+            raise ValueError("execute3 requires an explicitly negotiated RESP3 connection")
+        auto wire = encode_command(args)
+        if not self._state.compare_and_swap(0, 1):
+            if self._state.load() == 2:
+                raise ConnectionError("Redis connection is closed")
+            raise BusyError("Redis connection is in use")
+        auto healthy = False
+        try:
+            auto deadline = _budget(self._config.command_timeout_ms)
+            net.set_deadline_ns(self._socket, deadline)
+            auto result = self._wire_resp3(wire, deadline)
+            net.set_deadline_ns(self._socket, 0)
+            healthy = True
+            match _resp3_unwrap(result):
+                case Resp3.Error(data):
+                    self._last_error = data
+                    if raise_response_errors:
+                        raise ResponseError(_error_text(data))
+                case Resp3.BlobError(data):
+                    self._last_error = data
+                    if raise_response_errors:
+                        raise ResponseError(_error_text(data))
+                case _:
+                    pass
+            return result
+        finally:
+            if healthy:
+                self._state.store(0)
+            else:
+                self._invalidate()
+
+    def _wire_resp3(self, bytes wire, int64 deadline) -> Resp3:
+        self._write_wire(wire, deadline)
+        while True:
+            auto value = self._read_resp3_frame(deadline)
+            if _resp3_push(value):
+                self._queue_push(value)
+                continue
+            match value:
+                case Resp3.Attributed(attributes, child):
+                    self._last_attributes = attributes
+                case _:
+                    list[Resp3Pair] empty_attributes = []
+                    self._last_attributes = empty_attributes
+            return value
+
+    def _read_resp3_frame(self, int64 deadline) -> Resp3:
+        while True:
+            auto decoded = self._reader3.decode()
+            match decoded.status:
+                case "ok":
+                    self._reader3.consume(decoded.consumed)
+                    return decoded.value
+                case "invalid":
+                    raise ProtocolError("Invalid RESP3 frame: " + decoded.message)
+                case _:
+                    pass
+            _check_budget(deadline)
+            auto buffered = self._reader3.buffered_bytes()
+            auto room = self._max_frame - buffered
+            if room <= 0:
+                raise ProtocolError("Redis reply exceeds byte limit")
+            auto count = self._read_size
+            if count < buffered:
+                count = buffered
+            if count > room:
+                count = room
+            auto chunk = b""
+            try:
+                chunk = _receive_socket(self._socket, count, self._config.secure)
+            except TimeoutError:
+                raise CommandTimeout("Redis command deadline exceeded during receive")
+            except Exception as e:
+                raise ConnectionError("Redis receive failed: " + e)
+            if len(chunk) == 0:
+                if buffered == 0:
+                    raise ConnectionError("Redis peer closed before replying")
+                raise ConnectionError("Redis peer closed during a reply")
+            self._reader3.append(chunk)
 
     def _write_wire(self, bytes wire, int64 deadline):
         auto sent = 0
@@ -2569,6 +3174,12 @@ def _snapshot_options(Options config) -> Options:
     )
 
 def connect_options(Options config) -> Connection:
+    return _connect_options_mode(config, False)
+
+def connect_resp3_options(Options config) -> Connection:
+    return _connect_options_mode(config, True)
+
+def _connect_options_mode(Options config, bool protocol3) -> Connection:
     auto cfg = _snapshot_options(config)
     auto deadline = _budget(cfg.connect_timeout_ms)
     auto socket = _dial(cfg, deadline)
@@ -2576,12 +3187,18 @@ def connect_options(Options config) -> Connection:
     auto conn = Connection(
         socket,
         decoder(cfg.max_frame, cfg.max_depth),
+        resp3_reader(cfg.max_frame, cfg.max_depth),
         state,
         cfg.max_frame,
         cfg.max_depth,
         cfg.read_size,
         cfg,
         b"",
+        protocol3,
+        [],
+        0,
+        64,
+        [],
     )
     auto ready = False
     try:
@@ -2636,6 +3253,44 @@ def connect(
 
 def connect_url(str address) -> Connection:
     return connect_options(parse_url(address))
+
+def connect_resp3(
+    str host = "127.0.0.1",
+    int64 port = 6379,
+    int64 max_frame = 16777216,
+    int64 max_depth = 64,
+    int64 read_size = 4096,
+    int64 database = 0,
+    str username = "",
+    str password = "",
+    str client_name = "",
+    bool authenticate = False,
+    bool secure = False,
+    int64 connect_timeout_ms = 0,
+    int64 command_timeout_ms = 0,
+    str resolved_ip = "",
+) -> Connection:
+    return connect_resp3_options(
+        options(
+            host,
+            port,
+            database,
+            username,
+            password,
+            client_name,
+            authenticate,
+            max_frame,
+            max_depth,
+            read_size,
+            secure,
+            connect_timeout_ms,
+            command_timeout_ms,
+            resolved_ip,
+        ),
+    )
+
+def connect_resp3_url(str address) -> Connection:
+    return connect_resp3_options(parse_url(address))
 
 struct PoolClosed:
     str message
@@ -2926,6 +3581,86 @@ struct Lease:
         self._enter()
         try:
             return self._connection.xread(streams, count, block_ms)
+        finally:
+            self._guard.store(0)
+
+    def xgroup_create(
+        self,
+        bytes key,
+        bytes group,
+        bytes start_id = b"$",
+        bool mkstream = False,
+    ):
+        self._enter()
+        try:
+            self._connection.xgroup_create(key, group, start_id, mkstream)
+        finally:
+            self._guard.store(0)
+
+    def xgroup_destroy(self, bytes key, bytes group) -> bool:
+        self._enter()
+        try:
+            return self._connection.xgroup_destroy(key, group)
+        finally:
+            self._guard.store(0)
+
+    def xreadgroup(
+        self,
+        bytes group,
+        bytes consumer,
+        list[StreamCursor] streams,
+        int64 count = 0,
+        int64 block_ms = -1,
+        bool noack = False,
+    ) -> list[StreamBatch]:
+        if block_ms >= 0 and not self._dedicated:
+            raise ValueError("Blocking XREADGROUP requires a dedicated lease")
+        self._enter()
+        try:
+            return self._connection.xreadgroup(
+                group,
+                consumer,
+                streams,
+                count,
+                block_ms,
+                noack,
+            )
+        finally:
+            self._guard.store(0)
+
+    def xack(self, bytes key, bytes group, list[bytes] ids) -> int64:
+        self._enter()
+        try:
+            return self._connection.xack(key, group, ids)
+        finally:
+            self._guard.store(0)
+
+    def xpending(self, bytes key, bytes group) -> StreamPendingSummary:
+        self._enter()
+        try:
+            return self._connection.xpending(key, group)
+        finally:
+            self._guard.store(0)
+
+    def xautoclaim(
+        self,
+        bytes key,
+        bytes group,
+        bytes consumer,
+        int64 min_idle_ms,
+        bytes start_id = b"0-0",
+        int64 count = 0,
+    ) -> StreamAutoClaim:
+        self._enter()
+        try:
+            return self._connection.xautoclaim(
+                key,
+                group,
+                consumer,
+                min_idle_ms,
+                start_id,
+                count,
+            )
         finally:
             self._guard.store(0)
 
