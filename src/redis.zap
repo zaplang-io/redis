@@ -3559,7 +3559,8 @@ def _cluster_discover(list[Options] seeds) -> list[ClusterSlotRange]:
                 )
             finally:
                 conn.disconnect()
-        except Exception:
+        except Exception as e:
+            print("Cluster discovery seed failed: " + e)
             auto ignored = 0
     raise ConnectionError("Redis Cluster could not discover slot topology")
 
