@@ -16,6 +16,9 @@ is created by this change.
   explicit acknowledgements and at-most-once/no-replay semantics.
 - Basic Streams with unsigned ID tokens, ordered/repeated binary fields, ranges,
   deletion and nonblocking/dedicated-blocking XREAD.
-- Decoder-only RESP3 values; no RESP3 transport negotiation or push dispatch.
+- Stream consumer groups with pending summaries, acknowledgements, and stale
+  pending-entry claims.
+- Opt-in RESP3 HELLO negotiation, rich replies/attributes, bounded push delivery,
+  and RESP3 Pub/Sub dispatch; RESP2 remains the default.
 - Executable consumer examples, path/static-registry installation tests, pinned
   runtime/server CI, and version/tag release preflight.

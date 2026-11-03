@@ -3,9 +3,9 @@
 A pure-Zap Redis client, official non-core package. Tracks
 [zaplang-io/zap#322](https://github.com/zaplang-io/zap/issues/322).
 
-The package includes a binary-safe RESP2 codec, TCP connections, typed errors,
-explicit reconnect, URL configuration, verified TLS, and session initialization. Typed command
-helpers are still planned.
+The package includes a binary-safe RESP2 codec, opt-in RESP3 connections, typed
+commands, explicit reconnect, URL configuration, verified TLS, and session
+initialization.
 
 ## Installation and support
 
@@ -38,7 +38,7 @@ def main():
 ```
 
 `connect()` returns an open `Connection`. `execute(list[bytes]) -> Reply` sends
-one command and reads one complete RESP2 reply. Reads preserve arbitrary bytes;
+one command and reads one complete reply using the negotiated protocol. Reads preserve arbitrary bytes;
 fragmented replies are assembled and surplus bytes retained for the next reply.
 A top-level Redis server error raises `redis.ResponseError`. Use
 `execute_raw(list[bytes])` to receive `Reply.Error` values instead. Nested errors
@@ -421,7 +421,8 @@ See [transactions, lease ownership, session reset, and shutdown semantics](docs/
 
 ## Typed key and string commands
 
-These `Connection` methods use RESP2 and accept keys/values as `bytes`:
+These `Connection` methods accept keys/values as `bytes` and work on RESP2 or
+explicitly negotiated RESP3 connections:
 
 | Method | Result |
 | --- | --- |
@@ -511,7 +512,7 @@ applying the increment. Invalid integers, overflow, and operations on keys of
 the wrong type raise `ResponseError` and retain the server error bytes through
 `last_error()`. Commands are not retried automatically.
 
-HGETALL requires a non-null RESP2 array containing an even number of non-null
+HGETALL requires a non-null array containing an even number of non-null
 bulk strings. Odd lengths, nulls, and incorrectly typed fields/values raise
 `ProtocolError`. HMGET also checks result count and element types. These complete
 frames have already been consumed, so the connection remains usable under the
@@ -791,7 +792,16 @@ positive values set a server wait in milliseconds. Server timeout/missing data
 returns an empty list. Client deadlines/cancellation independently discard
 incomplete connections. Blocking XREAD requires a dedicated pool lease; ordinary
 leases support nonblocking `xread` and reject blocking raw/pipelined XREAD.
-Consumer groups, trimming and automatic cursor/retry policy are not included.
+Consumer groups use `xgroup_create`, `xgroup_destroy`, `xreadgroup`, `xack`,
+`xpending`, and `xautoclaim`. Group reads use `StreamCursor` identities:
+`b">"` requests entries never delivered to this consumer, while a full stream
+ID resumes this consumer's pending entries. `xpending` returns a summary with
+the total, ID range, and per-consumer pending counts. `xautoclaim` returns the
+continuation ID, reclaimed entries, and (on Redis 7+) IDs removed during the
+claim scan; it requires Redis 6.2 or newer. Delivery is at least once: process
+an entry before acknowledging it, and make consumers idempotent where needed.
+Blocking XREADGROUP, like blocking XREAD, requires a dedicated pool lease.
+Trimming and automatic cursor/retry policy are not included.
 
 See [API, delivery/backpressure, ID, timeout, and shutdown semantics](docs/pubsub-streams.md)
 and the [complete installed-package example](examples/pubsub_streams.zap).
@@ -884,13 +894,24 @@ automatic retry, deadline, or cancellation primitive is added by this decoder.
 The stateless `decode` API remains supported. Performance results are in
 [parser performance notes](docs/parser-performance.md).
 
-## Decoder-only RESP3 values
+## RESP3 connections
 
 `decode3(data, max_frame=16777216, max_depth=64) -> Decoded3` decodes one
 fixed-length RESP3 value with the same status/consumption/diagnostic convention.
 The separate `redis.Resp3` enum preserves the existing RESP2 `Reply` API and
-exhaustive matches. **Connections remain RESP2**; no public HELLO negotiation or
-push delivery is introduced. Those session features remain in #26.
+exhaustive matches. Connections remain RESP2 by default. Use
+`connect_resp3_options(options(...))` or `connect_resp3_url(url)` to opt into
+HELLO 3. Authentication, client name, database selection, reconnect, TLS, and
+configured timeouts use the same connection options as RESP2.
+
+On an opted-in connection, `execute` converts ordinary RESP3 values to the
+existing `Reply` shapes. `execute3` returns the full RESP3 value, while
+`execute3_raw` returns server errors as values. `last_attributes()` returns the
+attributes on the most recently consumed reply. Interleaved push frames are
+held in a bounded FIFO and read with `next_push(timeout_ms)`; exceeding its
+64-frame limit poisons the connection. RESP3 Pub/Sub uses the same push path
+through `PubSub.next_event`. There is no background reader, so a connection
+must have one active owner at a time.
 
 RESP3 supports Simple/Error/Integer/Bulk/Array (including legacy NullBulk and
 NullArray), Null, Boolean, Double, BigNumber, BlobError, Verbatim, Map, Set,
@@ -907,10 +928,9 @@ share the frame/depth budget. A Verbatim value retains its three-byte format
 and data separately. Sets/pushes retain their received item order without
 claiming set ordering or interpreting push messages as command replies.
 
-Streamed strings/aggregates (`$?`, `*?`, `%?`, chunk/terminator forms) are explicitly
-unsupported. Resource limits and invalid-frame diagnostics apply to every
-nested value and all fragment boundaries. Live decoder tests explicitly
-negotiate RESP3 only on a separate test socket; the library connection and typed
-command helpers continue to use RESP2.
+Streamed strings/aggregates (`$?`, `*?`, `%?`, chunk/terminator forms) are
+explicitly unsupported. Resource limits and invalid-frame diagnostics apply to
+every nested value and all fragment boundaries. Existing typed command helpers
+work on either protocol through the compatibility conversion.
 
 Reference: [Redis RESP3 data types](https://redis.io/docs/latest/develop/reference/protocol-spec/).
