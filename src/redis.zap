@@ -1033,7 +1033,7 @@ def _rank_value(Reply reply) -> Optional[int64]:
 
 def _required_bulk(Reply reply) -> bytes:
     match reply:
-        case Reply.Bulk(data):
+        case Reply.Bulk(_):
             return data
         case _:
             raise ProtocolError("Expected Redis non-null bulk reply")
@@ -1818,12 +1818,14 @@ def _stream_optional_id(Reply reply) -> Optional[bytes]:
         case _:
             raise ProtocolError("Expected stream ID or null")
 
-def _stream_optional_set(Optional[bytes] value) -> bool:
-    match value:
-        case Optional.Some(_):
+def _stream_reply_has_id(Reply reply) -> bool:
+    match reply:
+        case Reply.NullBulk:
+            return False
+        case Reply.Bulk(data):
             return True
         case _:
-            return False
+            raise ProtocolError("Expected stream ID or null")
 
 def _stream_pending_summary(Reply reply) -> StreamPendingSummary:
     match reply:
@@ -1831,6 +1833,8 @@ def _stream_pending_summary(Reply reply) -> StreamPendingSummary:
             if len(items) != 4:
                 raise ProtocolError("XPENDING summary must contain four fields")
             auto total = _stream_nonnegative(items[0])
+            auto has_smallest = _stream_reply_has_id(items[1])
+            auto has_largest = _stream_reply_has_id(items[2])
             auto smallest = _stream_optional_id(items[1])
             auto largest = _stream_optional_id(items[2])
             list[StreamPendingConsumer] consumers = []
@@ -1852,14 +1856,14 @@ def _stream_pending_summary(Reply reply) -> StreamPendingSummary:
                 case _:
                     raise ProtocolError("Expected XPENDING consumer array")
             if total == 0 and (
-                _stream_optional_set(smallest)
-                or _stream_optional_set(largest)
+                has_smallest
+                or has_largest
                 or len(consumers) != 0
             ):
                 raise ProtocolError("Empty XPENDING summary contains pending state")
             if total > 0 and (
-                not _stream_optional_set(smallest)
-                or not _stream_optional_set(largest)
+                not has_smallest
+                or not has_largest
             ):
                 raise ProtocolError("Non-empty XPENDING summary omits its ID range")
             return StreamPendingSummary(total, smallest, largest, consumers)
