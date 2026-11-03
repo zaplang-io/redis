@@ -115,8 +115,8 @@ def main():
             redis.options(
                 "127.0.0.1",
                 net.port(seed_listener),
-                connect_timeout_ms=1000,
-                command_timeout_ms=1000,
+                connect_timeout_ms=5000,
+                command_timeout_ms=5000,
             ),
         ],
     )
