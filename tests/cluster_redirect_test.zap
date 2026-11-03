@@ -30,7 +30,13 @@ def seed_peer(
     print("Cluster redirect fixture: seed accepted discovery")
     command(discovery, [b"CLUSTER", b"SLOTS"])
     print("Cluster redirect fixture: discovery command received")
-    net.send(discovery, slots(seed_port))
+    auto topology = slots(seed_port)
+    auto decoded = redis.decode(topology)
+    check(
+        decoded.status == "ok" and decoded.consumed == len(topology),
+        "Cluster redirect topology fixture is valid RESP",
+    )
+    net.send(discovery, topology)
     print("Cluster redirect fixture: topology sent")
     net.close_conn(discovery)
 
