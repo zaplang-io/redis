@@ -2147,7 +2147,7 @@ struct Connection:
             case Optional.Some(value):
                 return value
             case _:
-                pass
+                auto ignored = 0
         while True:
             auto value = self._read_resp3_frame(deadline)
             if not _resp3_push(value):
@@ -3049,7 +3049,7 @@ struct Connection:
                     if raise_response_errors:
                         raise ResponseError(_error_text(data))
                 case _:
-                    pass
+                    auto ignored = 0
             return result
         finally:
             if healthy:
@@ -3082,7 +3082,7 @@ struct Connection:
                 case "invalid":
                     raise ProtocolError("Invalid RESP3 frame: " + decoded.message)
                 case _:
-                    pass
+                    auto ignored = 0
             _check_budget(deadline)
             auto buffered = self._reader3.buffered_bytes()
             auto room = self._max_frame - buffered
