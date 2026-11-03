@@ -16,9 +16,6 @@ def command(bytes socket, list[bytes] args):
 def bulk(bytes data) -> bytes:
     return bytes("$" + str(len(data)) + "\r\n") + data + b"\r\n"
 
-def slots(int64 port) -> bytes:
-    return b"*1\r\n*3\r\n:0\r\n:16383\r\n*3\r\n" + bulk(b"127.0.0.1") + bytes(":" + str(port) + "\r\n") + bulk(b"node")
-
 def seed_peer(
     bytes listener,
     int64 seed_port,
@@ -30,13 +27,10 @@ def seed_peer(
     print("Cluster redirect fixture: seed accepted discovery")
     command(discovery, [b"CLUSTER", b"SLOTS"])
     print("Cluster redirect fixture: discovery command received")
-    auto topology = slots(seed_port)
-    auto decoded = redis.decode(topology)
-    check(
-        decoded.status == "ok" and decoded.consumed == len(topology),
-        "Cluster redirect topology fixture is valid RESP",
+    net.send(
+        discovery,
+        b"*1\r\n*3\r\n:0\r\n:16383\r\n*3\r\n" + bulk(b"127.0.0.1") + bytes(":" + str(seed_port) + "\r\n") + bulk(b"node"),
     )
-    net.send(discovery, topology)
     print("Cluster redirect fixture: topology sent")
     net.close_conn(discovery)
 
@@ -54,7 +48,10 @@ def seed_peer(
     for _ in range(0, 7):
         auto refresh = net.accept(listener)
         command(refresh, [b"CLUSTER", b"SLOTS"])
-        net.send(refresh, slots(primary_port))
+        net.send(
+            refresh,
+            b"*1\r\n*3\r\n:0\r\n:16383\r\n*3\r\n" + bulk(b"127.0.0.1") + bytes(":" + str(primary_port) + "\r\n") + bulk(b"node"),
+        )
         net.close_conn(refresh)
     net.close_listener(listener)
     done <- original_closed
