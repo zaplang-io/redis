@@ -24,7 +24,7 @@ def sentinel_peer(
 ):
     for port in [first_port, second_port]:
         auto socket = net.accept(listener)
-        command(socket, [b"AUTH", b"default", b"sentinel-secret"])
+        command(socket, [b"AUTH", b"sentinel-secret"])
         net.send(socket, b"+OK\r\n")
         command(socket, [b"SENTINEL", b"GET-MASTER-ADDR-BY-NAME", b"orders"])
         net.send(socket, b"*2\r\n" + bulk(b"127.0.0.1") + bulk(bytes(str(port))))
@@ -34,7 +34,7 @@ def sentinel_peer(
 
 def data_peer(bytes listener, channel[bool] done):
     auto socket = net.accept(listener)
-    command(socket, [b"AUTH", b"default", b"data-secret"])
+    command(socket, [b"AUTH", b"data-secret"])
     net.send(socket, b"+OK\r\n")
     command(socket, [b"PING"])
     net.send(socket, b"+PONG\r\n")
