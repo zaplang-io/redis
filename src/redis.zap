@@ -1218,6 +1218,9 @@ def _resp3_is_null(Resp3 value) -> bool:
         case _:
             return False
 
+def _none_bytes() -> Optional[bytes]:
+    return None
+
 def _resp3_reply(Resp3 value) -> Reply:
     match _resp3_unwrap(value):
         case Resp3.Simple(data):
@@ -1338,14 +1341,14 @@ def _pubsub_event3(Resp3 value) -> PubSubEvent:
                 return PubSubEvent.PatternSubscribed(_resp3_bulk(items[1]), count)
             if kind == b"unsubscribe":
                 if _resp3_is_null(items[1]):
-                    return PubSubEvent.Unsubscribed(None, count)
+                    return PubSubEvent.Unsubscribed(_none_bytes(), count)
                 return PubSubEvent.Unsubscribed(
                     Optional.Some(_resp3_bulk(items[1])),
                     count,
                 )
             if kind == b"punsubscribe":
                 if _resp3_is_null(items[1]):
-                    return PubSubEvent.PatternUnsubscribed(None, count)
+                    return PubSubEvent.PatternUnsubscribed(_none_bytes(), count)
                 return PubSubEvent.PatternUnsubscribed(
                     Optional.Some(_resp3_bulk(items[1])),
                     count,
@@ -2156,23 +2159,20 @@ struct Connection:
             raise ProtocolError("RESP3 push queue limit exceeded")
         self._pushes.append(value)
 
-    def _take_push(self) -> Optional[Resp3]:
+    def _take_push(self) -> Resp3:
         if self._push_head >= len(self._pushes):
-            return None
+            raise ProtocolError("RESP3 push queue is empty")
         auto value = self._pushes[self._push_head]
         self._push_head = self._push_head + 1
         if self._push_head == len(self._pushes):
             list[Resp3] empty = []
             self._pushes = empty
             self._push_head = 0
-        return Optional.Some(value)
+        return value
 
     def _next_push(self, int64 deadline) -> Resp3:
-        match self._take_push():
-            case Optional.Some(value):
-                return value
-            case _:
-                auto ignored = 0
+        if self._push_head < len(self._pushes):
+            return self._take_push()
         while True:
             auto value = self._read_resp3_frame(deadline)
             if not _resp3_push(value):
