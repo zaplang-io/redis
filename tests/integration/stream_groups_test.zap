@@ -71,10 +71,11 @@ def main():
 
     f.config.command_timeout_ms = 50
     auto blocked = f.open()
+    auto blocked_key = f.binary_key(bytes([0, 254]))
     auto timed_out = False
     try:
-        blocked.xgroup_create(key, group, b"0-0")
-        list[redis.StreamCursor] new_cursor = [redis.StreamCursor(key, b">")]
+        blocked.xgroup_create(blocked_key, group, b"0-0", True)
+        list[redis.StreamCursor] new_cursor = [redis.StreamCursor(blocked_key, b">")]
         blocked.xreadgroup(group, consumer, new_cursor, block_ms=0)
     except redis.CommandTimeout:
         timed_out = True
