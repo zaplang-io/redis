@@ -1,17 +1,6 @@
 import redis
 import integration_fixtures
 
-def reply_tag(redis.Reply reply) -> str:
-    match reply:
-        case redis.Reply.Integer(value):
-            return "integer:" + str(value)
-        case redis.Reply.Bulk(data):
-            return "bulk"
-        case redis.Reply.Array(items):
-            return "array:" + str(len(items))
-        case _:
-            return "other"
-
 def main():
     auto f = integration_fixtures.fixture()
     auto conn = f.open()
@@ -24,21 +13,15 @@ def main():
     try:
         auto id = conn.xadd(
             key,
-            [
-                redis.StreamField(field, value),
-                redis.StreamField(field, b"second"),
-            ],
+            [redis.StreamField(field, value), redis.StreamField(field, b"second")],
         )
-        print("group-stage: xadd")
         conn.xgroup_create(key, group, b"0-0", True)
-        print("group-stage: create")
         auto duplicate = False
         try:
             conn.xgroup_create(key, group, b"0-0")
         except redis.ResponseError:
             duplicate = redis.error_prefix(conn.last_error()) == b"BUSYGROUP"
         integration_fixtures.check(duplicate, "BUSYGROUP reported")
-        print("group-stage: duplicate")
 
         list[redis.StreamCursor] fresh_cursor = [redis.StreamCursor(key, b">")]
         auto fresh = conn.xreadgroup(group, consumer, fresh_cursor, count=2)
@@ -46,67 +29,43 @@ def main():
             len(fresh) == 1 and len(fresh[0].entries) == 1,
             "new group delivery",
         )
-        print("group-stage: read")
         integration_fixtures.check(
-            fresh[0].entries[0].id == id
-            and fresh[0].entries[0].fields[0].field == field
-            and fresh[0].entries[0].fields[0].value == value
-            and fresh[0].entries[0].fields[1].field == field,
+            fresh[0].entries[0].id == id and fresh[0].entries[0].fields[0].field == field and fresh[0].entries[0].fields[0].value == value and fresh[0].entries[0].fields[1].field == field,
             "binary entry and repeated fields",
         )
-        match conn.execute([b"XPENDING", key, group]):
-            case redis.Reply.Array(parts):
-                print(
-                    "xpending-raw:" + reply_tag(parts[0]) + ","
-                    + reply_tag(parts[1]) + "," + reply_tag(parts[2])
-                    + "," + reply_tag(parts[3]),
-                )
-                match parts[3]:
-                    case redis.Reply.Array(consumers):
-                        if len(consumers) > 0:
-                            match consumers[0]:
-                                case redis.Reply.Array(fields):
-                                    print(
-                                        "xpending-consumer:" + reply_tag(fields[0])
-                                        + "," + reply_tag(fields[1]),
-                                    )
-                                case _:
-                                    print("xpending-consumer:other")
-                    case _:
-                        print("xpending-consumer:other")
-            case _:
-                print("xpending-raw:other")
         auto pending = conn.xpending(key, group)
-        print("group-stage: pending")
         integration_fixtures.check(
             pending.total == 1 and pending.consumers[0].name == consumer,
             "pending total and consumer identity",
         )
         auto claimed = conn.xautoclaim(key, group, claimant, 0, b"0-0", 2)
-        print("group-stage: claim")
         integration_fixtures.check(
             len(claimed.entries) == 1 and claimed.entries[0].id == id,
             "abandoned entry claimed",
         )
         pending = conn.xpending(key, group)
-        print("group-stage: claimed-pending")
         integration_fixtures.check(
             pending.total == 1 and pending.consumers[0].name == claimant,
             "claim transfers pending ownership",
         )
-        integration_fixtures.check(conn.xack(key, group, [id]) == 1, "acknowledge claimed entry")
-        print("group-stage: ack")
-        integration_fixtures.check(conn.xpending(key, group).total == 0, "pending entry acknowledged")
-        print("group-stage: empty-pending")
+        integration_fixtures.check(
+            conn.xack(key, group, [id]) == 1,
+            "acknowledge claimed entry",
+        )
+        integration_fixtures.check(
+            conn.xpending(key, group).total == 0,
+            "pending entry acknowledged",
+        )
         integration_fixtures.check(conn.xgroup_destroy(key, group), "destroy group")
-        print("group-stage: destroy")
         auto missing = False
         try:
             conn.xreadgroup(group, consumer, fresh_cursor)
         except redis.ResponseError:
             missing = redis.error_prefix(conn.last_error()) == b"NOGROUP"
-        integration_fixtures.check(missing and conn.ping(), "missing group preserves connection")
-        print("group-stage: missing")
+        integration_fixtures.check(
+            missing and conn.ping(),
+            "missing group preserves connection",
+        )
     finally:
         conn.disconnect()
 
@@ -125,6 +84,5 @@ def main():
         timed_out and blocked.is_closed(),
         "client timeout discards blocked group read",
     )
-    print("group-stage: timeout")
     f.cleanup()
     print("Live Streams consumer groups: PASS")

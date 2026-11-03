@@ -1,3 +1,6 @@
+Warning: truncated output (original token count: 33667)
+Total output lines: 3756
+
 # RESP2 wire codec. All payloads stay bytes; text decoding is a caller choice.
 # Importing this module performs no sockets or implicit command execution.
 enum Reply:
@@ -1328,10 +1331,7 @@ def _pubsub_event3(Resp3 value) -> PubSubEvent:
             if len(items) != 3:
                 raise ProtocolError("Expected three-part Pub/Sub push")
             if kind == b"message":
-                return PubSubEvent.Message(
-                    _resp3_bulk(items[1]),
-                    _resp3_bulk(items[2]),
-                )
+                return PubSubEvent.Message(_resp3_bulk(items[1]), _resp3_bulk(items[2]))
             auto count = _resp3_integer(items[2])
             if count < 0:
                 raise ProtocolError("Negative RESP3 subscription count")
@@ -1708,369 +1708,7 @@ def _stream_component(str part) -> bool:
     if len(part) > 20:
         return False
     if len(part) == 20 and part > "18446744073709551615":
-        return False
-    return True
-
-def _stream_id_valid(bytes raw) -> bool:
-    auto text = ""
-    try:
-        text = str(raw)
-    except Exception:
-        return False
-    auto parsed = text =~ m/\A(?<ms>0|[1-9][0-9]*)-(?<seq>0|[1-9][0-9]*)\z/
-    if not parsed:
-        return False
-    if not _stream_component(parsed.group("ms")):
-        return False
-    return _stream_component(parsed.group("seq"))
-
-def _stream_position(bytes raw, bool allow_dollar):
-    if allow_dollar and raw == b"$":
-        return
-    if _stream_id_valid(raw):
-        return
-    auto text = ""
-    try:
-        text = str(raw)
-    except Exception:
-        raise ValueError("Invalid Redis stream ID")
-    if not _stream_component(text):
-        raise ValueError("Invalid Redis stream ID")
-
-def _stream_boundary(bytes raw):
-    if raw == b"-" or raw == b"+":
-        return
-    auto token = raw
-    if len(token) > 0 and token[0] == 40:
-        token = token[1:len(token)]
-    _stream_position(token, False)
-
-def _stream_entry(Reply reply) -> StreamEntry:
-    match reply:
-        case Reply.Array(parts):
-            if len(parts) != 2:
-                raise ProtocolError("Expected stream ID/fields entry")
-            bytes id = _required_bulk(parts[0])
-            if not _stream_id_valid(id):
-                raise ProtocolError("Invalid returned Redis stream ID")
-            match parts[1]:
-                case Reply.Array(values):
-                    if len(values) == 0 or len(values) % 2 != 0:
-                        raise ProtocolError("Expected ordered stream field/value pairs")
-                    list[StreamField] fields = []
-                    auto i = 0
-                    while i < len(values):
-                        fields.append(
-                            StreamField(
-                                _required_bulk(values[i]),
-                                _required_bulk(values[i + 1]),
-                            ),
-                        )
-                        i = i + 2
-                    return StreamEntry(id, fields)
-                case _:
-                    raise ProtocolError("Expected stream field array")
-        case _:
-            raise ProtocolError("Expected stream entry array")
-
-def _stream_entries(Reply reply) -> list[StreamEntry]:
-    match reply:
-        case Reply.Array(items):
-            list[StreamEntry] entries = []
-            for item in items:
-                entries.append(_stream_entry(item))
-            return entries
-        case _:
-            raise ProtocolError("Expected stream entries array")
-
-def _stream_batches(Reply reply, list[bytes] requested) -> list[StreamBatch]:
-    list[StreamBatch] batches = []
-    match reply:
-        case Reply.NullArray:
-            return batches
-        case Reply.NullBulk:
-            # RESP3 null is normalized to the existing null-bulk variant.
-            return batches
-        case Reply.Array(items):
-            for item in items:
-                match item:
-                    case Reply.Array(parts):
-                        if len(parts) != 2:
-                            raise ProtocolError("Expected stream key/entries batch")
-                        bytes key = _required_bulk(parts[0])
-                        if not _requested_key(requested, key):
-                            raise ProtocolError("XREAD returned an unrequested stream")
-                        batches.append(StreamBatch(key, _stream_entries(parts[1])))
-                    case _:
-                        raise ProtocolError("Expected XREAD stream array")
-            return batches
-        case _:
-            raise ProtocolError("Expected XREAD array or null array")
-
-def _stream_group_batches(Reply reply, list[bytes] requested) -> list[StreamBatch]:
-    return _stream_batches(reply, requested)
-
-def _stream_optional_id(Reply reply) -> Optional[bytes]:
-    match reply:
-        case Reply.NullBulk:
-            return None
-        case Reply.Bulk(data):
-            if not _stream_id_valid(data):
-                raise ProtocolError("Invalid pending stream ID")
-            return Optional.Some(data)
-        case _:
-            raise ProtocolError("Expected stream ID or null")
-
-def _stream_reply_has_id(Reply reply) -> bool:
-    match reply:
-        case Reply.NullBulk:
-            return False
-        case Reply.Bulk(_):
-            return True
-        case _:
-            raise ProtocolError("Expected stream ID or null")
-
-def _stream_pending_summary(Reply reply) -> StreamPendingSummary:
-    match reply:
-        case Reply.Array(items):
-            if len(items) != 4:
-                raise ProtocolError("XPENDING summary must contain four fields")
-            auto total = _stream_nonnegative(items[0])
-            auto has_smallest = _stream_reply_has_id(items[1])
-            auto has_largest = _stream_reply_has_id(items[2])
-            auto smallest = _stream_optional_id(items[1])
-            auto largest = _stream_optional_id(items[2])
-            list[StreamPendingConsumer] consumers = []
-            match items[3]:
-                case Reply.Array(entries):
-                    for entry in entries:
-                        match entry:
-                            case Reply.Array(parts):
-                                if len(parts) != 2:
-                                    raise ProtocolError("Invalid XPENDING consumer entry")
-                                consumers.append(
-                                    StreamPendingConsumer(
-                                        _required_bulk(parts[0]),
-                                        _stream_nonnegative(parts[1]),
-                                    ),
-                                )
-                            case _:
-                                raise ProtocolError("Invalid XPENDING consumer entry")
-                case _:
-                    raise ProtocolError("Expected XPENDING consumer array")
-            if total == 0 and (
-                has_smallest
-                or has_largest
-                or len(consumers) != 0
-            ):
-                raise ProtocolError("Empty XPENDING summary contains pending state")
-            if total > 0 and (
-                not has_smallest
-                or not has_largest
-            ):
-                raise ProtocolError("Non-empty XPENDING summary omits its ID range")
-            return StreamPendingSummary(total, smallest, largest, consumers)
-        case _:
-            raise ProtocolError("Expected XPENDING summary array")
-
-def _stream_autoclaim(Reply reply) -> StreamAutoClaim:
-    match reply:
-        case Reply.Array(parts):
-            if len(parts) != 2 and len(parts) != 3:
-                raise ProtocolError("XAUTOCLAIM reply must contain two or three fields")
-            auto next_id = _required_bulk(parts[0])
-            if not _stream_id_valid(next_id):
-                raise ProtocolError("Invalid XAUTOCLAIM continuation ID")
-            auto entries = _stream_entries(parts[1])
-            list[bytes] deleted = []
-            if len(parts) == 3:
-                deleted = _bulk_array(parts[2])
-                for id in deleted:
-                    if not _stream_id_valid(id):
-                        raise ProtocolError("Invalid XAUTOCLAIM deleted ID")
-            return StreamAutoClaim(next_id, entries, deleted)
-        case _:
-            raise ProtocolError("Expected XAUTOCLAIM array")
-
-def _stream_group_id(bytes raw):
-    if raw == b">":
-        return
-    _stream_position(raw, False)
-
-def _stream_count(list[bytes] args, int64 count):
-    if count < 0:
-        raise ValueError("Redis stream COUNT must not be negative")
-    if count > 0:
-        args.append(b"COUNT")
-        args.append(bytes(str(count)))
-
-def _stream_nonnegative(Reply reply) -> int64:
-    auto value = _integer_value(reply)
-    if value < 0:
-        raise ProtocolError("Expected non-negative stream integer")
-    return value
-
-# Look only at XREAD options, never at binary keys/IDs following STREAMS.
-def _xread_blocks(list[bytes] args) -> bool:
-    auto i = 1
-    while i < len(args):
-        auto option = _command_name([args[i]])
-        if option == "STREAMS":
-            return False
-        if option == "BLOCK":
-            return True
-        if option == "COUNT":
-            i = i + 2
-        else:
-            i = i + 1
-    return False
-
-def _xreadgroup_blocks(list[bytes] args) -> bool:
-    auto i = 1
-    while i < len(args):
-        auto option = _command_name([args[i]])
-        if option == "STREAMS":
-            return False
-        if option == "BLOCK":
-            return True
-        if option == "GROUP" or option == "COUNT":
-            i = i + 2
-        else:
-            i = i + 1
-    return False
-
-# RESP2 Pub/Sub is a separate pull session. No receiver coroutine or message
-# queue is created; messages remain in the bounded parser/socket/server buffers.
-enum PubSubEvent:
-    Subscribed(bytes topic, int64 count)
-    PatternSubscribed(bytes pattern, int64 count)
-    Unsubscribed(Optional[bytes] topic, int64 count)
-    PatternUnsubscribed(Optional[bytes] pattern, int64 count)
-    Message(bytes topic, bytes payload)
-    PatternMessage(bytes pattern, bytes topic, bytes payload)
-
-def _pubsub_count(Reply reply) -> int64:
-    auto count = _integer_value(reply)
-    if count < 0:
-        raise ProtocolError("Negative Pub/Sub subscription count")
-    return count
-
-def _pubsub_event(Reply reply) -> PubSubEvent:
-    match reply:
-        case Reply.Array(items):
-            if len(items) < 3:
-                raise ProtocolError("Incomplete Pub/Sub event")
-            bytes kind = _required_bulk(items[0])
-            if kind == b"pmessage":
-                if len(items) != 4:
-                    raise ProtocolError("Expected four-part pattern message")
-                return PubSubEvent.PatternMessage(
-                    _required_bulk(items[1]),
-                    _required_bulk(items[2]),
-                    _required_bulk(items[3]),
-                )
-            if len(items) != 3:
-                raise ProtocolError("Expected three-part Pub/Sub event")
-            if kind == b"message":
-                return PubSubEvent.Message(
-                    _required_bulk(items[1]),
-                    _required_bulk(items[2]),
-                )
-            auto count = _pubsub_count(items[2])
-            if kind == b"subscribe":
-                return PubSubEvent.Subscribed(_required_bulk(items[1]), count)
-            if kind == b"psubscribe":
-                return PubSubEvent.PatternSubscribed(_required_bulk(items[1]), count)
-            if kind == b"unsubscribe":
-                return PubSubEvent.Unsubscribed(_bulk_value(items[1]), count)
-            if kind == b"punsubscribe":
-                return PubSubEvent.PatternUnsubscribed(_bulk_value(items[1]), count)
-            raise ProtocolError("Unknown RESP2 Pub/Sub event")
-        case _:
-            raise ProtocolError("Expected Pub/Sub array event")
-
-def _pubsub_ack_count(PubSubEvent event) -> int64:
-    match event:
-        case PubSubEvent.Subscribed(name, count):
-            return count
-        case PubSubEvent.PatternSubscribed(name, count):
-            return count
-        case PubSubEvent.Unsubscribed(name, count):
-            return count
-        case PubSubEvent.PatternUnsubscribed(name, count):
-            return count
-        case _:
-            return -1
-
-def _unsubscribe_wire(bytes command, list[bytes] names) -> bytes:
-    list[bytes] args = [command]
-    for name in names:
-        args.append(name)
-    return encode_command(args)
-
-struct PubSub:
-    Connection _connection
-    Atomic[int64] _state
-    Atomic[int64] _lease_guard
-    Atomic[int64] _count
-
-    def _enter(self):
-        if not self._state.compare_and_swap(0, 1):
-            if self._state.load() == 2:
-                raise ConnectionError("Redis Pub/Sub session is closed")
-            raise BusyError("Redis Pub/Sub session is in use")
-
-    def _leave(self):
-        self._state.compare_and_swap(1, 0)
-
-    def _close_session(self):
-        if self._state.load() == 2:
-            return
-        self._connection._invalidate()
-        self._count.store(0)
-        self._state.store(2)
-        self._lease_guard.store(0)
-
-    def is_closed(self) -> bool:
-        return self._state.load() == 2
-
-    # This is the count from the last consumed acknowledgement, not a prediction
-    # based on commands whose acknowledgements have not been read yet.
-    def subscription_count(self) -> int64:
-        return self._count.load()
-
-    def _send_control(self, bytes wire):
-        self._enter()
-        auto healthy = False
-        try:
-            auto deadline = _budget(self._connection._config.command_timeout_ms)
-            net.set_deadline_ns(self._connection._socket, deadline)
-            self._connection._write_wire(wire, deadline)
-            _check_budget(deadline)
-            net.set_deadline_ns(self._connection._socket, 0)
-            healthy = True
-        finally:
-            if not healthy:
-                self._close_session()
-            self._leave()
-
-    # Send control commands without silently consuming/dropping intervening
-    # messages. Acknowledgements are events read with next_event().
-    def subscribe(self, list[bytes] channels):
-        self._send_control(encode_command(_keys_command(b"SUBSCRIBE", channels)))
-
-    def psubscribe(self, list[bytes] patterns):
-        self._send_control(encode_command(_keys_command(b"PSUBSCRIBE", patterns)))
-
-    # An empty list asks Redis to unsubscribe all of this kind. Patterns and
-    # literal channels are independent; total count reaches zero after both.
-    def unsubscribe(self, list[bytes] channels):
-        self._send_control(_unsubscribe_wire(b"UNSUBSCRIBE", channels))
-
-    def punsubscribe(self, list[bytes] patterns):
-        self._send_control(_unsubscribe_wire(b"PUNSUBSCRIBE", patterns))
-
-    def next_event(self, int64 timeout_ms = -1) -> PubSubEvent:
+        return F…3667 tokens truncated…t:
         if timeout_ms < -1:
             raise ValueError("Pub/Sub timeout must be -1, zero, or positive")
         auto budget_ms = timeout_ms
@@ -2181,7 +1819,9 @@ struct Connection:
 
     def next_push(self, int64 timeout_ms = -1) -> Resp3:
         if not self._protocol3:
-            raise ValueError("RESP3 push reads require an explicitly negotiated connection")
+            raise ValueError(
+                "RESP3 push reads require an explicitly negotiated connection",
+            )
         if timeout_ms < -1:
             raise ValueError("RESP3 push timeout must be -1, zero, or positive")
         auto budget_ms = timeout_ms
@@ -2330,10 +1970,14 @@ struct Connection:
             match _resp3_unwrap(negotiated):
                 case Resp3.Error(data):
                     self._last_error = data
-                    raise ResponseError("Redis RESP3 negotiation failed: " + _error_text(data))
+                    raise ResponseError(
+                        "Redis RESP3 negotiation failed: " + _error_text(data),
+                    )
                 case Resp3.BlobError(data):
                     self._last_error = data
-                    raise ResponseError("Redis RESP3 negotiation failed: " + _error_text(data))
+                    raise ResponseError(
+                        "Redis RESP3 negotiation failed: " + _error_text(data),
+                    )
                 case Resp3.Map(pairs):
                     if _resp3_map_integer(negotiated, b"proto") != 3:
                         raise ProtocolError("Redis HELLO did not negotiate RESP3")
@@ -2753,9 +2397,7 @@ struct Connection:
         return _stream_nonnegative(self.execute(args))
 
     def xpending(self, bytes key, bytes group) -> StreamPendingSummary:
-        return _stream_pending_summary(
-            self.execute([b"XPENDING", key, group]),
-        )
+        return _stream_pending_summary(self.execute([b"XPENDING", key, group]))
 
     def xautoclaim(
         self,
@@ -3051,7 +2693,9 @@ struct Connection:
 
     def _exchange3(self, list[bytes] args, bool raise_response_errors) -> Resp3:
         if not self._protocol3:
-            raise ValueError("execute3 requires an explicitly negotiated RESP3 connection")
+            raise ValueError(
+                "execute3 requires an explicitly negotiated RESP3 connection",
+            )
         auto wire = encode_command(args)
         if not self._state.compare_and_swap(0, 1):
             if self._state.load() == 2:
