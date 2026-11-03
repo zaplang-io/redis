@@ -32,6 +32,8 @@ def seed_peer(
         b"*1\r\n*3\r\n:0\r\n:16383\r\n*3\r\n" + bulk(b"127.0.0.1") + bytes(":" + str(seed_port) + "\r\n") + bulk(b"node"),
     )
     print("Cluster redirect fixture: topology sent")
+    auto discovery_closed = len(bytes(net.recv(discovery, 1))) == 0
+    check(discovery_closed, "client closes the discovery connection")
     net.close_conn(discovery)
 
     auto original = net.accept(listener)
