@@ -1033,7 +1033,7 @@ def _rank_value(Reply reply) -> Optional[int64]:
 
 def _required_bulk(Reply reply) -> bytes:
     match reply:
-        case Reply.Bulk(_):
+        case Reply.Bulk(data):
             return data
         case _:
             raise ProtocolError("Expected Redis non-null bulk reply")
@@ -1822,7 +1822,7 @@ def _stream_reply_has_id(Reply reply) -> bool:
     match reply:
         case Reply.NullBulk:
             return False
-        case Reply.Bulk(data):
+        case Reply.Bulk(_):
             return True
         case _:
             raise ProtocolError("Expected stream ID or null")
