@@ -1,8 +1,7 @@
 import redis
 import integration_fixtures
 
-# Test-only raw socket harness, not a public RESP3 connection mode. The normal
-# Connection remains RESP2 until HELLO/push dispatch (#26) is implemented.
+# Raw RESP3 value coverage plus the public opt-in RESP3 connection path.
 struct Raw3:
     bytes socket
     bytes buffer
@@ -124,7 +123,49 @@ def main():
                 tls.close_conn(raw.socket)
             else:
                 net.close_conn(raw.socket)
+
+        auto public3 = redis.connect_resp3_options(f.config)
+        try:
+            integration_fixtures.check(
+                public3.protocol() == "RESP3" and public3.ping(),
+                "public HELLO 3 command transport",
+            )
+            public3.reconnect()
+            integration_fixtures.check(
+                public3.protocol() == "RESP3" and public3.ping(),
+                "public RESP3 reconnect renegotiates",
+            )
+        finally:
+            public3.disconnect()
+
+        auto subscriber = redis.connect_resp3_options(f.config)
+        auto topic = f.key("resp3-pubsub")
+        try:
+            auto sub = subscriber.pubsub()
+            try:
+                sub.subscribe([topic])
+                match sub.next_event():
+                    case redis.PubSubEvent.Subscribed(name, count):
+                        integration_fixtures.check(
+                            name == topic and count == 1,
+                            "public RESP3 subscription acknowledgement",
+                        )
+                    case _:
+                        raise ValueError("expected public RESP3 subscribe push")
+                conn.publish(topic, value)
+                match sub.next_event():
+                    case redis.PubSubEvent.Message(name, payload):
+                        integration_fixtures.check(
+                            name == topic and payload == value,
+                            "public RESP3 binary Pub/Sub push",
+                        )
+                    case _:
+                        raise ValueError("expected public RESP3 message push")
+            finally:
+                sub.disconnect()
+        finally:
+            subscriber.disconnect()
     finally:
         conn.disconnect()
         f.cleanup()
-    print("Live Redis RESP3 decoder: PASS")
+    print("Live Redis RESP3 decoder and connections: PASS")
