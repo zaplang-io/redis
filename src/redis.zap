@@ -630,7 +630,7 @@ struct Resp3Reader:
     def buffered_bytes(self) -> int64:
         return len(self._buffer)
 
-    def decode(self) -> Decoded3:
+    def peek(self) -> Decoded3:
         return decode3(self._buffer, self._max_frame, self._max_depth)
 
     def append(self, bytes chunk):
@@ -1211,6 +1211,13 @@ def _resp3_error_bytes(Resp3 value) -> Optional[bytes]:
         case _:
             return None
 
+def _resp3_is_null(Resp3 value) -> bool:
+    match _resp3_unwrap(value):
+        case Resp3.Null:
+            return True
+        case _:
+            return False
+
 def _resp3_reply(Resp3 value) -> Reply:
     match _resp3_unwrap(value):
         case Resp3.Simple(data):
@@ -1330,14 +1337,14 @@ def _pubsub_event3(Resp3 value) -> PubSubEvent:
             if kind == b"psubscribe":
                 return PubSubEvent.PatternSubscribed(_resp3_bulk(items[1]), count)
             if kind == b"unsubscribe":
-                if _resp3_unwrap(items[1]) == Resp3.Null:
+                if _resp3_is_null(items[1]):
                     return PubSubEvent.Unsubscribed(None, count)
                 return PubSubEvent.Unsubscribed(
                     Optional.Some(_resp3_bulk(items[1])),
                     count,
                 )
             if kind == b"punsubscribe":
-                if _resp3_unwrap(items[1]) == Resp3.Null:
+                if _resp3_is_null(items[1]):
                     return PubSubEvent.PatternUnsubscribed(None, count)
                 return PubSubEvent.PatternUnsubscribed(
                     Optional.Some(_resp3_bulk(items[1])),
@@ -3074,7 +3081,7 @@ struct Connection:
 
     def _read_resp3_frame(self, int64 deadline) -> Resp3:
         while True:
-            auto decoded = self._reader3.decode()
+            auto decoded = self._reader3.peek()
             match decoded.status:
                 case "ok":
                     self._reader3.consume(decoded.consumed)
