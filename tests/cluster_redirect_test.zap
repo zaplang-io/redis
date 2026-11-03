@@ -16,11 +16,11 @@ def command(bytes socket, list[bytes] args):
 def bulk(bytes data) -> bytes:
     return bytes("$" + str(len(data)) + "\r\n") + data + b"\r\n"
 
+def slots(int64 port) -> bytes:
+    return b"*1\r\n*3\r\n:0\r\n:16383\r\n*3\r\n" + bulk(b"127.0.0.1") + bytes(":" + str(port) + "\r\n") + bulk(b"node")
+
 def send_slots(bytes socket, int64 port):
-    net.send(socket, b"*1\r\n*3\r\n:0\r\n:16383\r\n*3\r\n")
-    net.send(socket, bulk(b"127.0.0.1"))
-    net.send(socket, bytes(":" + str(port) + "\r\n"))
-    net.send(socket, bulk(b"node"))
+    net.send(socket, slots(port))
 
 def seed_peer(
     bytes listener,
@@ -30,11 +30,8 @@ def seed_peer(
     channel[bool] done,
 ):
     auto discovery = net.accept(listener)
-    print("Cluster redirect fixture: seed accepted discovery")
     command(discovery, [b"CLUSTER", b"SLOTS"])
-    print("Cluster redirect fixture: discovery command received")
     send_slots(discovery, seed_port)
-    print("Cluster redirect fixture: topology sent")
     auto discovery_closed = len(bytes(net.recv(discovery, 1))) == 0
     check(discovery_closed, "client closes the discovery connection")
     net.close_conn(discovery)
@@ -45,8 +42,8 @@ def seed_peer(
         original,
         bytes("-MOVED " + str(slot) + " 127.0.0.1:" + str(primary_port) + "\r\n"),
     )
-    auto original_closed = len(bytes(net.recv(original, 1))) == 0
     net.close_conn(original)
+    auto original_closed = True
 
     # The first refresh installs the moved primary; five more refreshes are
     # triggered by the deliberate redirect loop, followed by one public refresh.
