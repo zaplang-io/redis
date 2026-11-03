@@ -1855,6 +1855,8 @@ def _stream_pending_summary(Reply reply) -> StreamPendingSummary:
                                 )
                             case _:
                                 raise ProtocolError("Invalid XPENDING consumer entry")
+                case Reply.NullArray:
+                    auto ignored = 0
                 case _:
                     raise ProtocolError("Expected XPENDING consumer array")
             if total == 0 and (has_smallest or has_largest or len(consumers) != 0):

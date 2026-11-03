@@ -45,7 +45,20 @@ def peer(bytes listener, channel[bool] done):
         net.send(socket, b"-BUSYGROUP Consumer Group name already exists\r\n")
         command(
             socket,
-            [b"XREADGROUP", b"GROUP", group, consumer, b"COUNT", b"2", b"BLOCK", b"10", b"NOACK", b"STREAMS", key, b">"],
+            [
+                b"XREADGROUP",
+                b"GROUP",
+                group,
+                consumer,
+                b"COUNT",
+                b"2",
+                b"BLOCK",
+                b"10",
+                b"NOACK",
+                b"STREAMS",
+                key,
+                b">",
+            ],
         )
         net.send(socket, b"*1\r\n*2\r\n" + bulk(key) + b"*1\r\n" + record)
         command(
@@ -58,8 +71,7 @@ def peer(bytes listener, channel[bool] done):
         command(socket, [b"XPENDING", key, group])
         net.send(
             socket,
-            b"*4\r\n:1\r\n" + bulk(id) + bulk(id)
-            + b"*1\r\n*2\r\n" + bulk(consumer) + b":1\r\n",
+            b"*4\r\n:1\r\n" + bulk(id) + bulk(id) + b"*1\r\n*2\r\n" + bulk(consumer) + b":1\r\n",
         )
         command(
             socket,
@@ -67,14 +79,18 @@ def peer(bytes listener, channel[bool] done):
         )
         net.send(
             socket,
-            b"*3\r\n" + bulk(b"0-0") + b"*1\r\n" + record
-            + b"*1\r\n" + bulk(id),
+            b"*3\r\n" + bulk(b"0-0") + b"*1\r\n" + record + b"*1\r\n" + bulk(id),
         )
+        command(socket, [b"XPENDING", key, group])
+        net.send(socket, b"*4\r\n:0\r\n$-1\r\n$-1\r\n*-1\r\n")
         command(socket, [b"XGROUP", b"DESTROY", key, group])
         net.send(socket, b":1\r\n")
         command(socket, [b"XACK", key, group, id])
         net.send(socket, b":0\r\n")
-        command(socket, [b"XREADGROUP", b"GROUP", group, consumer, b"STREAMS", key, b">"])
+        command(
+            socket,
+            [b"XREADGROUP", b"GROUP", group, consumer, b"STREAMS", key, b">"],
+        )
         net.send(socket, b"-NOGROUP No such key or consumer group\r\n")
         command(socket, [b"PING"])
         net.send(socket, b"+PONG\r\n")
@@ -110,9 +126,7 @@ def main():
         "group entry ID preserved",
     )
     check(
-        fresh[0].entries[0].fields[0].field == field
-        and fresh[0].entries[0].fields[0].value == value
-        and fresh[0].entries[0].fields[1].field == field,
+        fresh[0].entries[0].fields[0].field == field and fresh[0].entries[0].fields[0].value == value and fresh[0].entries[0].fields[1].field == field,
         "binary repeated entry fields preserved",
     )
     list[redis.StreamCursor] pending_streams = [redis.StreamCursor(key, b"0-0")]
@@ -121,19 +135,18 @@ def main():
     check(conn.xack(key, group, [id]) == 1, "XACK count")
     auto summary = conn.xpending(key, group)
     check(
-        summary.total == 1
-        and optional_id_is(summary.smallest_id)
-        and optional_id_is(summary.largest_id)
-        and summary.consumers[0].name == consumer
-        and summary.consumers[0].pending == 1,
+        summary.total == 1 and optional_id_is(summary.smallest_id) and optional_id_is(summary.largest_id) and summary.consumers[0].name == consumer and summary.consumers[0].pending == 1,
         "XPENDING summary",
     )
     auto claimed = conn.xautoclaim(key, group, consumer, 25, b"0-0", 2)
     check(
-        claimed.next_id == b"0-0"
-        and claimed.entries[0].id == id
-        and str(claimed.deleted_ids[0]) == str(id),
+        claimed.next_id == b"0-0" and claimed.entries[0].id == id and str(claimed.deleted_ids[0]) == str(id),
         "XAUTOCLAIM entries and deleted IDs",
+    )
+    auto empty_summary = conn.xpending(key, group)
+    check(
+        empty_summary.total == 0 and len(empty_summary.consumers) == 0,
+        "XPENDING accepts a null consumer list when empty",
     )
     check(conn.xgroup_destroy(key, group), "XGROUP DESTROY")
     check(conn.xack(key, group, [id]) == 0, "missing pending entry")
