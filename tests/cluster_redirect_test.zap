@@ -27,8 +27,11 @@ def seed_peer(
     channel[bool] done,
 ):
     auto discovery = net.accept(listener)
+    print("Cluster redirect fixture: seed accepted discovery")
     command(discovery, [b"CLUSTER", b"SLOTS"])
+    print("Cluster redirect fixture: discovery command received")
     net.send(discovery, slots(seed_port))
+    print("Cluster redirect fixture: topology sent")
     net.close_conn(discovery)
 
     auto original = net.accept(listener)
