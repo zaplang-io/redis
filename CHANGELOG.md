@@ -20,5 +20,7 @@ is created by this change.
   pending-entry claims.
 - Opt-in RESP3 HELLO negotiation, rich replies/attributes, bounded push delivery,
   and RESP3 Pub/Sub dispatch; RESP2 remains the default.
+- Sentinel primary discovery with separate Sentinel/data credentials and explicit
+  reconnect, plus Redis Cluster slot discovery and cached single-key routing.
 - Executable consumer examples, path/static-registry installation tests, pinned
   runtime/server CI, and version/tag release preflight.

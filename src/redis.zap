@@ -748,6 +748,15 @@ struct Options:
     int64 command_timeout_ms
     str resolved_ip
 
+struct RedisEndpoint:
+    bytes host
+    int64 port
+
+struct ClusterSlotRange:
+    int64 first
+    int64 last
+    RedisEndpoint primary
+
 # Diagnostics deliberately omit BOTH credentials, even when authentication is off.
 def describe_options(Options cfg) -> str:
     auto host = cfg.host
@@ -913,6 +922,142 @@ def parse_url(str address) -> Options:
     )
     cfg.secure = parsed.group("scheme") == "rediss"
     return cfg
+
+def _endpoint_options(Options config, RedisEndpoint endpoint) -> Options:
+    auto cfg = options(
+        str(endpoint.host),
+        endpoint.port,
+        config.database,
+        config.username,
+        config.password,
+        config.client_name,
+        config.authenticate,
+        config.max_frame,
+        config.max_depth,
+        config.read_size,
+        config.secure,
+        config.connect_timeout_ms,
+        config.command_timeout_ms,
+        "",
+    )
+    return cfg
+
+def _redis_endpoint_equal(RedisEndpoint left, RedisEndpoint right) -> bool:
+    return left.host == right.host and left.port == right.port
+
+def _sentinel_master_reply(Reply reply) -> RedisEndpoint:
+    match reply:
+        case Reply.Array(parts):
+            if len(parts) != 2:
+                raise ProtocolError("Sentinel primary reply must contain host and port")
+            auto host = b""
+            try:
+                host = _required_bulk(parts[0])
+            except Exception:
+                raise ProtocolError("Sentinel returned an invalid primary host")
+            auto port_text = ""
+            try:
+                port_text = str(_required_bulk(parts[1]))
+            except Exception:
+                raise ProtocolError("Sentinel returned an invalid primary port")
+            auto port = _uint(port_text, 65535)
+            if len(host) == 0 or port == 0:
+                raise ProtocolError("Sentinel returned an invalid primary endpoint")
+            return RedisEndpoint(host, port)
+        case Reply.NullArray:
+            raise ProtocolError("Sentinel service has no known primary")
+        case _:
+            raise ProtocolError("Expected Sentinel primary address array")
+
+def _sentinel_discover(list[Options] seeds, bytes service) -> RedisEndpoint:
+    if len(seeds) == 0:
+        raise ValueError("Sentinel requires at least one seed")
+    for seed in seeds:
+        try:
+            auto sentinel = connect_options(seed)
+            try:
+                return _sentinel_master_reply(
+                    sentinel.execute(
+                        [b"SENTINEL", b"GET-MASTER-ADDR-BY-NAME", service],
+                    ),
+                )
+            finally:
+                sentinel.disconnect()
+        except Exception:
+            auto ignored = 0
+    raise ConnectionError("Redis Sentinel could not discover a primary")
+
+def sentinel_connect(
+    list[Options] sentinel_seeds,
+    bytes service,
+    Options data_options,
+) -> SentinelClient:
+    if len(service) == 0:
+        raise ValueError("Sentinel service name must not be empty")
+    list[Options] seeds = []
+    for seed in sentinel_seeds:
+        if seed.connect_timeout_ms <= 0 or seed.command_timeout_ms <= 0:
+            raise ValueError(
+                "Sentinel seeds require positive connect and command timeouts",
+            )
+        seeds.append(_snapshot_options(seed))
+    if data_options.connect_timeout_ms <= 0:
+        raise ValueError("Redis data options require a positive connect timeout")
+    auto data = _snapshot_options(data_options)
+    auto endpoint = _sentinel_discover(seeds, service)
+    return SentinelClient(
+        seeds,
+        service,
+        data,
+        endpoint,
+        connect_options(_endpoint_options(data, endpoint)),
+        Atomic(0),
+    )
+
+def _xor16(int64 left, int64 right) -> int64:
+    auto result = 0
+    auto place = 1
+    for _ in range(0, 16):
+        if left % 2 != right % 2:
+            result = result + place
+        left = left // 2
+        right = right // 2
+        place = place * 2
+    return result
+
+def _cluster_hash_key(bytes key) -> bytes:
+    auto open = -1
+    auto close = -1
+    auto i = 0
+    while i < len(key):
+        if key[i] == 123:
+            open = i
+            break
+        i = i + 1
+    if open >= 0:
+        i = open + 1
+        while i < len(key):
+            if key[i] == 125:
+                close = i
+                break
+            i = i + 1
+    if open >= 0 and close > open + 1:
+        return key[open + 1:close]
+    return key
+
+def cluster_slot(bytes key) -> int64:
+    auto tagged = _cluster_hash_key(key)
+    auto crc = 0
+    auto i = 0
+    while i < len(tagged):
+        crc = _xor16(crc, tagged[i] * 256)
+        for _ in range(0, 8):
+            auto high = crc >= 32768
+            crc = crc * 2 % 65536
+            if high:
+                crc = _xor16(crc, 4129)
+        i = i + 1
+    return crc % 16384
 
 # MSET preserves caller ordering and permits binary keys and values.
 struct KeyValue:
@@ -3337,6 +3482,236 @@ def connect_resp3(
 
 def connect_resp3_url(str address) -> Connection:
     return connect_resp3_options(parse_url(address))
+
+def _cluster_slot_reply(Reply reply, RedisEndpoint seed) -> list[ClusterSlotRange]:
+    match reply:
+        case Reply.Array(parts):
+            list[ClusterSlotRange] ranges = []
+            auto next_slot = 0
+            for item in parts:
+                match item:
+                    case Reply.Array(slot):
+                        if len(slot) < 3:
+                            raise ProtocolError("Invalid CLUSTER SLOTS entry")
+                        auto first = _integer_value(slot[0])
+                        auto last = _integer_value(slot[1])
+                        if first != next_slot or last < first or last > 16383:
+                            raise ProtocolError(
+                                "CLUSTER SLOTS ranges are incomplete or overlapping",
+                            )
+                        match slot[2]:
+                            case Reply.Array(node):
+                                if len(node) < 2:
+                                    raise ProtocolError("Invalid CLUSTER SLOTS primary")
+                                auto host = bytes(seed.host)
+                                match node[0]:
+                                    case Reply.Bulk(address):
+                                        if len(address) > 0:
+                                            host = address
+                                    case Reply.NullBulk:
+                                        auto ignored = 0
+                                    case _:
+                                        raise ProtocolError(
+                                            "Invalid CLUSTER SLOTS primary host",
+                                        )
+                                auto port = _integer_value(node[1])
+                                if len(host) == 0 or port < 1 or port > 65535:
+                                    raise ProtocolError(
+                                        "Invalid CLUSTER SLOTS primary endpoint",
+                                    )
+                                ranges.append(
+                                    ClusterSlotRange(
+                                        first,
+                                        last,
+                                        RedisEndpoint(host, port),
+                                    ),
+                                )
+                                next_slot = last + 1
+                            case _:
+                                raise ProtocolError("Expected CLUSTER SLOTS primary")
+                    case _:
+                        raise ProtocolError("Expected CLUSTER SLOTS entry")
+            if next_slot != 16384:
+                raise ProtocolError("CLUSTER SLOTS does not cover every hash slot")
+            return ranges
+        case _:
+            raise ProtocolError("Expected CLUSTER SLOTS array")
+
+def _cluster_discover(list[Options] seeds) -> list[ClusterSlotRange]:
+    if len(seeds) == 0:
+        raise ValueError("Redis Cluster requires at least one seed")
+    for seed in seeds:
+        try:
+            auto conn = connect_options(seed)
+            try:
+                return _cluster_slot_reply(
+                    conn.execute([b"CLUSTER", b"SLOTS"]),
+                    RedisEndpoint(bytes(seed.host), seed.port),
+                )
+            finally:
+                conn.disconnect()
+        except Exception:
+            auto ignored = 0
+    raise ConnectionError("Redis Cluster could not discover slot topology")
+
+def cluster_connect(list[Options] seeds) -> ClusterClient:
+    if len(seeds) == 0:
+        raise ValueError("Redis Cluster requires at least one seed")
+    list[Options] copied_seeds = []
+    for seed in seeds:
+        if seed.database != 0:
+            raise ValueError("Redis Cluster supports database zero only")
+        if seed.connect_timeout_ms <= 0 or seed.command_timeout_ms <= 0:
+            raise ValueError(
+                "Redis Cluster seeds require positive connect and command timeouts",
+            )
+        copied_seeds.append(_snapshot_options(seed))
+    auto slots = _cluster_discover(copied_seeds)
+    return ClusterClient(copied_seeds, copied_seeds[0], slots, [], [], Atomic(0))
+
+struct SentinelClient:
+    list[Options] _seeds
+    bytes _service
+    Options _data_config
+    RedisEndpoint _primary
+    Connection _connection
+    Atomic[int64] _state
+
+    def primary(self) -> RedisEndpoint:
+        return self._primary
+
+    def is_closed(self) -> bool:
+        return self._state.load() == 2 or self._connection.is_closed()
+
+    def execute(self, list[bytes] args) -> Reply:
+        if not self._state.compare_and_swap(0, 1):
+            if self._state.load() == 2:
+                raise ConnectionError("Redis Sentinel client is closed")
+            raise BusyError("Redis Sentinel client is in use")
+        try:
+            return self._connection.execute(args)
+        finally:
+            if self._state.load() != 2:
+                self._state.store(0)
+
+    def reconnect(self):
+        if not self._state.compare_and_swap(0, 1):
+            if not self._state.compare_and_swap(2, 1):
+                raise BusyError("Redis Sentinel client is in use")
+        auto ready = False
+        try:
+            auto endpoint = _sentinel_discover(self._seeds, self._service)
+            if not self._connection.is_closed():
+                self._connection.disconnect()
+            self._connection = connect_options(
+                _endpoint_options(self._data_config, endpoint),
+            )
+            self._primary = endpoint
+            ready = True
+        finally:
+            if ready:
+                self._state.store(0)
+            else:
+                if not self._connection.is_closed():
+                    self._connection.disconnect()
+                self._state.store(2)
+
+    def disconnect(self):
+        if not self._state.compare_and_swap(0, 1):
+            if self._state.load() == 2:
+                return
+            raise BusyError("Redis Sentinel client is in use")
+        try:
+            self._connection.disconnect()
+        finally:
+            self._state.store(2)
+
+struct ClusterClient:
+    list[Options] _seeds
+    Options _data_config
+    list[ClusterSlotRange] _slots
+    list[RedisEndpoint] _endpoints
+    list[Connection] _connections
+    Atomic[int64] _state
+
+    def _primary(self, int64 slot) -> RedisEndpoint:
+        for item in self._slots:
+            if slot >= item.first and slot <= item.last:
+                return item.primary
+        raise ProtocolError("Redis Cluster slot is missing from topology")
+
+    def _connection_for(self, RedisEndpoint endpoint) -> Connection:
+        auto i = 0
+        while i < len(self._endpoints):
+            if _redis_endpoint_equal(self._endpoints[i], endpoint):
+                if self._connections[i].is_closed():
+                    self._connections[i].reconnect()
+                return self._connections[i]
+            i = i + 1
+        auto connection = connect_options(
+            _endpoint_options(self._data_config, endpoint),
+        )
+        self._endpoints.append(endpoint)
+        self._connections.append(connection)
+        return self._connections[len(self._connections) - 1]
+
+    def execute_for(self, bytes key, list[bytes] args) -> Reply:
+        if len(args) < 2:
+            raise ValueError("Redis Cluster command must include a single key")
+        auto command = _command_name(args)
+        if bytes(args[1]) != key or not _cluster_single_key_command(bytes(command)):
+            raise ValueError(
+                "Redis Cluster command is not a supported single-key operation",
+            )
+        if not self._state.compare_and_swap(0, 1):
+            if self._state.load() == 2:
+                raise ConnectionError("Redis Cluster client is closed")
+            raise BusyError("Redis Cluster client is in use")
+        try:
+            auto endpoint = self._primary(cluster_slot(key))
+            return self._connection_for(endpoint).execute(args)
+        finally:
+            if self._state.load() != 2:
+                self._state.store(0)
+
+    def refresh(self):
+        if not self._state.compare_and_swap(0, 1):
+            if self._state.load() == 2:
+                raise ConnectionError("Redis Cluster client is closed")
+            raise BusyError("Redis Cluster client is in use")
+        try:
+            auto slots = _cluster_discover(self._seeds)
+            list[RedisEndpoint] retained_endpoints = []
+            list[Connection] retained_connections = []
+            for i in range(0, len(self._endpoints)):
+                auto keep = False
+                for item in slots:
+                    if _redis_endpoint_equal(self._endpoints[i], item.primary):
+                        keep = True
+                if keep:
+                    retained_endpoints.append(self._endpoints[i])
+                    retained_connections.append(self._connections[i])
+                else:
+                    self._connections[i].disconnect()
+            self._endpoints = retained_endpoints
+            self._connections = retained_connections
+            self._slots = slots
+        finally:
+            self._state.store(0)
+
+    def disconnect(self):
+        if not self._state.compare_and_swap(0, 1):
+            if self._state.load() == 2:
+                return
+            raise BusyError("Redis Cluster client is in use")
+        try:
+            for connection in self._connections:
+                connection.disconnect()
+        finally:
+            self._state.store(2)
+
+def _cluster_single_key_command(bytes command) -> bool:
+    return command == b"APPEND" or command == b"DECR" or command == b"DECRBY" or command == b"EXPIRE" or command == b"EXPIREAT" or command == b"GET" or command == b"GETDEL" or command == b"GETEX" or command == b"GETRANGE" or command == b"GETSET" or command == b"HDEL" or command == b"HEXISTS" or command == b"HGET" or command == b"HGETALL" or command == b"HINCRBY" or command == b"HINCRBYFLOAT" or command == b"HKEYS" or command == b"HLEN" or command == b"HMGET" or command == b"HSET" or command == b"HSETNX" or command == b"HSTRLEN" or command == b"HVALS" or command == b"INCR" or command == b"INCRBY" or command == b"INCRBYFLOAT" or command == b"LINDEX" or command == b"LINSERT" or command == b"LLEN" or command == b"LPOP" or command == b"LPOS" or command == b"LPUSH" or command == b"LPUSHX" or command == b"LRANGE" or command == b"LREM" or command == b"LSET" or command == b"LTRIM" or command == b"PERSIST" or command == b"PEXPIRE" or command == b"PEXPIREAT" or command == b"PTTL" or command == b"RESTORE" or command == b"RPOP" or command == b"RPUSH" or command == b"RPUSHX" or command == b"SADD" or command == b"SCARD" or command == b"SET" or command == b"SETEX" or command == b"SETNX" or command == b"SETRANGE" or command == b"SISMEMBER" or command == b"SMEMBERS" or command == b"SMISMEMBER" or command == b"SPOP" or command == b"SRANDMEMBER" or command == b"SREM" or command == b"STRLEN" or command == b"SUBSTR" or command == b"TTL" or command == b"TYPE" or command == b"XADD" or command == b"XDEL" or command == b"XLEN" or command == b"XPENDING" or command == b"XRANGE" or command == b"XREVRANGE" or command == b"ZADD" or command == b"ZCARD" or command == b"ZCOUNT" or command == b"ZINCRBY" or command == b"ZLEXCOUNT" or command == b"ZMSCORE" or command == b"ZPOPMAX" or command == b"ZPOPMIN" or command == b"ZRANGE" or command == b"ZRANGEBYLEX" or command == b"ZRANGEBYSCORE" or command == b"ZRANK" or command == b"ZREM" or command == b"ZREVRANGE" or command == b"ZREVRANGEBYLEX" or command == b"ZREVRANGEBYSCORE" or command == b"ZREVRANK" or command == b"ZSCAN" or command == b"ZSCORE"
 
 struct PoolClosed:
     str message
