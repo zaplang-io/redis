@@ -1,1 +1,13 @@
+group-stage: xadd
+group-stage: create
+group-stage: duplicate
+group-stage: read
+group-stage: pending
+group-stage: claim
+group-stage: claimed-pending
+group-stage: ack
+group-stage: empty-pending
+group-stage: destroy
+group-stage: missing
+group-stage: timeout
 Live Streams consumer groups: PASS
