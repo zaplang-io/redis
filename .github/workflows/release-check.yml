@@ -12,7 +12,7 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    container: ghcr.io/zaplang-io/zap@sha256:7cf901e2a8d465be3c480474238764411f77308c925cd3df26ef46b240f4e5c4
+    container: ghcr.io/zaplang-io/zap:latest
     steps:
       - name: Install Git for tag validation
         run: |

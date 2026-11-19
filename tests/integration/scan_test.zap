@@ -56,14 +56,7 @@ def main():
         conn.pexpire(hash, 60000)
         conn.sadd(set_key, [field, other, b"skip"])
         conn.pexpire(set_key, 60000)
-        conn.zadd(
-            sorted,
-            [
-                redis.ScoredMember(field, -1.25),
-                redis.ScoredMember(other, 1.2345678901234567),
-                redis.ScoredMember(b"skip", 0.0),
-            ],
-        )
+        conn.zadd(sorted, {field: -1.25, other: 1.2345678901234567, b"skip": 0.0})
         conn.pexpire(sorted, 60000)
         cursor = b"0"
         list[bytes] hash_seen = []

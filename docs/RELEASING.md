@@ -6,7 +6,7 @@ or hosted-registry publications.
 
 ## Install the candidate into an application
 
-Use the pinned Zap toolchain from [SUPPORT.md](SUPPORT.md), with LLVM codegen.
+Use the latest published Zap toolchain from [SUPPORT.md](SUPPORT.md), with LLVM codegen.
 Clone the reviewed library checkout and add it as a real path dependency:
 
 ```sh
@@ -28,7 +28,7 @@ in the application. Do not copy redis.zap beside main or activate an unrelated
 zenv. The path dependency snapshots the package into the environment; rerun
 `zap zenv create --no-venv` after intentionally changing the source checkout.
 
-The pinned CLI records Git dependencies but skips Git materialization during
+The Zap CLI records Git dependencies but skips Git materialization during
 `zenv create`. Therefore `zap add redis --git ...` is not the verified install
 path for this release. Cloning a reviewed commit/tag plus a path dependency
 works; the Git tag is a source identity, not a claim of automatic Git fetching.

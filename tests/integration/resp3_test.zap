@@ -42,7 +42,7 @@ def main():
         conn.pexpire(hash, 60000)
         conn.sadd(set_key, [b"", value])
         conn.pexpire(set_key, 60000)
-        conn.zadd(sorted, [redis.ScoredMember(value, 1.25)])
+        conn.zadd(sorted, {value: 1.25})
         conn.pexpire(sorted, 60000)
         auto socket = b""
         if f.config.secure:

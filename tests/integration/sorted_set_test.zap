@@ -26,7 +26,7 @@ def main():
         check(len(conn.zrange_withscores(key, 0, -1)) == 0, "missing WITHSCORES")
         check(conn.zrem(key, [binary]) == 0, "missing ZREM")
         check(
-            conn.zadd(key, [redis.ScoredMember(b"b", 2.0), redis.ScoredMember(b"a", 2.0), redis.ScoredMember(binary, -1.5), redis.ScoredMember(b"", 0.0)]) == 4,
+            conn.zadd(key, {b"b": 2.0, b"a": 2.0, binary: -1.5, b"": 0.0}).count() == 4,
             "multi ZADD",
         )
         conn.pexpire(key, 60000)
@@ -53,31 +53,24 @@ def main():
         check(scored[0].member == b"" and scored[0].score == 0.0, "empty scored member")
         check(scored[1].member == b"a" and scored[1].score == 2.0, "first tied score")
         check(scored[2].member == b"b" and scored[2].score == 2.0, "second tied score")
-        check(
-            conn.zadd(key, [redis.ScoredMember(b"a", 3.0)]) == 0,
-            "ZADD update not added count",
-        )
+        check(conn.zadd(key, {b"a": 3.0}).count() == 0, "ZADD update not added count")
         check(conn.zrank(key, b"a").unwrap() == 3, "score update changes rank")
         check(conn.zincrby(key, b"a", -4.5) == -1.5, "signed ZINCRBY")
         sequence(conn.zrange(key, 0, 1), [binary, b"a"])
+        dict[bytes, float64] updated = {b"dup": 1.0}
+        updated[b"dup"] = 4.0
         check(
-            conn.zadd(key, [redis.ScoredMember(b"dup", 1.0), redis.ScoredMember(b"dup", 4.0)]) == 1,
-            "duplicate ZADD last score wins",
+            conn.zadd(key, updated).count().count() == 1,
+            "ZADD sends one score per mapping entry",
         )
         check(conn.zscore(key, b"dup").unwrap() == 4.0, "duplicate score")
         auto precise = 1.2345678901234567
-        conn.zadd(key, [redis.ScoredMember(b"precise", precise)])
+        conn.zadd(key, {b"precise": precise})
         check(
             conn.zscore(key, b"precise").unwrap() == precise,
             "17-digit score round trip",
         )
-        conn.zadd(
-            key,
-            [
-                redis.ScoredMember(b"tiny", 5e-324),
-                redis.ScoredMember(b"huge", 1.7976931348623157e308),
-            ],
-        )
+        conn.zadd(key, {b"tiny": 5e-324, b"huge": 1.7976931348623157e308})
         check(
             conn.zscore(key, b"tiny").unwrap() == 5e-324,
             "subnormal score round trip",
@@ -86,13 +79,7 @@ def main():
             conn.zscore(key, b"huge").unwrap() == 1.7976931348623157e308,
             "max finite score",
         )
-        conn.zadd(
-            key,
-            [
-                redis.ScoredMember(b"low", -math.inf),
-                redis.ScoredMember(b"high", math.inf),
-            ],
-        )
+        conn.zadd(key, {b"low": -math.inf, b"high": math.inf})
         check(conn.zscore(key, b"low").unwrap() == -math.inf, "negative infinity")
         check(conn.zscore(key, b"high").unwrap() == math.inf, "positive infinity")
         auto invalid_sum = False
@@ -116,7 +103,7 @@ def main():
         f.put(conn, wrong, b"string")
         auto errors = 0
         try:
-            conn.zadd(wrong, [redis.ScoredMember(b"v", 1.0)])
+            conn.zadd(wrong, {b"v": 1.0})
         except redis.ResponseError:
             check(
                 redis.error_prefix(conn.last_error()) == b"WRONGTYPE",

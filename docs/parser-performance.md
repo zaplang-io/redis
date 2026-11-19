@@ -1,6 +1,6 @@
 # RESP2 hardening workload
 
-Reproduce with the pinned Zap container used by CI:
+Run the workload with the latest Zap container used by CI:
 
 ```sh
 sh tools/run-tests.sh

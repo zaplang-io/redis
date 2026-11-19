@@ -5,8 +5,8 @@ the first tag; the release preflight does not create a release or publish remote
 
 | Area | v0.1 contract |
 | --- | --- |
-| Zap runtime | Tested with core commit `2b6a607b5f11eb1e52016450c41403c0a2b77997`, including core #575/#578/#583; use the exact CI image below. The runtime's generic version string alone does not identify these fixes. |
-| Toolchain image | `ghcr.io/zaplang-io/zap@sha256:7cf901e2a8d465be3c480474238764411f77308c925cd3df26ef46b240f4e5c4` |
+| Zap runtime | CI uses the latest published Zap toolchain with LLVM code generation. ZADD uses the float dictionary values introduced by core D-0137. |
+| Toolchain image | `ghcr.io/zaplang-io/zap:latest` |
 | Client CI platform | Linux x86_64. Other architectures/OSes are not certified by this library's matrix. |
 | Redis servers | CI tests Redis 7.4.12 and 8.10.3. Earlier/later versions are not promised by this matrix. Individual commands can have lower version floors. |
 | Transport | Standalone TCP and verified TLS/rediss, OpenSSL trust paths. No per-connection CA/mTLS API; see core #560. |
@@ -14,15 +14,15 @@ the first tag; the release preflight does not create a release or publish remote
 | Data | Keys, arguments, values and server-error bytes remain `bytes`; callers choose text decoding. |
 | Ownership | One active owner per Connection/Lease; transactions retain ownership through caller code. Concurrent use rejects with BusyError. |
 | Timeouts | Connect budget includes numeric TCP/TLS/setup; command budget spans write/reply or whole pipeline. Synchronous hostname DNS remains unbounded unless caller supplies a resolved address. |
-| Blocking lists | BLPOP, BRPOP, BLMOVE on standalone connections or dedicated pool leases. Redis timeout seconds and client budget milliseconds are independent. |
+| Blocking pops and moves | BLPOP, BRPOP, BLMOVE, BZPOPMIN, BZPOPMAX, and BZMPOP on standalone connections or dedicated pool leases. Redis timeout seconds and client budget milliseconds are independent. |
 | Pool reuse | RESET plus original setup under a finite reset budget. Requires Redis 6.2+ and suitable ACLs for reuse; denied/failed reset discards. |
 | Recovery | Cancellation/incomplete exchanges discard sockets. Explicit reconnect only; ambiguous commands/transactions are never replayed. |
 | Parser limits | Default 16 MiB per reply, depth 64; configurable read chunk. Pipeline request-byte/command limits are separate. |
 | Installation | Tested external consumers use path dependencies and a disposable file:// static registry, without copying the module beside main. |
 
-The image pins a working toolchain rather than promising compatibility with every
-Zap compiler revision. Public APIs may evolve before a stable release; consult
-the changelog when upgrading and commit application `zap.lock` files.
+CI validates the published Zap image when a workflow runs. Public APIs may
+evolve before a stable release. Consult the changelog when upgrading and
+commit application `zap.lock` files.
 
 The implemented subset includes typed SET options and binary string commands,
 counters and expiry, generic key copy,
