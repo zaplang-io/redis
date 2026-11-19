@@ -332,6 +332,10 @@ That explicit mode tests database isolation and reconnect, creates a randomly
 named ACL user limited to the test namespace and required commands, checks good
 and bad authentication and client-name restoration, and removes the user and
 keys during cleanup. It never changes the default user or global server config.
+The isolated run also covers namespace-scoped `KEYS` and `RANDOMKEY`. Use
+[SCAN pages](#cursor-based-scan-pages) for production traversal. Redis scans
+the database for `KEYS` even when the pattern limits which keys it returns.
+
 CI supplies a fresh service container per matrix job. Readiness is gated by
 `redis-cli ping` health checks; tests have no startup sleeps. Destroying the
 service container also removes any state left after a forcibly terminated job.

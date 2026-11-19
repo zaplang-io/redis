@@ -110,3 +110,29 @@ def integer(redis.Reply reply) -> int64:
             return value
         case _:
             raise ValueError("expected integer reply")
+
+def items(redis.Reply reply, str label) -> list[redis.Reply]:
+    match reply:
+        case redis.Reply.Array(values):
+            return values
+        case _:
+            raise ValueError("expected array: " + label)
+
+def payload(redis.Reply reply, str label) -> bytes:
+    match reply:
+        case redis.Reply.Bulk(data):
+            return data
+        case _:
+            raise ValueError("expected bulk reply: " + label)
+
+def count(redis.Reply reply, int64 want, str label):
+    check(integer(reply) == want, label)
+
+def rejected(redis.Connection conn, list[bytes] args, bytes prefix, str label):
+    auto seen = False
+    try:
+        conn.execute(args)
+    except redis.ResponseError:
+        seen = True
+    check(seen and redis.error_prefix(conn.last_error()) == prefix, label)
+    check(conn.ping(), label + ": connection remains usable")
