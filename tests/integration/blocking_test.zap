@@ -40,12 +40,23 @@ def optional_value(Optional[bytes] result, bytes value):
         case Optional.None:
             raise ValueError("expected moved value")
 
+def pop_batch(Optional[redis.ListPopBatch] result, bytes key, bytes value):
+    match result:
+        case Optional.Some(batch):
+            list[bytes] expected = [value]
+            integration_fixtures.check(
+                batch.key == key and len(batch.values) == 1 and batch.values[0] == expected[0],
+                "BLMPOP binary key and batch wakeup",
+            )
+        case Optional.None:
+            raise ValueError("expected multi-pop producer wakeup")
+
 def wakeups(integration_fixtures.Fixture f):
     auto conn = f.open()
     auto id = integration_fixtures.integer(conn.execute([b"CLIENT", b"ID"]))
     auto value = bytes([0, 255, 13, 10])
     try:
-        for mode in range(0, 3):
+        for mode in range(0, 5):
             auto key = f.binary_key(bytes([0, 255]) + bytes(str(mode)))
             auto destination = f.key("moved-" + str(mode))
             scope:
@@ -54,12 +65,23 @@ def wakeups(integration_fixtures.Fixture f):
                     pop_pair(conn.blpop([f.key("empty"), key], 1.0), key, value)
                 elif mode == 1:
                     pop_pair(conn.brpop([key], 1.0), key, value)
-                else:
+                elif mode == 2:
                     optional_value(
                         conn.blmove(key, destination, "RIGHT", "LEFT", 1.0),
                         value,
                     )
-            if mode == 2:
+                elif mode == 3:
+                    optional_value(
+                        conn.brpoplpush(key, destination, timeout=1.0),
+                        value,
+                    )
+                else:
+                    pop_batch(
+                        conn.blmpop(1.0, [key], direction="RIGHT", count=2),
+                        key,
+                        value,
+                    )
+            if mode == 2 or mode == 3:
                 conn.execute([b"PEXPIRE", destination, b"60000"])
                 optional_value(conn.lpop(destination), value)
         auto empty = f.key("server-timeout")
@@ -103,7 +125,7 @@ def wakeups(integration_fixtures.Fixture f):
 
 def deadlines(integration_fixtures.Fixture f):
     f.config.command_timeout_ms = 50
-    for mode in range(0, 3):
+    for mode in range(0, 5):
         auto conn = f.open()
         auto failed = False
         auto key = f.key("client-timeout-" + str(mode))
@@ -112,8 +134,12 @@ def deadlines(integration_fixtures.Fixture f):
                 conn.blpop([key])
             elif mode == 1:
                 conn.brpop([key])
-            else:
+            elif mode == 2:
                 conn.blmove(key, f.key("client-destination"))
+            elif mode == 3:
+                conn.brpoplpush(key, f.key("client-legacy-destination"))
+            else:
+                conn.blmpop(0.0, [key], direction="LEFT")
         except redis.CommandTimeout:
             failed = True
         finally:

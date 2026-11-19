@@ -612,6 +612,12 @@ These `Connection` helpers accept binary keys and elements:
 | Method | Result |
 | --- | --- |
 | `lpush(key, values)`, `rpush(key, values)` | `int64` new list length |
+| `lpushx(name, values)`, `rpushx(name, values)` | `int64` new length, or zero if the list was absent |
+| `lpos(name, value, rank=1, count=-1, maxlen=0)` | `redis.ListPosition.Index(int64)`, `.Missing`, or `.Positions(list[int64])` |
+| `linsert(name, where, refvalue, value)` | `int64` new length, zero for an absent list, or -1 for an absent pivot |
+| `lrem(name, count, value)` | `int64` number of elements removed |
+| `rpoplpush(src, dst)` | `Optional[bytes]` moved tail element, or None for an absent source |
+| `lmpop(keys, direction, count=1)` | `Optional[redis.ListPopBatch]` with the selected binary `.key` and `.values` |
 | `lpop(key)`, `rpop(key)` | `Optional[bytes]` single head/tail element |
 | `llen(key)` | `int64` length, zero for a missing list |
 | `lrange(key, start, stop)` | `list[bytes]` in list order |
@@ -631,8 +637,11 @@ conn.ltrim(b"queue", 0, 1)  # retain the first two elements
 Pushes require a nonempty `list[bytes]`; an empty list raises `ValueError`
 before network I/O. LPUSH inserts each supplied element at the head, so their
 order is reversed in the resulting list. RPUSH appends in supplied order.
-Empty byte elements are valid and pop/index results distinguish Some(b"")
-from None. Pops use only the single-element form; no count argument is sent.
+Conditional pushes leave a missing key absent. Empty byte elements are valid
+and pop/index results distinguish Some(b"") from None. LPOP and RPOP use the
+single-element form. LMPOP selects the first nonempty list in input order.
+Its count must be positive, and its LEFT/RIGHT direction is case-insensitive.
+The reply preserves pop order and can contain fewer elements than requested.
 
 Indexes are signed `int64`, zero-based from the head; -1 is the last element.
 LRANGE and LTRIM have **inclusive** stop indexes. Bounds are passed directly to
@@ -645,12 +654,24 @@ in `last_error()`.
 LRANGE validates a non-null array of non-null bulk elements. Unexpected typed
 replies raise `ProtocolError` after consuming the complete frame, following the
 same connection recovery contract as other helpers. No command is replayed.
-Blocking list helpers are described below. Multi-pop variants remain available
-through raw commands on a standalone connection or dedicated lease.
+LPOS indexes are always zero-based from the head. A positive rank searches
+from the head and a negative rank searches from the tail. Rank zero raises
+`ValueError`. A positive `maxlen` caps the number of inspected elements
+in the search direction. Zero leaves the search uncapped. An omitted count
+returns `.Index` or `.Missing`. An explicit count returns `.Positions`,
+including an empty list when no match exists. Count zero finds all matches
+from the selected rank.
 
-References: [LPUSH](https://redis.io/docs/latest/commands/lpush/),
-[LRANGE](https://redis.io/docs/latest/commands/lrange/),
-[LSET](https://redis.io/docs/latest/commands/lset/).
+LINSERT accepts BEFORE or AFTER case-insensitively and uses the first
+matching pivot. LREM scans from the head for a positive count and from the
+tail for a negative count. A zero count removes every matching value.
+RPOPLPUSH atomically moves the source tail to the destination head. With
+the same key as source and destination, it rotates the list.
+
+References [LPOS](https://redis.io/docs/latest/commands/lpos/),
+[LINSERT](https://redis.io/docs/latest/commands/linsert/),
+[LREM](https://redis.io/docs/latest/commands/lrem/), and
+[LMPOP](https://redis.io/docs/latest/commands/lmpop/).
 
 ## Blocking list consumers
 
@@ -659,6 +680,8 @@ References: [LPUSH](https://redis.io/docs/latest/commands/lpush/),
 | `blpop(keys, server_timeout_seconds=0.0)` | `Optional[redis.KeyValue]` with binary key/value |
 | `brpop(keys, server_timeout_seconds=0.0)` | Same, popping the rightmost value |
 | `blmove(source, destination, source_side="LEFT", destination_side="RIGHT", server_timeout_seconds=0.0)` | `Optional[bytes]` moved value |
+| `brpoplpush(src, dst, timeout=0.0)` | `Optional[bytes]` moved source tail |
+| `blmpop(timeout, keys, direction, count=1)` | `Optional[redis.ListPopBatch]` with the selected key and values |
 
 Sides accept LEFT/RIGHT case-insensitively. Pop calls require at least one key (an empty byte key is valid); values and keys remain bytes. Negative/non-finite timeouts and invalid
 sides are local ValueErrors. Server timeouts use seconds, including fractional
@@ -675,11 +698,12 @@ for their lifetime and close on release, including server-timeout success.
 No timer/socket worker survives a cancelled operation. Always release/disconnect
 in `finally`; see the [complete producer/consumer example](examples/blocking.zap).
 
-These methods use Redis [BLPOP](https://redis.io/docs/latest/commands/blpop/),
-[BRPOP](https://redis.io/docs/latest/commands/brpop/), and
-[BLMOVE](https://redis.io/docs/latest/commands/blmove/). BLPOP/BRPOP support fractional
-timeouts on Redis 6.0+; BLMOVE requires 6.2+. The tested server matrix is narrower
-and is recorded in [SUPPORT.md](docs/SUPPORT.md).
+Redis deprecated RPOPLPUSH and BRPOPLPUSH in 6.2. The helpers expose those
+commands for compatibility. BLMOVE with RIGHT and LEFT provides the equivalent
+blocking move. LMPOP and BLMPOP require Redis 7.0 or newer. See the tested
+versions in [SUPPORT.md](docs/SUPPORT.md).
+[BRPOPLPUSH reference](https://redis.io/docs/latest/commands/brpoplpush/),
+[BLMPOP reference](https://redis.io/docs/latest/commands/blmpop/).
 
 ## Set commands
 

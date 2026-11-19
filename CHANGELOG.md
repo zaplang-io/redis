@@ -18,6 +18,8 @@ is created by this change.
 - Sorted-set score and lex ranges, stores, set operations, and cancellable
   blocking pops. ZADD takes a member-to-score mapping with redis-py flags and
   returns a tagged result (#58).
+- Typed LPOS, LINSERT, LREM, conditional pushes, and list moves and
+  multi-pops, including cancellation-safe BRPOPLPUSH and BLMPOP (#59).
 - Bounded guarded pools with finite reset/reinitialization and dedicated leases.
 - Dedicated pull-based Pub/Sub sessions and PUBLISH, with typed binary events,
   explicit acknowledgements and at-most-once/no-replay semantics.

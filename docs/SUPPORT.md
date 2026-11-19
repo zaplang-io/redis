@@ -14,7 +14,7 @@ the first tag; the release preflight does not create a release or publish remote
 | Data | Keys, arguments, values and server-error bytes remain `bytes`; callers choose text decoding. |
 | Ownership | One active owner per Connection/Lease; transactions retain ownership through caller code. Concurrent use rejects with BusyError. |
 | Timeouts | Connect budget includes numeric TCP/TLS/setup; command budget spans write/reply or whole pipeline. Synchronous hostname DNS remains unbounded unless caller supplies a resolved address. |
-| Blocking pops and moves | BLPOP, BRPOP, BLMOVE, BZPOPMIN, BZPOPMAX, and BZMPOP on standalone connections or dedicated pool leases. Redis timeout seconds and client budget milliseconds are independent. |
+| Blocking pops and moves | BLPOP, BRPOP, BLMOVE, BRPOPLPUSH, BLMPOP, BZPOPMIN, BZPOPMAX, and BZMPOP on standalone connections or dedicated pool leases. Redis timeout seconds and client budget milliseconds are independent. |
 | Pool reuse | RESET plus original setup under a finite reset budget. Requires Redis 6.2+ and suitable ACLs for reuse; denied/failed reset discards. |
 | Recovery | Cancellation/incomplete exchanges discard sockets. Explicit reconnect only; ambiguous commands/transactions are never replayed. |
 | Parser limits | Default 16 MiB per reply, depth 64; configurable read chunk. Pipeline request-byte/command limits are separate. |
