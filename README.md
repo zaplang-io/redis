@@ -211,7 +211,7 @@ Reconnecting creates a fresh Redis session and reapplies the configured AUTH,
 SELECT, and client name. WATCH/MULTI state, subscriptions, and other session state
 are not restored. Callers must decide how to recover after an ambiguously executed
 operation. Cancellation that reaches the operation propagates and closes the
-socket during cleanup. The pinned runtime wakes parked TCP/TLS operations on
+socket during cleanup. The Zap runtime wakes parked TCP/TLS operations on
 scope cancellation; synchronous hostname resolution remains unbounded.
 
 ## Codec
@@ -299,8 +299,9 @@ versions **7.4.12** and **8.10.3**, alongside an independent offline job. Redis
 7.4 is an extended release and 8.10 is a current GA branch in the
 [Redis version policy](https://redis.io/docs/latest/operate/oss_and_stack/install/version-mgmt/).
 Older server branches and Redis-compatible alternatives are currently untested.
-The server images, Zap toolchain, and checkout action are pinned by digest/SHA in
-`.github/workflows/test.yml`; update the server version and image digest together.
+CI uses the latest published Zap image. Redis server images and the checkout
+action use digests or SHAs in `.github/workflows/test.yml`. Update each Redis
+server version and image digest together.
 The live suites verify the actual server version when CI supplies the expected
 patch version. CI runs once per pull request and on pushes to main only.
 
@@ -727,61 +728,101 @@ References: [SADD](https://redis.io/docs/latest/commands/sadd/),
 
 ## Sorted-set commands
 
-`redis.ScoredMember(member, score)` pairs binary member bytes with a `float64`
-score. These `Connection` helpers use basic ZADD and rank-based ZRANGE forms:
+Sorted-set keys and members are binary `bytes`. `redis.ScoredMember(member,
+score)` pairs a member with its `float64` score in typed replies.
 
 | Method | Result |
 | --- | --- |
-| `zadd(key, members)` | `int64` newly added members; score updates do not count |
-| `zrem(key, members)` | `int64` members removed |
-| `zcard(key)` | `int64` cardinality, zero for a missing set |
-| `zscore(key, member)` | `Optional[float64]`, None for a missing key/member |
-| `zincrby(key, member, amount)` | `float64` new score; creates missing key/member |
+| `zadd(name, mapping, nx=False, xx=False, ch=False, incr=False, gt=False, lt=False)` | `redis.ZAddResult`. The mapping is `dict[bytes, float64]`. |
+| `zrem(key, members)`, `zcard(key)` | `int64` removed members or cardinality |
+| `zscore(key, member)`, `zincrby(key, member, amount)` | `Optional[float64]` current score, or `float64` new score |
 | `zrank(key, member)`, `zrevrank(key, member)` | `Optional[int64]` zero-based forward/reverse rank |
-| `zrange(key, start, stop)` | `list[bytes]` in ascending score/rank order |
-| `zrange_withscores(key, start, stop)` | `list[redis.ScoredMember]`, using WITHSCORES |
+| `zrange(key, start, stop)`, `zrange_withscores(key, start, stop)` | `list[bytes]` or `list[redis.ScoredMember]` in rank order |
+| `zrangebyscore(name, min, max, start=-1, num=-1, withscores=False)`, `zrevrangebyscore(name, max, min, ...)` | `redis.SortedSetResult` with member or scored-member lists |
+| `zrangebylex(name, min, max, start=-1, num=-1)`, `zrevrangebylex(name, max, min, ...)` | `list[bytes]` in lexicographic order |
+| `zcount(name, min, max)`, `zlexcount(name, min, max)` | `int64` count within the score or lex interval |
+| `zrangestore(dest, name, start, end, byscore=False, bylex=False, desc=False, offset=-1, num=-1)` | `int64` number stored |
+| `zunion(keys, aggregate="", withscores=False, weights=[])`, `zinter(keys, ...)`, `zdiff(keys, withscores=False)` | `redis.SortedSetResult` for union, intersection, or difference |
+| `zunionstore(dest, keys, aggregate="", weights=[])`, `zinterstore(dest, keys, ...)`, `zdiffstore(dest, keys)` | `int64` number stored |
+| `zpopmin(name, count=-1)`, `zpopmax(name, count=-1)` | `list[redis.ScoredMember]` in pop order |
+| `bzpopmin(keys, timeout=0.0)`, `bzpopmax(keys, timeout=0.0)` | `Optional[redis.SortedPop]` with the selected key, member, and score |
+| `zmpop(keys, min=False, max=False, count=1)`, `bzmpop(timeout, keys, min=False, max=False, count=1)` | `Optional[redis.SortedPopBatch]` with the selected key and its scored members |
+
+### Adding and incrementing scores
 
 ```zap
-conn.zadd(b"scores", [redis.ScoredMember(b"Ada", 1.5), redis.ScoredMember(b"Lin", 2.0)])
-conn.zincrby(b"scores", b"Ada", 1.0)
-auto rank = conn.zrank(b"scores", b"Ada")
-for entry in conn.zrange_withscores(b"scores", 0, -1):
-    print(str(entry.member))  # explicit text conversion for known UTF-8 data
-    print(entry.score)
+auto added = conn.zadd(b"scores", {b"Ada": 1.5, b"Lin": 2.0}).count()
+match conn.zadd(b"scores", {b"Ada": 1.0}, xx=True, incr=True):
+    case redis.ZAddResult.Score(score):
+        print(score)
+    case redis.ZAddResult.Null:
+        print("condition skipped")
+    case redis.ZAddResult.Count(count):
+        print(count)
 ```
 
-ZADD and ZREM require nonempty lists; empty lists raise `ValueError` before
-network I/O. Duplicate ZADD members are sent in order and the final score wins.
-Scores use `format(score, ".17g")` for float64 round trips, rather than the
-shorter display precision of `str(float)`. Positive/negative infinity are
-supported as `math.inf`/`-math.inf` and sent as `inf`/`-inf`. NaN inputs raise
-`ValueError` locally, including a NaN later in a multi-member request. A valid
-increment whose result would be NaN is rejected by Redis as `ResponseError`.
+ZADD takes a nonempty member-to-score dictionary. Migrate earlier calls by
+replacing the list of `ScoredMember` inputs with a dictionary and using
+`.count()` for the count result. Each dictionary key has one score. Ordinary
+ZADD counts added members. CH counts additions and changed scores. NX inserts
+only new members, and XX updates only existing members. GT and LT compare
+against the existing score and allow new members unless combined with XX.
+NX conflicts with XX, GT, or LT, and GT conflicts with LT.
 
-Score replies accept decimal/exponent notation and explicit `inf`, `+inf`, or
-`-inf`. Invalid UTF-8, whitespace, hexadecimal forms, NaN, trailing data,
-overflowing decimal values, and nonzero values that underflow to zero raise
-`ProtocolError`. Finite scores retain float64 precision, including subnormals;
-zero is a present score, distinct from None.
+INCR requires one mapping entry. Its value is the score delta, and its
+result is `ZAddResult.Score` or `.Null` when the condition skips the write.
+Use `.is_null()` to check for that result. Score zero is a present score.
 
-Ranges use signed rank bounds with an **inclusive** stop. Negative ranks count
-from the end (-1 is the last member), and Redis clips out-of-range bounds.
-Equal scores use binary lexicographic member ordering; reverse ranks reverse
-that order too. Missing members have no rank/score, while missing or empty
-ranges return empty lists. Removing the final member removes the key.
+Scores and weights use 17-digit float64 formatting. Infinity is supported.
+NaN input raises `ValueError` before I/O, and an increment that would produce
+NaN raises `ResponseError`. Numeric score replies are validated and retain
+float64 precision, including subnormal values.
 
-WITHSCORES replies must contain an even-length non-null array of alternating
-non-null bulk member/score strings. Helpers validate malformed shapes and
-negative ranks, and use the existing complete-frame reply recovery contract.
-Wrong key types remain `ResponseError` with raw bytes in `last_error()`.
-Commands are never replayed automatically.
+### Ranges and combinations
 
-This slice does not expose ZADD NX/XX/GT/LT/CH/INCR options or ZRANGE
-BYSCORE/BYLEX/REV/LIMIT options. ZRANK WITHSCORE and ZSCAN are also outside this
-API; use raw `execute` for other forms. Cursor iteration is tracked in #14.
+Rank bounds are inclusive and allow negative indexes. Score and lex bounds
+use Redis tokens as bytes. For scores, `b"1.5"` is inclusive and `b"(1.5"`
+is exclusive. Use `b"-inf"` and `b"+inf"` for infinities. For lex ranges, use
+`b"[" + member` or `b"(" + member` for an inclusive or exclusive member.
+`b"-"` and `b"+"` bound the full lex range. Use lex ranges on sets whose
+members share a score. Reversed ranges take the upper bound first.
 
-References: [ZADD](https://redis.io/docs/latest/commands/zadd/),
-[ZRANGE](https://redis.io/docs/latest/commands/zrange/).
+A nonnegative `start` (or `offset` for ZRANGESTORE) enables LIMIT. A zero
+`num` returns no entries and a negative `num` takes the remaining entries.
+ZRANGESTORE uses byte tokens for rank bounds too, such as `b"0", b"-1"`.
+Its LIMIT applies to score and lex modes. An empty store result removes
+the destination key.
+
+With `withscores=True`, score ranges and set combinations return
+`SortedSetResult.WithScores(list[ScoredMember])`. Otherwise they return
+`SortedSetResult.Members(list[bytes])`. For union and intersection,
+`weights` follows the order of `keys` and defaults to all ones.
+Aggregate modes are SUM (default), MIN, MAX, and COUNT (Redis 8.8+).
+Difference uses the first input as the source and subtracts later inputs.
+
+### Blocking pops
+
+Pop commands select the first nonempty set in key order. ZPOPMIN/MAX use one
+member when count is omitted and return an empty list when count is zero
+or the set is missing. ZMPOP/BZMPOP derive the Redis key count from the
+keys list and require exactly one of `min` and `max` and a positive count.
+An empty ZMPOP result or a server timeout returns None.
+
+The three blocking helpers also work on dedicated pool leases. Redis
+`timeout` is in seconds, with zero waiting indefinitely. The independent
+client command deadline and scope cancellation close an incomplete
+connection and discard its lease; a server timeout leaves the session
+usable. See [deadlines](docs/deadlines.md) and
+[lease ownership](docs/transactions-pooling.md).
+
+Malformed replies raise `ProtocolError`. The connection remains usable
+when a complete frame was consumed. The helpers decode RESP2 and RESP3
+score pairs into the same result types.
+
+References [ZADD](https://redis.io/docs/latest/commands/zadd/),
+[ZRANGE](https://redis.io/docs/latest/commands/zrange/),
+[ZUNION](https://redis.io/docs/latest/commands/zunion/), and
+[BZMPOP](https://redis.io/docs/latest/commands/bzmpop/).
 
 ## Cursor-based scan pages
 

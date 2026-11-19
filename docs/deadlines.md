@@ -1,6 +1,6 @@
 # Connection and command deadlines
 
-Requires the pinned Zap toolchain containing [core #575](https://github.com/zaplang-io/zap/pull/575).
+Requires a Zap toolchain containing [core #575](https://github.com/zaplang-io/zap/pull/575).
 The earlier cancellation audit is retained in Git history; its unsupported-runtime
 probe is no longer a CI gate. CI now runs executable library deadline regressions.
 

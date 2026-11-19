@@ -1193,7 +1193,7 @@ def _score_value(Reply reply) -> float64:
         return -math.inf
     if text !~ m/\A[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\z/:
         raise ProtocolError("Invalid Redis score syntax")
-    # Validate before float(): malformed conversions abort in the pinned core.
+    # Validate before float(): malformed conversions can abort in the runtime.
     auto value = float(text)
     if math.isinf(value) or math.isnan(value):
         raise ProtocolError("Redis score is outside float64 range")
@@ -1260,6 +1260,175 @@ def _scored_members(Reply reply) -> list[ScoredMember]:
             return members
         case _:
             raise ProtocolError("Expected member/score array reply")
+
+# ZADD with INCR returns a score or null, instead of a changed-member count.
+enum ZAddResult:
+    Count(int64 value)
+    Score(float64 value)
+    Null
+
+    def count(self) -> int64:
+        match self:
+            case ZAddResult.Count(value):
+                return value
+            case _:
+                raise ValueError("ZADD INCR result has no member count")
+
+    def is_null(self) -> bool:
+        match self:
+            case ZAddResult.Null:
+                return True
+            case _:
+                return False
+
+# WITHSCORES selects the result shape, as in redis-py.
+enum SortedSetResult:
+    Members(list[bytes] values)
+    WithScores(list[ScoredMember] values)
+
+struct SortedPop:
+    bytes key
+    bytes member
+    float64 score
+
+struct SortedPopBatch:
+    bytes key
+    list[ScoredMember] members
+
+def _nested_scored_members(Reply reply) -> list[ScoredMember]:
+    match reply:
+        case Reply.Array(items):
+            list[ScoredMember] members = []
+            for item in items:
+                match item:
+                    case Reply.Array(pair):
+                        if len(pair) != 2:
+                            raise ProtocolError("Expected sorted-set member/score pair")
+                        members.append(ScoredMember(_required_bulk(pair[0]), _score_value(pair[1])))
+                    case _:
+                        raise ProtocolError("Expected nested sorted-set member/score pair")
+            return members
+        case _:
+            raise ProtocolError("Expected sorted-set array reply")
+
+def _sorted_set_result(Reply reply, bool withscores, bool resp3) -> SortedSetResult:
+    if not withscores:
+        return SortedSetResult.Members(_bulk_array(reply))
+    if resp3:
+        return SortedSetResult.WithScores(_nested_scored_members(reply))
+    return SortedSetResult.WithScores(_scored_members(reply))
+
+def _score_bound(bytes bound):
+    auto number = bound
+    if len(bound) > 0 and bound[0] == 40:
+        number = bound[1:len(bound)]
+    try:
+        _score_value(Reply.Bulk(number))
+    except ProtocolError:
+        raise ValueError("Invalid Redis score boundary")
+
+def _lex_bound(bytes bound):
+    if bound == b"-" or bound == b"+":
+        return
+    if len(bound) == 0 or (bound[0] != 40 and bound[0] != 91):
+        raise ValueError("Redis lex bounds require [ or ( prefixes, or - or +")
+
+def _range_limit(list[bytes] args, int64 offset, int64 count):
+    if offset < -1 or (offset == -1 and count != -1):
+        raise ValueError("Redis range LIMIT requires a nonnegative offset")
+    if offset >= 0:
+        args.append(b"LIMIT")
+        args.append(bytes(str(offset)))
+        args.append(bytes(str(count)))
+
+def _sorted_count(Reply reply) -> int64:
+    auto count = _integer_value(reply)
+    if count < 0:
+        raise ProtocolError("Redis sorted-set count must not be negative")
+    return count
+
+def _sorted_key_args(list[bytes] args, list[bytes] keys):
+    if len(keys) == 0:
+        raise ValueError("Redis sorted-set key list must not be empty")
+    args.append(bytes(str(len(keys))))
+    for key in keys:
+        args.append(key)
+
+def _sorted_aggregation(list[bytes] args, list[bytes] keys, list[float64] weights, str aggregate):
+    if len(weights) > 0:
+        if len(weights) != len(keys):
+            raise ValueError("Redis sorted-set weights must match the key count")
+        args.append(b"WEIGHTS")
+        for weight in weights:
+            args.append(_score_argument(weight))
+    if len(aggregate) > 0:
+        auto mode = aggregate.upper()
+        if mode != "SUM" and mode != "MIN" and mode != "MAX" and mode != "COUNT":
+            raise ValueError("Invalid Redis sorted-set aggregation mode")
+        args.append(b"AGGREGATE")
+        args.append(bytes(mode))
+
+def _sorted_blocking_args(bytes command, list[bytes] keys, float64 timeout) -> list[bytes]:
+    auto args = _keys_command(command, keys)
+    args.append(_blocking_timeout(timeout))
+    return args
+
+def _sorted_blocking_reply(Reply reply, list[bytes] keys, bool resp3) -> Optional[SortedPop]:
+    match reply:
+        case Reply.NullArray:
+            return None
+        case Reply.NullBulk:
+            if resp3:
+                return None
+            raise ProtocolError("Expected sorted-set blocking pop null array")
+        case Reply.Array(items):
+            if len(items) != 3:
+                raise ProtocolError("Expected sorted-set blocking pop key, member, and score")
+            bytes key = _required_bulk(items[0])
+            if not _requested_key(keys, key):
+                raise ProtocolError("Sorted-set pop returned an unrequested key")
+            return Optional.Some(SortedPop(key, _required_bulk(items[1]), _score_value(items[2])))
+        case _:
+            raise ProtocolError("Expected sorted-set blocking pop array")
+
+def _sorted_mpop_args(list[bytes] args, list[bytes] keys, bool min, bool max, int64 count):
+    if min == max:
+        raise ValueError("Redis sorted-set multi-pop requires exactly one of min or max")
+    if count <= 0:
+        raise ValueError("Redis sorted-set multi-pop count must be positive")
+    _sorted_key_args(args, keys)
+    if min:
+        args.append(b"MIN")
+    else:
+        args.append(b"MAX")
+    args.append(b"COUNT")
+    args.append(bytes(str(count)))
+
+def _sorted_mpop_reply(
+    Reply reply,
+    list[bytes] keys,
+    int64 count,
+    bool resp3,
+) -> Optional[SortedPopBatch]:
+    match reply:
+        case Reply.NullArray:
+            return None
+        case Reply.NullBulk:
+            if resp3:
+                return None
+            raise ProtocolError("Expected sorted-set multi-pop null array")
+        case Reply.Array(items):
+            if len(items) != 2:
+                raise ProtocolError("Expected sorted-set multi-pop key and members")
+            bytes key = _required_bulk(items[0])
+            if not _requested_key(keys, key):
+                raise ProtocolError("Sorted-set multi-pop returned an unrequested key")
+            auto members = _nested_scored_members(items[1])
+            if len(members) == 0 or len(members) > count:
+                raise ProtocolError("Invalid sorted-set multi-pop member count")
+            return Optional.Some(SortedPopBatch(key, members))
+        case _:
+            raise ProtocolError("Expected sorted-set multi-pop array")
 
 # Cursors stay decimal bytes, never narrowed to signed machine integers.
 struct ScanPage:
@@ -3246,14 +3415,45 @@ struct Connection:
     def sdiff(self, list[bytes] keys) -> list[bytes]:
         return _bulk_array(self.execute(_keys_command(b"SDIFF", keys)))
 
-    def zadd(self, bytes key, list[ScoredMember] members) -> int64:
-        if len(members) == 0:
-            raise ValueError("ZADD requires at least one score/member pair")
-        list[bytes] args = [b"ZADD", key]
-        for entry in members:
-            args.append(_score_argument(entry.score))
-            args.append(entry.member)
-        return _integer_value(self.execute(args))
+    def zadd(
+        self,
+        bytes name,
+        dict[bytes, float64] mapping,
+        bool nx = False,
+        bool xx = False,
+        bool ch = False,
+        bool incr = False,
+        bool gt = False,
+        bool lt = False,
+    ) -> ZAddResult:
+        if len(mapping) == 0 or (incr and len(mapping) != 1):
+            raise ValueError("ZADD requires a nonempty mapping, or one member with INCR")
+        if (nx and (xx or gt or lt)) or (gt and lt):
+            raise ValueError("Invalid Redis ZADD condition combination")
+        list[bytes] args = [b"ZADD", name]
+        if nx:
+            args.append(b"NX")
+        if xx:
+            args.append(b"XX")
+        if gt:
+            args.append(b"GT")
+        if lt:
+            args.append(b"LT")
+        if ch:
+            args.append(b"CH")
+        if incr:
+            args.append(b"INCR")
+        for member, score in mapping.items():
+            args.append(_score_argument(score))
+            args.append(member)
+        auto reply = self.execute(args)
+        if not incr:
+            return ZAddResult.Count(_sorted_count(reply))
+        match reply:
+            case Reply.NullBulk:
+                return ZAddResult.Null
+            case _:
+                return ZAddResult.Score(_score_value(reply))
 
     def zrem(self, bytes key, list[bytes] members) -> int64:
         if len(members) == 0:
@@ -3296,11 +3496,199 @@ struct Connection:
         int64 start,
         int64 stop,
     ) -> list[ScoredMember]:
-        return _scored_members(
-            self.execute(
-                [b"ZRANGE", key, bytes(str(start)), bytes(str(stop)), b"WITHSCORES"],
-            ),
+        auto reply = self.execute(
+            [b"ZRANGE", key, bytes(str(start)), bytes(str(stop)), b"WITHSCORES"],
         )
+        if self._protocol3:
+            return _nested_scored_members(reply)
+        return _scored_members(reply)
+
+    def _zscore_range(
+        self,
+        bytes command,
+        bytes name,
+        bytes first,
+        bytes last,
+        int64 start,
+        int64 num,
+        bool withscores,
+    ) -> SortedSetResult:
+        _score_bound(first)
+        _score_bound(last)
+        list[bytes] args = [command, name, first, last]
+        _range_limit(args, start, num)
+        if withscores:
+            args.append(b"WITHSCORES")
+        return _sorted_set_result(self.execute(args), withscores, self._protocol3)
+
+    def zrangebyscore(
+        self,
+        bytes name,
+        bytes min,
+        bytes max,
+        int64 start = -1,
+        int64 num = -1,
+        bool withscores = False,
+    ) -> SortedSetResult:
+        return self._zscore_range(b"ZRANGEBYSCORE", name, min, max, start, num, withscores)
+
+    def zrevrangebyscore(
+        self,
+        bytes name,
+        bytes max,
+        bytes min,
+        int64 start = -1,
+        int64 num = -1,
+        bool withscores = False,
+    ) -> SortedSetResult:
+        return self._zscore_range(b"ZREVRANGEBYSCORE", name, max, min, start, num, withscores)
+
+    def _zlex_range(self, bytes command, bytes name, bytes first, bytes last, int64 start, int64 num) -> list[bytes]:
+        _lex_bound(first)
+        _lex_bound(last)
+        list[bytes] args = [command, name, first, last]
+        _range_limit(args, start, num)
+        return _bulk_array(self.execute(args))
+
+    def zrangebylex(self, bytes name, bytes min, bytes max, int64 start = -1, int64 num = -1) -> list[bytes]:
+        return self._zlex_range(b"ZRANGEBYLEX", name, min, max, start, num)
+
+    def zrevrangebylex(self, bytes name, bytes max, bytes min, int64 start = -1, int64 num = -1) -> list[bytes]:
+        return self._zlex_range(b"ZREVRANGEBYLEX", name, max, min, start, num)
+
+    def zcount(self, bytes name, bytes min, bytes max) -> int64:
+        _score_bound(min)
+        _score_bound(max)
+        return _sorted_count(self.execute([b"ZCOUNT", name, min, max]))
+
+    def zlexcount(self, bytes name, bytes min, bytes max) -> int64:
+        _lex_bound(min)
+        _lex_bound(max)
+        return _sorted_count(self.execute([b"ZLEXCOUNT", name, min, max]))
+
+    def _zpop(self, bytes command, bytes name, int64 count) -> list[ScoredMember]:
+        if count < -1:
+            raise ValueError("Redis sorted-set pop count must be nonnegative or omitted")
+        list[bytes] args = [command, name]
+        auto limit = 1
+        if count >= 0:
+            args.append(bytes(str(count)))
+            limit = count
+        auto reply = self.execute(args)
+        list[ScoredMember] members = []
+        if self._protocol3 and count >= 0:
+            members = _nested_scored_members(reply)
+        else:
+            members = _scored_members(reply)
+        if len(members) > limit:
+            raise ProtocolError("Too many sorted-set pop results")
+        return members
+
+    def zpopmin(self, bytes name, int64 count = -1) -> list[ScoredMember]:
+        return self._zpop(b"ZPOPMIN", name, count)
+
+    def zpopmax(self, bytes name, int64 count = -1) -> list[ScoredMember]:
+        return self._zpop(b"ZPOPMAX", name, count)
+
+    def bzpopmin(self, list[bytes] keys, float64 timeout = 0.0) -> Optional[SortedPop]:
+        auto reply = self.execute(_sorted_blocking_args(b"BZPOPMIN", keys, timeout))
+        return _sorted_blocking_reply(reply, keys, self._protocol3)
+
+    def bzpopmax(self, list[bytes] keys, float64 timeout = 0.0) -> Optional[SortedPop]:
+        auto reply = self.execute(_sorted_blocking_args(b"BZPOPMAX", keys, timeout))
+        return _sorted_blocking_reply(reply, keys, self._protocol3)
+
+    def zmpop(self, list[bytes] keys, bool min = False, bool max = False, int64 count = 1) -> Optional[SortedPopBatch]:
+        list[bytes] args = [b"ZMPOP"]
+        _sorted_mpop_args(args, keys, min, max, count)
+        return _sorted_mpop_reply(self.execute(args), keys, count, self._protocol3)
+
+    def bzmpop(self, float64 timeout, list[bytes] keys, bool min = False, bool max = False, int64 count = 1) -> Optional[SortedPopBatch]:
+        list[bytes] args = [b"BZMPOP", _blocking_timeout(timeout)]
+        _sorted_mpop_args(args, keys, min, max, count)
+        return _sorted_mpop_reply(self.execute(args), keys, count, self._protocol3)
+
+    def zrangestore(
+        self,
+        bytes dest,
+        bytes name,
+        bytes start,
+        bytes end,
+        bool byscore = False,
+        bool bylex = False,
+        bool desc = False,
+        int64 offset = -1,
+        int64 num = -1,
+    ) -> int64:
+        if byscore and bylex:
+            raise ValueError("ZRANGESTORE BYSCORE and BYLEX are mutually exclusive")
+        list[bytes] args = [b"ZRANGESTORE", dest, name, start, end]
+        if byscore:
+            _score_bound(start)
+            _score_bound(end)
+            args.append(b"BYSCORE")
+        if bylex:
+            _lex_bound(start)
+            _lex_bound(end)
+            args.append(b"BYLEX")
+        if desc:
+            args.append(b"REV")
+        if (offset != -1 or num != -1) and not byscore and not bylex:
+            raise ValueError("ZRANGESTORE LIMIT requires BYSCORE or BYLEX")
+        _range_limit(args, offset, num)
+        return _sorted_count(self.execute(args))
+
+    def _zcombine(
+        self,
+        bytes command,
+        list[bytes] keys,
+        str aggregate,
+        bool withscores,
+        list[float64] weights,
+    ) -> SortedSetResult:
+        list[bytes] args = [command]
+        _sorted_key_args(args, keys)
+        _sorted_aggregation(args, keys, weights, aggregate)
+        if withscores:
+            args.append(b"WITHSCORES")
+        return _sorted_set_result(self.execute(args), withscores, self._protocol3)
+
+    def zunion(self, list[bytes] keys, str aggregate = "", bool withscores = False, list[float64] weights = []) -> SortedSetResult:
+        return self._zcombine(b"ZUNION", keys, aggregate, withscores, weights)
+
+    def zinter(self, list[bytes] keys, str aggregate = "", bool withscores = False, list[float64] weights = []) -> SortedSetResult:
+        return self._zcombine(b"ZINTER", keys, aggregate, withscores, weights)
+
+    def zdiff(self, list[bytes] keys, bool withscores = False) -> SortedSetResult:
+        list[bytes] args = [b"ZDIFF"]
+        _sorted_key_args(args, keys)
+        if withscores:
+            args.append(b"WITHSCORES")
+        return _sorted_set_result(self.execute(args), withscores, self._protocol3)
+
+    def _zcombine_store(
+        self,
+        bytes command,
+        bytes dest,
+        list[bytes] keys,
+        str aggregate,
+        list[float64] weights,
+    ) -> int64:
+        list[bytes] args = [command, dest]
+        _sorted_key_args(args, keys)
+        _sorted_aggregation(args, keys, weights, aggregate)
+        return _sorted_count(self.execute(args))
+
+    def zunionstore(self, bytes dest, list[bytes] keys, str aggregate = "", list[float64] weights = []) -> int64:
+        return self._zcombine_store(b"ZUNIONSTORE", dest, keys, aggregate, weights)
+
+    def zinterstore(self, bytes dest, list[bytes] keys, str aggregate = "", list[float64] weights = []) -> int64:
+        return self._zcombine_store(b"ZINTERSTORE", dest, keys, aggregate, weights)
+
+    def zdiffstore(self, bytes dest, list[bytes] keys) -> int64:
+        list[bytes] args = [b"ZDIFFSTORE", dest]
+        _sorted_key_args(args, keys)
+        return _sorted_count(self.execute(args))
 
     def scan(
         self,
@@ -4387,6 +4775,19 @@ struct Lease:
             )
         finally:
             self._guard.store(0)
+
+    def bzpopmin(self, list[bytes] keys, float64 timeout = 0.0) -> Optional[SortedPop]:
+        auto reply = self.execute(_sorted_blocking_args(b"BZPOPMIN", keys, timeout))
+        return _sorted_blocking_reply(reply, keys, self._connection._protocol3)
+
+    def bzpopmax(self, list[bytes] keys, float64 timeout = 0.0) -> Optional[SortedPop]:
+        auto reply = self.execute(_sorted_blocking_args(b"BZPOPMAX", keys, timeout))
+        return _sorted_blocking_reply(reply, keys, self._connection._protocol3)
+
+    def bzmpop(self, float64 timeout, list[bytes] keys, bool min = False, bool max = False, int64 count = 1) -> Optional[SortedPopBatch]:
+        list[bytes] args = [b"BZMPOP", _blocking_timeout(timeout)]
+        _sorted_mpop_args(args, keys, min, max, count)
+        return _sorted_mpop_reply(self.execute(args), keys, count, self._connection._protocol3)
 
     def xread(
         self,

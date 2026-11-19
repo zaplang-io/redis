@@ -17,3 +17,17 @@ A null result has the same option-dependent meaning as the Redis reply.
 This changes the unreleased boolean API. Callers can use `.is_written()`
 for status-only SET calls, switch the `key` keyword to `name`, and name
 any previously positional SET options to account for the new order.
+
+## Sorted-set mapping and result types
+
+Issue [#58](https://github.com/zaplang-io/redis/issues/58) changes ZADD
+to take a `dict[bytes, float64]` member-to-score mapping with the same
+option names and order as [redis-py](https://redis.readthedocs.io/en/stable/commands.html#redis.commands.core.SortedSetCommands.zadd).
+`ZAddResult` represents the count, incremented score, or skipped increment.
+`ScoredMember` remains the representation of member/score replies.
+
+`SortedSetResult` represents the two WITHSCORES list shapes. Sort boundaries
+use byte tokens so a single argument type covers numeric, exclusive, infinite,
+and binary lex bounds. Union and intersection take an ordered key list and
+optional parallel weights. Multi-pop derives the count of input keys from
+the list. Scored results always use float64.

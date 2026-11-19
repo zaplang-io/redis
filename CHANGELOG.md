@@ -15,6 +15,9 @@ is created by this change.
   expiry, and OBJECT metadata (Redis #56).
 - Typed GETDEL, GETEX, string ranges, APPEND, and STRLEN. SET supports EXAT,
   PXAT, KEEPTTL, and GET, and returns a tagged `SetResult` (#57).
+- Sorted-set score and lex ranges, stores, set operations, and cancellable
+  blocking pops. ZADD takes a member-to-score mapping with redis-py flags and
+  returns a tagged result (#58).
 - Bounded guarded pools with finite reset/reinitialization and dedicated leases.
 - Dedicated pull-based Pub/Sub sessions and PUBLISH, with typed binary events,
   explicit acknowledgements and at-most-once/no-replay semantics.
@@ -28,5 +31,5 @@ is created by this change.
   reconnect, plus Redis Cluster slot discovery and cached single-key routing.
 - Cluster MOVED/ASK redirects with bounded retries and same-slot validation for
   a supported multi-key command subset.
-- Executable consumer examples, path/static-registry installation tests, pinned
-  runtime/server CI, and version/tag release preflight.
+- Executable consumer examples, path/static-registry installation tests, the latest
+  Zap image and pinned Redis server versions in CI, and version/tag release preflight.
