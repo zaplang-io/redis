@@ -13,6 +13,8 @@ is created by this change.
   scan-page and scripting helpers; bounded pipelines and exclusive transactions.
 - Typed key rename, copy, discovery, touch, binary DUMP/RESTORE, absolute
   expiry, and OBJECT metadata (Redis #56).
+- Typed GETDEL, GETEX, string ranges, APPEND, and STRLEN. SET supports EXAT,
+  PXAT, KEEPTTL, and GET, and returns a tagged `SetResult` (#57).
 - Bounded guarded pools with finite reset/reinitialization and dedicated leases.
 - Dedicated pull-based Pub/Sub sessions and PUBLISH, with typed binary events,
   explicit acknowledgements and at-most-once/no-replay semantics.
