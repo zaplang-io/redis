@@ -12,6 +12,7 @@ def server(bytes listener, list[Step] steps):
     auto socket = net.accept(listener)
     net.close_listener(listener)
     try:
+        auto number = 1
         for step in steps:
             auto want = redis.encode_command(step.args)
             auto got = b""
@@ -19,8 +20,12 @@ def server(bytes listener, list[Step] steps):
                 auto chunk = bytes(net.recv(socket, len(want) - len(got)))
                 check(len(chunk) > 0, "command complete")
                 got = got + chunk
-            check(got == want, "exact helper wire command")
+            check(
+                got == want,
+                "exact sorted-set wire command at step " + str(number) + " (" + str(step.args[0]) + ")",
+            )
             net.send(socket, step.reply)
+            number = number + 1
     finally:
         net.close_conn(socket)
 
@@ -306,19 +311,9 @@ def breadth_wire():
 def main():
     auto value = bytes([255, 0, 128, 13, 10])
     list[Step] steps = [
-        Step(
-            [
-                b"ZADD",
-                b"k",
-                b"1.2345678901234567",
-                value,
-                b"-inf",
-                b"low",
-                b"inf",
-                b"high",
-            ],
-            b":3\r\n",
-        ),
+        Step([b"ZADD", b"k", b"1.2345678901234567", value], b":1\r\n"),
+        Step([b"ZADD", b"k", b"-inf", b"low"], b":1\r\n"),
+        Step([b"ZADD", b"k", b"inf", b"high"], b":1\r\n"),
         Step([b"ZREM", b"k", value, value], b":1\r\n"),
         Step([b"ZCARD", b"k"], b":2\r\n"),
         Step([b"ZSCORE", b"k", value], b"$-1\r\n"),
@@ -417,8 +412,16 @@ def main():
     try:
         invalid_options(conn)
         check(
-            conn.zadd(b"k", {value: 1.2345678901234567, b"low": -math.inf, b"high": math.inf}).count() == 3,
+            conn.zadd(b"k", {value: 1.2345678901234567}).count() == 1,
             "exact score formatting",
+        )
+        check(
+            conn.zadd(b"k", {b"low": -math.inf}).count() == 1,
+            "negative infinity formatting",
+        )
+        check(
+            conn.zadd(b"k", {b"high": math.inf}).count() == 1,
+            "positive infinity formatting",
         )
         check(conn.zrem(b"k", [value, value]) == 1, "ZREM duplicates")
         check(conn.zcard(b"k") == 2, "ZCARD")

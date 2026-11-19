@@ -60,7 +60,7 @@ def main():
         dict[bytes, float64] updated = {b"dup": 1.0}
         updated[b"dup"] = 4.0
         check(
-            conn.zadd(key, updated).count().count() == 1,
+            conn.zadd(key, updated).count() == 1,
             "ZADD sends one score per mapping entry",
         )
         check(conn.zscore(key, b"dup").unwrap() == 4.0, "duplicate score")
