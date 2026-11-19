@@ -1160,6 +1160,74 @@ def _requires_dedicated(list[bytes] args) -> bool:
         return _xreadgroup_blocks(args)
     return name == "BLPOP" or name == "BRPOP" or name == "BLMOVE" or name == "BLMPOP" or name == "BRPOPLPUSH" or name == "BZPOPMIN" or name == "BZPOPMAX" or name == "BZMPOP"
 
+# LPOS uses a scalar or an array depending on whether COUNT is present.
+enum ListPosition:
+    Index(int64 value)
+    Positions(list[int64] values)
+    Missing
+
+struct ListPopBatch:
+    bytes key
+    list[bytes] values
+
+def _list_count(Reply reply) -> int64:
+    auto count = _integer_value(reply)
+    if count < 0:
+        raise ProtocolError("Redis list count must not be negative")
+    return count
+
+def _list_position(Reply reply, int64 count) -> ListPosition:
+    if count == -1:
+        match reply:
+            case Reply.NullBulk:
+                return ListPosition.Missing
+            case _:
+                return ListPosition.Index(_list_count(reply))
+    match reply:
+        case Reply.Array(items):
+            if count > 0 and len(items) > count:
+                raise ProtocolError("Too many Redis LPOS positions")
+            list[int64] positions = []
+            for item in items:
+                positions.append(_list_count(item))
+            return ListPosition.Positions(positions)
+        case _:
+            raise ProtocolError("Expected Redis LPOS COUNT array")
+
+def _list_mpop_args(list[bytes] args, list[bytes] keys, str direction, int64 count):
+    if count <= 0:
+        raise ValueError("Redis list multi-pop count must be positive")
+    _numkeys_args(args, keys)
+    args.append(_list_side(direction))
+    args.append(b"COUNT")
+    args.append(bytes(str(count)))
+
+def _list_mpop_reply(
+    Reply reply,
+    list[bytes] keys,
+    int64 count,
+    bool resp3,
+) -> Optional[ListPopBatch]:
+    match reply:
+        case Reply.NullArray:
+            return None
+        case Reply.NullBulk:
+            if resp3:
+                return None
+            raise ProtocolError("Expected Redis list multi-pop null array")
+        case Reply.Array(items):
+            if len(items) != 2:
+                raise ProtocolError("Expected Redis list multi-pop key and values")
+            bytes key = _required_bulk(items[0])
+            if not _requested_key(keys, key):
+                raise ProtocolError("Redis list multi-pop returned an unrequested key")
+            auto values = _bulk_array(items[1])
+            if len(values) == 0 or len(values) > count:
+                raise ProtocolError("Invalid Redis list multi-pop value count")
+            return Optional.Some(ListPopBatch(key, values))
+        case _:
+            raise ProtocolError("Expected Redis list multi-pop array")
+
 # Hash fields stay separate from keys, with no implicit text conversion.
 struct HashField:
     bytes field
@@ -1347,9 +1415,9 @@ def _sorted_count(Reply reply) -> int64:
         raise ProtocolError("Redis sorted-set count must not be negative")
     return count
 
-def _sorted_key_args(list[bytes] args, list[bytes] keys):
+def _numkeys_args(list[bytes] args, list[bytes] keys):
     if len(keys) == 0:
-        raise ValueError("Redis sorted-set key list must not be empty")
+        raise ValueError("Redis command requires at least one key")
     args.append(bytes(str(len(keys))))
     for key in keys:
         args.append(key)
@@ -1396,7 +1464,7 @@ def _sorted_mpop_args(list[bytes] args, list[bytes] keys, bool min, bool max, in
         raise ValueError("Redis sorted-set multi-pop requires exactly one of min or max")
     if count <= 0:
         raise ValueError("Redis sorted-set multi-pop count must be positive")
-    _sorted_key_args(args, keys)
+    _numkeys_args(args, keys)
     if min:
         args.append(b"MIN")
     else:
@@ -3129,13 +3197,68 @@ struct Connection:
         list[bytes] args = [command, key]
         for value in values:
             args.append(value)
-        return _integer_value(self.execute(args))
+        return _list_count(self.execute(args))
 
     def lpush(self, bytes key, list[bytes] values) -> int64:
         return self._list_push(b"LPUSH", key, values)
 
     def rpush(self, bytes key, list[bytes] values) -> int64:
         return self._list_push(b"RPUSH", key, values)
+
+    def lpushx(self, bytes name, list[bytes] values) -> int64:
+        return self._list_push(b"LPUSHX", name, values)
+
+    def rpushx(self, bytes name, list[bytes] values) -> int64:
+        return self._list_push(b"RPUSHX", name, values)
+
+    def lpos(
+        self,
+        bytes name,
+        bytes value,
+        int64 rank = 1,
+        int64 count = -1,
+        int64 maxlen = 0,
+    ) -> ListPosition:
+        if rank == 0 or count < -1 or maxlen < 0:
+            raise ValueError("LPOS requires nonzero rank, nonnegative maxlen, and nonnegative or omitted count")
+        list[bytes] args = [b"LPOS", name, value]
+        if rank != 1:
+            args.append(b"RANK")
+            args.append(bytes(str(rank)))
+        if count >= 0:
+            args.append(b"COUNT")
+            args.append(bytes(str(count)))
+        if maxlen > 0:
+            args.append(b"MAXLEN")
+            args.append(bytes(str(maxlen)))
+        return _list_position(self.execute(args), count)
+
+    def linsert(self, bytes name, str where, bytes refvalue, bytes value) -> int64:
+        auto placement = where.upper()
+        if placement != "BEFORE" and placement != "AFTER":
+            raise ValueError("LINSERT placement must be BEFORE or AFTER")
+        auto length = _integer_value(
+            self.execute([b"LINSERT", name, bytes(placement), refvalue, value]),
+        )
+        if length < -1:
+            raise ProtocolError("Invalid Redis LINSERT result")
+        return length
+
+    def lrem(self, bytes name, int64 count, bytes value) -> int64:
+        return _list_count(self.execute([b"LREM", name, bytes(str(count)), value]))
+
+    def rpoplpush(self, bytes src, bytes dst) -> Optional[bytes]:
+        return _bulk_value(self.execute([b"RPOPLPUSH", src, dst]))
+
+    def lmpop(
+        self,
+        list[bytes] keys,
+        str direction,
+        int64 count = 1,
+    ) -> Optional[ListPopBatch]:
+        list[bytes] args = [b"LMPOP"]
+        _list_mpop_args(args, keys, direction, count)
+        return _list_mpop_reply(self.execute(args), keys, count, self._protocol3)
 
     def lpop(self, bytes key) -> Optional[bytes]:
         return _bulk_value(self.execute([b"LPOP", key]))
@@ -3213,6 +3336,22 @@ struct Connection:
             _blocking_timeout(server_timeout_seconds),
         ]
         return _blocking_move_reply(self.execute(args))
+
+    def brpoplpush(self, bytes src, bytes dst, float64 timeout = 0.0) -> Optional[bytes]:
+        return _blocking_move_reply(
+            self.execute([b"BRPOPLPUSH", src, dst, _blocking_timeout(timeout)]),
+        )
+
+    def blmpop(
+        self,
+        float64 timeout,
+        list[bytes] keys,
+        str direction,
+        int64 count = 1,
+    ) -> Optional[ListPopBatch]:
+        list[bytes] args = [b"BLMPOP", _blocking_timeout(timeout)]
+        _list_mpop_args(args, keys, direction, count)
+        return _list_mpop_reply(self.execute(args), keys, count, self._protocol3)
 
     def xadd(self, bytes key, list[StreamField] fields, bytes id = b"*") -> bytes:
         if id != b"*" and not _stream_id_valid(id):
@@ -3647,7 +3786,7 @@ struct Connection:
         list[float64] weights,
     ) -> SortedSetResult:
         list[bytes] args = [command]
-        _sorted_key_args(args, keys)
+        _numkeys_args(args, keys)
         _sorted_aggregation(args, keys, weights, aggregate)
         if withscores:
             args.append(b"WITHSCORES")
@@ -3661,7 +3800,7 @@ struct Connection:
 
     def zdiff(self, list[bytes] keys, bool withscores = False) -> SortedSetResult:
         list[bytes] args = [b"ZDIFF"]
-        _sorted_key_args(args, keys)
+        _numkeys_args(args, keys)
         if withscores:
             args.append(b"WITHSCORES")
         return _sorted_set_result(self.execute(args), withscores, self._protocol3)
@@ -3675,7 +3814,7 @@ struct Connection:
         list[float64] weights,
     ) -> int64:
         list[bytes] args = [command, dest]
-        _sorted_key_args(args, keys)
+        _numkeys_args(args, keys)
         _sorted_aggregation(args, keys, weights, aggregate)
         return _sorted_count(self.execute(args))
 
@@ -3687,7 +3826,7 @@ struct Connection:
 
     def zdiffstore(self, bytes dest, list[bytes] keys) -> int64:
         list[bytes] args = [b"ZDIFFSTORE", dest]
-        _sorted_key_args(args, keys)
+        _numkeys_args(args, keys)
         return _sorted_count(self.execute(args))
 
     def scan(
@@ -4775,6 +4914,22 @@ struct Lease:
             )
         finally:
             self._guard.store(0)
+
+    def brpoplpush(self, bytes src, bytes dst, float64 timeout = 0.0) -> Optional[bytes]:
+        return _blocking_move_reply(
+            self.execute([b"BRPOPLPUSH", src, dst, _blocking_timeout(timeout)]),
+        )
+
+    def blmpop(
+        self,
+        float64 timeout,
+        list[bytes] keys,
+        str direction,
+        int64 count = 1,
+    ) -> Optional[ListPopBatch]:
+        list[bytes] args = [b"BLMPOP", _blocking_timeout(timeout)]
+        _list_mpop_args(args, keys, direction, count)
+        return _list_mpop_reply(self.execute(args), keys, count, self._connection._protocol3)
 
     def bzpopmin(self, list[bytes] keys, float64 timeout = 0.0) -> Optional[SortedPop]:
         auto reply = self.execute(_sorted_blocking_args(b"BZPOPMIN", keys, timeout))

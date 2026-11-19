@@ -120,8 +120,8 @@ structured `Cancelled` propagates after closing and returning capacity. Use
 `discard()` to skip reset and close deliberately. This makes cleanup safe even
 when ordinary command budgets are disabled.
 
-Blocking list/sorted-set and streaming/protocol commands (BLPOP/BRPOP/BLMOVE
-variants, XREAD with BLOCK, SUBSCRIBE variants, MONITOR, HELLO, replication stream commands) require `acquire(dedicated=True)` and are rejected locally on
+Blocking list/sorted-set commands, including BRPOPLPUSH and BLMPOP, and
+streaming/protocol commands require `acquire(dedicated=True)` and are rejected locally on
 ordinary leases, including pipeline batches. Dedicated leases always close on
 release and reserve capacity for their lifetime. They provide exclusive ownership.
 The dedicated `pubsub()` pull session and blocking stream reads are documented

@@ -133,8 +133,12 @@ def stalled(
         command(socket, [b"BZPOPMIN", b"key", b"0"])
     elif mode == 4:
         command(socket, [b"BZPOPMAX", b"key", b"0"])
-    else:
+    elif mode == 5:
         command(socket, [b"BZMPOP", b"0", b"1", b"key", b"MAX", b"COUNT", b"1"])
+    elif mode == 6:
+        command(socket, [b"BRPOPLPUSH", b"key", b"dest", b"0"])
+    else:
+        command(socket, [b"BLMPOP", b"0", b"1", b"key", b"LEFT", b"COUNT", b"1"])
     if signal:
         entered <- True
     check(len(bytes(net.recv(socket, 1))) == 0, "blocked socket discarded")
@@ -157,8 +161,12 @@ def owner(redis.Lease lease, int64 mode, Atomic[int64] cancelled):
             lease.bzpopmin([b"key"])
         elif mode == 4:
             lease.bzpopmax([b"key"])
-        else:
+        elif mode == 5:
             lease.bzmpop(0.0, [b"key"], max=True)
+        elif mode == 6:
+            lease.brpoplpush(b"key", b"dest")
+        else:
+            lease.blmpop(0.0, [b"key"], "LEFT")
     except Cancelled:
         cancelled.add(1)
     finally:
@@ -204,8 +212,12 @@ def deadline(int64 mode):
             conn.bzpopmin([b"key"])
         elif mode == 4:
             conn.bzpopmax([b"key"])
-        else:
+        elif mode == 5:
             conn.bzmpop(0.0, [b"key"], max=True)
+        elif mode == 6:
+            conn.brpoplpush(b"key", b"dest")
+        else:
+            conn.blmpop(0.0, [b"key"], "LEFT")
     except redis.CommandTimeout:
         failed = True
     check(failed and conn.is_closed(), "client deadline overrides infinite server wait")
@@ -255,7 +267,28 @@ def shared_lease():
         lease.execute_pipeline(sorted_batch)
     except ValueError:
         rejected = rejected + 1
-    check(rejected == 8, "shared lease rejects typed/raw/pipelined blockers before I/O")
+    try:
+        lease.brpoplpush(b"key", b"dest")
+    except ValueError:
+        rejected = rejected + 1
+    try:
+        lease.blmpop(0.0, [b"key"], "LEFT")
+    except ValueError:
+        rejected = rejected + 1
+    try:
+        lease.execute_raw([b"blmpop", b"0", b"1", b"key", b"RIGHT"])
+    except ValueError:
+        rejected = rejected + 1
+    auto list_batch = redis.pipeline()
+    list_batch.queue([b"BRPOPLPUSH", b"key", b"dest", b"0"])
+    try:
+        lease.execute_pipeline(list_batch)
+    except ValueError:
+        rejected = rejected + 1
+    check(
+        rejected == 12,
+        "shared lease rejects typed/raw/pipelined blockers before I/O",
+    )
     lease.execute([b"PING"])
     lease.discard()
     pool.shutdown()
@@ -273,7 +306,7 @@ def shared_peer(bytes listener, channel[bool] done):
 def main():
     wire()
     shared_lease()
-    for mode in range(0, 6):
+    for mode in range(0, 8):
         deadline(mode)
         cancellation(mode)
     print("Blocking lists, deadlines, and dedicated ownership: PASS")
