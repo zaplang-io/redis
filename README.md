@@ -435,7 +435,13 @@ explicitly negotiated RESP3 connections:
 | --- | --- |
 | `ping()` | `bool`, true for PONG |
 | `get(key)` | `Optional[bytes]`; None for missing, Some(b"") for empty |
-| `set_value(key, value, nx=False, xx=False, ex=0, px=0)` | `bool`: written or condition not met |
+| `set_value(name, value, ex=0, px=0, nx=False, xx=False, keepttl=False, get=False, exat=0, pxat=0)` | `redis.SetResult` for one Redis SET command |
+| `getdel(name)` | `Optional[bytes]` containing the previous value, or None for a missing key |
+| `getex(name, ex=0, px=0, exat=0, pxat=0, persist=False)` | `Optional[bytes]` containing the value, or None for a missing key |
+| `setrange(name, offset, value)` | `int64` byte length after writing at a nonnegative offset |
+| `getrange(key, start, end)` | `bytes` from the inclusive range, or empty bytes for a missing key or empty span |
+| `append(key, value)` | `int64` byte length after appending |
+| `strlen(name)` | `int64` byte length, zero for a missing key |
 | `mget(keys)` | `list[Optional[bytes]]` in input order, including duplicates |
 | `mset(pairs)` | `bool`, true for OK; pairs are `redis.KeyValue(key, value)` |
 | `delete(keys)`, `unlink(keys)` | `int64` number removed |
@@ -447,26 +453,53 @@ explicitly negotiated RESP3 connections:
 | `ttl(key)`, `pttl(key)` | `int64` remaining seconds/milliseconds, -1 for no expiry, -2 for missing |
 | `persist(key)` | `bool`, whether an expiration was removed |
 
-Zap reserves `set`, so SET uses `set_value`; DEL uses `delete` and TYPE uses
-`key_type`. SET supports only NX/XX and EX/PX in this slice. Expiry arguments are `int64` durations, with zero meaning omitted, for example:
+Zap reserves `set`, so SET uses `set_value`. DEL uses `delete` and TYPE
+uses `key_type`. SET options follow redis-py's argument order through PXAT.
+Use keywords to make the conditions and units explicit.
+
+- `redis.SetResult.Written` is Redis's successful SET status when `get=False`.
+- `redis.SetResult.Previous(value)` contains the previous bytes when
+  `get=True`, including a present empty string. NX with GET can return the
+  old value even when Redis skips the write.
+- `redis.SetResult.Null` means a skipped condition with `get=False`, or an
+  absent previous value with `get=True`. With GET, a null reply can follow
+  either a write or a skipped condition.
 
 ```zap
-auto lifetime = 60
-auto written = conn.set_value(b"key", b"value", nx=True, ex=lifetime)
-auto result = conn.get(b"key")
+auto result = conn.set_value(b"key", b"value", xx=True, keepttl=True, get=True)
 match result:
-    case Optional.Some(data):
-        print(str(data))  # explicit UTF-8 conversion; may raise on binary data
-    case _:
-        print("missing")
+    case redis.SetResult.Previous(data):
+        print(len(data))
+    case redis.SetResult.Null:
+        print("no previous value")
+    case redis.SetResult.Written:
+        print("written")
 ```
 
-NX and XX conflict, EX and PX conflict, and negative SET expiry durations are rejected. Zero omits that expiry option;
-a positive value sends EX or PX.
-Invalid combinations and empty multi-key/pair lists raise `ValueError` before
-network I/O. EXPIRE/PEXPIRE retain Redis semantics: zero or negative durations
-delete existing keys immediately. SET GET, KEEPTTL, the SET EXAT/PXAT
-options, and conditional flags for relative expiry remain available through
+Callers migrating from the boolean setter can use
+`conn.set_value(...).is_written()` for status-only calls, and
+`.is_null()` to check for a skipped conditional write. The first key keyword
+is now `name`. Use named options when migrating calls that passed
+`nx`, `xx`, `ex`, or `px` positionally. See [package decisions](DECISIONS.md).
+
+SET and GETEX accept one of EX/PX (relative seconds/milliseconds) or
+EXAT/PXAT (absolute Unix seconds/milliseconds). Expiry arguments are
+`int64` values and zero omits the option. SET KEEPTTL and GETEX PERSIST
+each conflict with a supplied expiry. SET NX and XX are mutually exclusive.
+Plain GETEX keeps the current expiry, and PERSIST removes it. GETEX and GETDEL
+preserve the difference between empty bytes and a missing key.
+
+GETRANGE accepts negative indexes and clips endpoints. SETRANGE fills a gap
+with zero bytes. An empty SETRANGE leaves the value and length unchanged.
+APPEND creates a missing string. Both SETRANGE and APPEND retain the expiry
+of an existing key. Commands that read or modify an existing string report
+`ResponseError` on a different key type. Plain SET can replace other key
+types. SET with GET requires a string to return the old value.
+
+Invalid option combinations, negative string expiry options, negative
+SETRANGE offsets, and empty multi-key/pair lists raise `ValueError` before
+network I/O. Relative EXPIRE/PEXPIRE durations of zero or less delete an
+existing key immediately. Relative expiry conditions are available through
 `execute`.
 
 MGET returns None for both absent and non-string keys, as Redis specifies;

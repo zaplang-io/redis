@@ -1073,6 +1073,26 @@ struct KeyValue:
     bytes key
     bytes value
 
+# SET returns a status or the previous value, depending on GET.
+enum SetResult:
+    Written
+    Previous(bytes value)
+    Null
+
+    def is_written(self) -> bool:
+        match self:
+            case SetResult.Written:
+                return True
+            case _:
+                return False
+
+    def is_null(self) -> bool:
+        match self:
+            case SetResult.Null:
+                return True
+            case _:
+                return False
+
 # OBJECT's reply type depends on the selected metadata.
 enum ObjectInfo:
     Missing
@@ -1332,6 +1352,65 @@ def _integer_value(Reply reply) -> int64:
             return value
         case _:
             raise ProtocolError("Expected Redis integer reply")
+
+def _string_length(Reply reply) -> int64:
+    auto length = _integer_value(reply)
+    if length < 0:
+        raise ProtocolError("Redis string length must not be negative")
+    return length
+
+def _append_string_expiry(
+    list[bytes] args,
+    int64 ex,
+    int64 px,
+    int64 exat,
+    int64 pxat,
+    bytes flag,
+):
+    if ex < 0 or px < 0 or exat < 0 or pxat < 0:
+        raise ValueError("Redis string expiry values must not be negative")
+    auto start = len(args)
+    if ex > 0:
+        args.append(b"EX")
+        args.append(bytes(str(ex)))
+    if px > 0:
+        args.append(b"PX")
+        args.append(bytes(str(px)))
+    if exat > 0:
+        args.append(b"EXAT")
+        args.append(bytes(str(exat)))
+    if pxat > 0:
+        args.append(b"PXAT")
+        args.append(bytes(str(pxat)))
+    auto added = len(args) - start
+    if added > 2 or (added > 0 and len(flag) > 0):
+        raise ValueError("Redis string expiry options are mutually exclusive")
+    if len(flag) > 0:
+        args.append(flag)
+
+def _set_command(
+    bytes key,
+    bytes value,
+    bool nx,
+    bool xx,
+    int64 ex,
+    int64 px,
+    int64 exat,
+    int64 pxat,
+    bool keepttl,
+) -> list[bytes]:
+    if nx and xx:
+        raise ValueError("SET NX and XX are mutually exclusive")
+    list[bytes] args = [b"SET", key, value]
+    auto flag = b""
+    if keepttl:
+        flag = b"KEEPTTL"
+    _append_string_expiry(args, ex, px, exat, pxat, flag)
+    if nx:
+        args.append(b"NX")
+    if xx:
+        args.append(b"XX")
+    return args
 
 def _status_value(Reply reply, bytes expected) -> bool:
     match reply:
@@ -2566,38 +2645,64 @@ struct Connection:
 
     def set_value(
         self,
-        bytes key,
+        bytes name,
         bytes value,
-        bool nx = False,
-        bool xx = False,
         int64 ex = 0,
         int64 px = 0,
-    ) -> bool:
-        if nx and xx:
-            raise ValueError("SET NX and XX are mutually exclusive")
-        list[bytes] args = [b"SET", key, value]
-        if ex < 0 or px < 0:
-            raise ValueError("SET expiry durations must not be negative")
-        if ex > 0 and px > 0:
-            raise ValueError("SET EX and PX are mutually exclusive")
-        if ex > 0:
-            args.append(b"EX")
-            args.append(bytes(str(ex)))
-        if px > 0:
-            args.append(b"PX")
-            args.append(bytes(str(px)))
-        if nx:
-            args.append(b"NX")
-        if xx:
-            args.append(b"XX")
+        bool nx = False,
+        bool xx = False,
+        bool keepttl = False,
+        bool get = False,
+        int64 exat = 0,
+        int64 pxat = 0,
+    ) -> SetResult:
+        auto args = _set_command(name, value, nx, xx, ex, px, exat, pxat, keepttl)
+        if get:
+            args.append(b"GET")
         auto reply = self.execute(args)
         match reply:
             case Reply.NullBulk:
-                if nx or xx:
-                    return False
+                if get or nx or xx:
+                    return SetResult.Null
                 raise ProtocolError("Unexpected null SET reply")
             case _:
-                return _status_value(reply, b"OK")
+                if get:
+                    return SetResult.Previous(_required_bulk(reply))
+                _status_value(reply, b"OK")
+                return SetResult.Written
+
+    def getdel(self, bytes name) -> Optional[bytes]:
+        return _bulk_value(self.execute([b"GETDEL", name]))
+
+    def getex(
+        self,
+        bytes name,
+        int64 ex = 0,
+        int64 px = 0,
+        int64 exat = 0,
+        int64 pxat = 0,
+        bool persist = False,
+    ) -> Optional[bytes]:
+        list[bytes] args = [b"GETEX", name]
+        auto flag = b""
+        if persist:
+            flag = b"PERSIST"
+        _append_string_expiry(args, ex, px, exat, pxat, flag)
+        return _bulk_value(self.execute(args))
+
+    def setrange(self, bytes name, int64 offset, bytes value) -> int64:
+        if offset < 0:
+            raise ValueError("SETRANGE offset must not be negative")
+        return _string_length(self.execute([b"SETRANGE", name, bytes(str(offset)), value]))
+
+    def getrange(self, bytes key, int64 start, int64 end) -> bytes:
+        return _required_bulk(self.execute([b"GETRANGE", key, bytes(str(start)), bytes(str(end))]))
+
+    def append(self, bytes key, bytes value) -> int64:
+        return _string_length(self.execute([b"APPEND", key, value]))
+
+    def strlen(self, bytes name) -> int64:
+        return _string_length(self.execute([b"STRLEN", name]))
 
     def mget(self, list[bytes] keys) -> list[Optional[bytes]]:
         auto reply = self.execute(_keys_command(b"MGET", keys))

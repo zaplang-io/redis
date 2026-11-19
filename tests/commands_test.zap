@@ -252,6 +252,187 @@ def generic_key_commands():
     finally:
         conn.disconnect()
 
+def invalid_string_options(redis.Connection conn):
+    auto caught = 0
+    try:
+        conn.set_value(b"key", b"value", exat=-1)
+    except ValueError:
+        caught = caught + 1
+    try:
+        conn.set_value(b"key", b"value", pxat=-1)
+    except ValueError:
+        caught = caught + 1
+    try:
+        conn.set_value(b"key", b"value", ex=1, exat=2)
+    except ValueError:
+        caught = caught + 1
+    try:
+        conn.set_value(b"key", b"value", px=1, pxat=2)
+    except ValueError:
+        caught = caught + 1
+    try:
+        conn.set_value(b"key", b"value", exat=1, pxat=2)
+    except ValueError:
+        caught = caught + 1
+    try:
+        conn.set_value(b"key", b"value", pxat=1, keepttl=True)
+    except ValueError:
+        caught = caught + 1
+    try:
+        conn.getex(b"key", ex=-1)
+    except ValueError:
+        caught = caught + 1
+    try:
+        conn.getex(b"key", px=-1)
+    except ValueError:
+        caught = caught + 1
+    try:
+        conn.getex(b"key", exat=-1)
+    except ValueError:
+        caught = caught + 1
+    try:
+        conn.getex(b"key", pxat=-1)
+    except ValueError:
+        caught = caught + 1
+    try:
+        conn.getex(b"key", ex=1, pxat=2)
+    except ValueError:
+        caught = caught + 1
+    try:
+        conn.getex(b"key", exat=1, persist=True)
+    except ValueError:
+        caught = caught + 1
+    try:
+        conn.setrange(b"key", -1, b"value")
+    except ValueError:
+        caught = caught + 1
+    try:
+        conn.set_value(b"key", b"value", nx=True, xx=True, get=True)
+    except ValueError:
+        caught = caught + 1
+    try:
+        conn.set_value(b"key", b"value", ex=60, keepttl=True, get=True)
+    except ValueError:
+        caught = caught + 1
+    check(caught == 15, "extended string options reject invalid input before I/O")
+
+def invalid_string_replies(redis.Connection conn):
+    auto caught = 0
+    try:
+        conn.set_value(b"k", b"v", keepttl=True)
+    except redis.ProtocolError:
+        caught = caught + 1
+    try:
+        conn.getdel(b"k")
+    except redis.ProtocolError:
+        caught = caught + 1
+    try:
+        conn.getex(b"k")
+    except redis.ProtocolError:
+        caught = caught + 1
+    try:
+        conn.getrange(b"k", 0, -1)
+    except redis.ProtocolError:
+        caught = caught + 1
+    try:
+        conn.setrange(b"k", 0, b"v")
+    except redis.ProtocolError:
+        caught = caught + 1
+    try:
+        conn.append(b"k", b"v")
+    except redis.ProtocolError:
+        caught = caught + 1
+    try:
+        conn.strlen(b"k")
+    except redis.ProtocolError:
+        caught = caught + 1
+    try:
+        conn.set_value(b"k", b"v", get=True)
+    except redis.ProtocolError:
+        caught = caught + 1
+    check(
+        caught == 8 and conn.ping(),
+        "extended string commands reject malformed replies and preserve connection",
+    )
+
+def extended_strings():
+    auto key = bytes([255, 0, 13, 10])
+    auto data = bytes([0, 255, 13, 10])
+    auto bulk = b"$4\r\n" + data + b"\r\n"
+    list[Step] steps = [
+        Step([b"SET", key, data, b"EXAT", b"4294967296", b"XX"], b"+OK\r\n"),
+        Step([b"SET", key, data, b"PXAT", b"4294967296123", b"NX"], b"$-1\r\n"),
+        Step([b"SET", key, b"", b"KEEPTTL"], b"+OK\r\n"),
+        Step([b"SET", key, data, b"EX", b"60", b"NX", b"GET"], bulk),
+        Step([b"SET", key, data, b"KEEPTTL", b"XX", b"GET"], b"$0\r\n\r\n"),
+        Step([b"SET", key, data, b"GET"], b"$-1\r\n"),
+        Step([b"GETDEL", key], bulk),
+        Step([b"GETDEL", key], b"$-1\r\n"),
+        Step([b"GETEX", key], b"$0\r\n\r\n"),
+        Step([b"GETEX", key, b"EX", b"60"], bulk),
+        Step([b"GETEX", key, b"PX", b"60000"], bulk),
+        Step([b"GETEX", key, b"EXAT", b"4294967296"], bulk),
+        Step([b"GETEX", key, b"PXAT", b"4294967296123"], bulk),
+        Step([b"GETEX", key, b"PERSIST"], b"$-1\r\n"),
+        Step([b"SETRANGE", key, b"2", data], b":6\r\n"),
+        Step([b"GETRANGE", key, b"-4", b"-1"], bulk),
+        Step([b"APPEND", key, data], b":10\r\n"),
+        Step([b"STRLEN", key], b":10\r\n"),
+        Step([b"SET", b"k", b"v", b"KEEPTTL"], b"$-1\r\n"),
+        Step([b"GETDEL", b"k"], b":1\r\n"),
+        Step([b"GETEX", b"k"], b"+OK\r\n"),
+        Step([b"GETRANGE", b"k", b"0", b"-1"], b"$-1\r\n"),
+        Step([b"SETRANGE", b"k", b"0", b"v"], b":-1\r\n"),
+        Step([b"APPEND", b"k", b"v"], b":-1\r\n"),
+        Step([b"STRLEN", b"k"], b":-1\r\n"),
+        Step([b"SET", b"k", b"v", b"GET"], b"+OK\r\n"),
+        Step([b"PING"], b"+PONG\r\n"),
+    ]
+    auto listener = net.listen("127.0.0.1", 0)
+    spawn server(listener, steps)
+    auto conn = redis.connect(port=net.port(listener), command_timeout_ms=1000)
+    try:
+        invalid_string_options(conn)
+        check(
+            conn.set_value(key, data, exat=4294967296, xx=True).is_written(),
+            "SET EXAT XX",
+        )
+        check(
+            conn.set_value(key, data, pxat=4294967296123, nx=True).is_null(),
+            "SET PXAT NX",
+        )
+        check(
+            conn.set_value(key, b"", keepttl=True).is_written(),
+            "SET KEEPTTL with empty value",
+        )
+        # Positional options follow redis-py: EX, PX, NX, XX, KEEPTTL, GET.
+        match conn.set_value(key, data, 60, 0, True, False, False, True):
+            case redis.SetResult.Previous(value):
+                check(value == data, "SET EX NX GET returns binary value")
+            case _:
+                raise ValueError("expected SET previous value")
+        match conn.set_value(name=key, value=data, xx=True, keepttl=True, get=True):
+            case redis.SetResult.Previous(value):
+                check(value == b"", "SET XX KEEPTTL GET returns present empty value")
+            case _:
+                raise ValueError("expected SET previous empty value")
+        check(conn.set_value(key, data, get=True).is_null(), "SET GET null")
+        check(conn.getdel(key).unwrap() == data, "GETDEL binary bytes")
+        check(conn.getdel(key).is_none(), "GETDEL null")
+        check(conn.getex(key).unwrap() == b"", "GETEX empty")
+        check(conn.getex(key, ex=60).unwrap() == data, "GETEX EX")
+        check(conn.getex(key, px=60000).unwrap() == data, "GETEX PX")
+        check(conn.getex(key, exat=4294967296).unwrap() == data, "GETEX EXAT")
+        check(conn.getex(key, pxat=4294967296123).unwrap() == data, "GETEX PXAT")
+        check(conn.getex(key, persist=True).is_none(), "GETEX PERSIST null")
+        check(conn.setrange(key, 2, data) == 6, "SETRANGE")
+        check(conn.getrange(key, -4, -1) == data, "GETRANGE")
+        check(conn.append(key, data) == 10, "APPEND")
+        check(conn.strlen(key) == 10, "STRLEN")
+        invalid_string_replies(conn)
+    finally:
+        conn.disconnect()
+
 def main():
     list[Step] steps = [
         Step([b"PING"], b"+PONG\r\n"),
@@ -289,8 +470,8 @@ def main():
         check(conn.ping(), "ping")
         check(conn.get(b"k").is_none(), "missing")
         check(conn.get(b"k").unwrap() == b"", "empty")
-        check(conn.set_value(b"k", b"v", nx=True, ex=60), "SET EX NX")
-        check(not conn.set_value(b"k", b"v", xx=True, px=1000), "SET PX XX")
+        check(conn.set_value(b"k", b"v", nx=True, ex=60).is_written(), "SET EX NX")
+        check(conn.set_value(b"k", b"v", xx=True, px=1000).is_null(), "SET PX XX")
         auto values = conn.mget([b"a", b"b"])
         check(values[0].unwrap() == b"v" and values[1].is_none(), "MGET")
         check(
@@ -338,4 +519,5 @@ def main():
     finally:
         conn.disconnect()
     generic_key_commands()
+    extended_strings()
     print("Typed command wire and validation: PASS")
