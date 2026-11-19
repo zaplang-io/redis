@@ -1073,6 +1073,13 @@ struct KeyValue:
     bytes key
     bytes value
 
+# OBJECT's reply type depends on the selected metadata.
+enum ObjectInfo:
+    Missing
+    Encoding(bytes name)
+    Refcount(int64 count)
+    IdleTime(int64 seconds)
+
 # Redis server blocking timeouts are seconds, independent of client deadlines.
 # Zero means wait indefinitely at Redis; reject non-finite/negative values before
 # encoding or acquiring the connection. Keep sub-second precision on the wire.
@@ -2630,6 +2637,92 @@ struct Connection:
             case _:
                 raise ProtocolError("Expected TYPE status reply")
 
+    def rename(self, bytes src, bytes dst) -> bool:
+        return _status_value(self.execute([b"RENAME", src, dst]), b"OK")
+
+    def renamenx(self, bytes src, bytes dst) -> bool:
+        return _boolean_value(self.execute([b"RENAMENX", src, dst]))
+
+    def copy(
+        self,
+        bytes source,
+        bytes destination,
+        int64 destination_db = -1,
+        bool replace = False,
+    ) -> bool:
+        if destination_db < -1 or destination_db > 2147483647:
+            raise ValueError("COPY destination_db must be -1 or a non-negative int32")
+        list[bytes] args = [b"COPY", source, destination]
+        if destination_db >= 0:
+            args.append(b"DB")
+            args.append(bytes(str(destination_db)))
+        if replace:
+            args.append(b"REPLACE")
+        return _boolean_value(self.execute(args))
+
+    # Redis scans the whole database for KEYS. Use scan() for production traversal.
+    def keys(self, bytes pattern = b"*") -> list[bytes]:
+        return _bulk_array(self.execute([b"KEYS", pattern]))
+
+    def randomkey(self) -> Optional[bytes]:
+        return _bulk_value(self.execute([b"RANDOMKEY"]))
+
+    def touch(self, list[bytes] keys) -> int64:
+        auto count = _integer_value(self.execute(_keys_command(b"TOUCH", keys)))
+        if count < 0 or count > len(keys):
+            raise ProtocolError("Invalid Redis TOUCH count")
+        return count
+
+    def dump(self, bytes name) -> Optional[bytes]:
+        return _bulk_value(self.execute([b"DUMP", name]))
+
+    def restore(
+        self,
+        bytes name,
+        int64 ttl,
+        bytes value,
+        bool replace = False,
+        bool absttl = False,
+        int64 idletime = -1,
+        int64 frequency = -1,
+    ) -> bool:
+        if ttl < 0:
+            raise ValueError("RESTORE ttl must not be negative")
+        if idletime < -1 or frequency < -1 or frequency > 255:
+            raise ValueError("RESTORE idletime or frequency is out of range")
+        if idletime >= 0 and frequency >= 0:
+            raise ValueError("RESTORE IDLETIME and FREQ are mutually exclusive")
+        list[bytes] args = [b"RESTORE", name, bytes(str(ttl)), value]
+        if replace:
+            args.append(b"REPLACE")
+        if absttl:
+            args.append(b"ABSTTL")
+        if idletime >= 0:
+            args.append(b"IDLETIME")
+            args.append(bytes(str(idletime)))
+        if frequency >= 0:
+            args.append(b"FREQ")
+            args.append(bytes(str(frequency)))
+        return _status_value(self.execute(args), b"OK")
+
+    def object(self, str infotype, bytes key) -> ObjectInfo:
+        auto kind = infotype.upper()
+        if kind != "ENCODING" and kind != "REFCOUNT" and kind != "IDLETIME":
+            raise ValueError("OBJECT requires ENCODING, REFCOUNT, or IDLETIME")
+        auto reply = self.execute([b"OBJECT", bytes(kind), key])
+        match reply:
+            case Reply.NullBulk:
+                return ObjectInfo.Missing
+            case _:
+                if kind == "ENCODING":
+                    return ObjectInfo.Encoding(_required_bulk(reply))
+                auto value = _integer_value(reply)
+                if value < 0:
+                    raise ProtocolError("Redis OBJECT count or idle time is negative")
+                if kind == "REFCOUNT":
+                    return ObjectInfo.Refcount(value)
+                return ObjectInfo.IdleTime(value)
+
     def incr(self, bytes key) -> int64:
         return _integer_value(self.execute([b"INCR", key]))
 
@@ -2647,6 +2740,63 @@ struct Connection:
 
     def pexpire(self, bytes key, int64 milliseconds) -> bool:
         return _boolean_value(self.execute([b"PEXPIRE", key, bytes(str(milliseconds))]))
+
+    def _expire_at(
+        self,
+        bytes command,
+        bytes name,
+        int64 time,
+        bool nx,
+        bool xx,
+        bool gt,
+        bool lt,
+    ) -> bool:
+        if nx and (xx or gt or lt) or gt and lt:
+            raise ValueError("Invalid Redis expiry condition combination")
+        list[bytes] args = [command, name, bytes(str(time))]
+        if nx:
+            args.append(b"NX")
+        if xx:
+            args.append(b"XX")
+        if gt:
+            args.append(b"GT")
+        if lt:
+            args.append(b"LT")
+        return _boolean_value(self.execute(args))
+
+    def expireat(
+        self,
+        bytes name,
+        int64 time,
+        bool nx = False,
+        bool xx = False,
+        bool gt = False,
+        bool lt = False,
+    ) -> bool:
+        return self._expire_at(b"EXPIREAT", name, time, nx, xx, gt, lt)
+
+    def pexpireat(
+        self,
+        bytes name,
+        int64 time,
+        bool nx = False,
+        bool xx = False,
+        bool gt = False,
+        bool lt = False,
+    ) -> bool:
+        return self._expire_at(b"PEXPIREAT", name, time, nx, xx, gt, lt)
+
+    def _expire_time(self, bytes command, bytes name) -> int64:
+        auto timestamp = _integer_value(self.execute([command, name]))
+        if timestamp < -2:
+            raise ProtocolError("Invalid Redis expiry timestamp")
+        return timestamp
+
+    def expiretime(self, bytes name) -> int64:
+        return self._expire_time(b"EXPIRETIME", name)
+
+    def pexpiretime(self, bytes name) -> int64:
+        return self._expire_time(b"PEXPIRETIME", name)
 
     def ttl(self, bytes key) -> int64:
         return _integer_value(self.execute([b"TTL", key]))

@@ -24,7 +24,8 @@ The image pins a working toolchain rather than promising compatibility with ever
 Zap compiler revision. Public APIs may evolve before a stable release; consult
 the changelog when upgrading and commit application `zap.lock` files.
 
-The implemented subset includes key/string/counter/expiry, hashes, non-blocking
+The implemented subset includes key/string/counter/expiry, generic key copy,
+rename, DUMP/RESTORE, and metadata, hashes, non-blocking
 and blocking lists, sets, sorted sets, cursor pages, scripts, pipelines,
 transactions, pools, dedicated Pub/Sub, Streams consumer groups, explicit
 RESP3 connections, Sentinel primary discovery and Redis Cluster slot routing
