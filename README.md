@@ -321,7 +321,7 @@ registered keys in finally cleanup, and set a 60-second fallback TTL. They do
 not flush or enumerate the database.
 
 For a **disposable, isolated** instance with administrative ACL permissions and
-at least two databases, also run the session suite:
+at least two databases, also run the isolated session and generic-key cases:
 
 ```sh
 REDIS_TEST_URL=redis://127.0.0.1:6379/0 ZAP=/path/to/zap \
@@ -332,11 +332,14 @@ That explicit mode tests database isolation and reconnect, creates a randomly
 named ACL user limited to the test namespace and required commands, checks good
 and bad authentication and client-name restoration, and removes the user and
 keys during cleanup. It never changes the default user or global server config.
+The isolated run also covers namespace-scoped `KEYS`, `RANDOMKEY`,
+cross-database `COPY`, and the default eviction policy's idle-time metadata.
+
 CI supplies a fresh service container per matrix job. Readiness is gated by
 `redis-cli ping` health checks; tests have no startup sleeps. Destroying the
 service container also removes any state left after a forcibly terminated job.
 
-`tools/run-integration-tests.sh --check` validates both live suites without a
+`tools/run-integration-tests.sh --check` validates the live suites without a
 server or endpoint. Reusable setup/assertion/cleanup helpers live in
 `tests/integration/integration_fixtures.zap`; add future live suites under that
 directory with a matching `.expected` output file. Any suite that mutates ACLs
@@ -462,8 +465,9 @@ NX and XX conflict, EX and PX conflict, and negative SET expiry durations are re
 a positive value sends EX or PX.
 Invalid combinations and empty multi-key/pair lists raise `ValueError` before
 network I/O. EXPIRE/PEXPIRE retain Redis semantics: zero or negative durations
-delete existing keys immediately. SET GET, KEEPTTL, absolute expirations, and
-conditional EXPIRE flags remain available through `execute`.
+delete existing keys immediately. SET GET, KEEPTTL, the SET EXAT/PXAT
+options, and conditional flags for relative expiry remain available through
+`execute`.
 
 MGET returns None for both absent and non-string keys, as Redis specifies;
 GET on a non-string key raises `ResponseError`. MSET accepts a nonempty ordered
@@ -480,6 +484,45 @@ above. Helpers inherit the connection's single-owner contract.
 References: [SET](https://redis.io/docs/latest/commands/set/),
 [MGET](https://redis.io/docs/latest/commands/mget/),
 [TTL](https://redis.io/docs/latest/commands/ttl/).
+
+### Generic key-space methods
+
+| Method | Result |
+| --- | --- |
+| `rename(src, dst)` | `bool` for OK. Replaces the destination and preserves the source expiry. Redis raises `ResponseError` for a missing source. |
+| `renamenx(src, dst)` | `bool`. False if the destination already exists. |
+| `copy(source, destination, destination_db=-1, replace=False)` | `bool`. False when the source is missing or an existing destination prevents copying. The default uses the current database. |
+| `keys(pattern=b"*")` | `list[bytes]` matching a binary Redis glob, in server order. |
+| `randomkey()` | `Optional[bytes]`. None if the selected database is empty. |
+| `touch(keys)` | `int64` count of existing keys touched. Repeated keys count repeatedly. Requires a nonempty list. |
+| `dump(name)` | `Optional[bytes]` containing the opaque Redis serialization, or None for a missing key. |
+| `restore(name, ttl, value, replace=False, absttl=False, idletime=-1, frequency=-1)` | `bool` for OK. Redis validates the serialized payload and reports collisions or corrupt data as `ResponseError`. |
+| `expireat(name, time, nx=False, xx=False, gt=False, lt=False)`, `pexpireat(...)` | `bool` when the absolute expiration was applied. Pass Unix seconds or milliseconds respectively. |
+| `expiretime(name)`, `pexpiretime(name)` | `int64` Unix seconds or milliseconds, respectively. Both return -1 for persistent keys and -2 for missing keys. |
+| `object(infotype, key)` | `redis.ObjectInfo.Encoding(bytes)`, `.Refcount(int64)`, `.IdleTime(int64)`, or `.Missing`. The selector is case-insensitive. |
+
+Use [SCAN pages](#cursor-based-scan-pages) for production traversal. Redis
+scans the whole selected database for KEYS, even with a narrow pattern.
+
+RESTORE uses a millisecond TTL. Zero creates a persistent key. With
+`absttl=True`, a nonzero TTL is an absolute Unix timestamp in milliseconds.
+`idletime` is in seconds, `frequency` must be 0–255, and -1 omits either
+option. Supply at most one eviction metadata option. Redis's eviction policy
+determines which metadata applies. OBJECT IDLETIME can fail under LFU.
+
+For absolute expiration, NX requires a persistent key. XX requires an existing
+expiry. GT and LT compare with the previous expiry and may each be combined
+with XX. NX conflicts with the other flags, and GT conflicts with LT. A past
+expiry deletes the key if the condition is satisfied.
+
+```zap
+auto snapshot = conn.dump(b"source")
+match snapshot:
+    case Optional.Some(payload):
+        conn.restore(b"restored", 60000, payload, replace=True)
+    case _:
+        print("source key is missing")
+```
 
 ## Typed hash commands
 
