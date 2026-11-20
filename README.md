@@ -814,6 +814,37 @@ References [SMISMEMBER](https://redis.io/docs/latest/commands/smismember/),
 [SRANDMEMBER](https://redis.io/docs/latest/commands/srandmember/), and
 [SPOP](https://redis.io/docs/latest/commands/spop/).
 
+## HyperLogLog commands
+
+These methods accept byte keys and binary elements:
+
+| Method | Result |
+| --- | --- |
+| `pfadd(name, values=[])` | `int64`, one if Redis creates the sketch or changes a register, zero otherwise |
+| `pfcount(sources)` | `int64` estimate of the distinct elements across one or more sketches |
+| `pfmerge(dest, sources=[])` | `bool`, true when Redis acknowledges the merge |
+
+```zap
+conn.pfadd(b"visitors:today", [b"alice", b"bob"])
+conn.pfadd(b"visitors:yesterday", [b"bob", b"carol"])
+auto estimate = conn.pfcount([b"visitors:today", b"visitors:yesterday"])
+conn.pfmerge(b"visitors:rolling", [b"visitors:today", b"visitors:yesterday"])
+```
+
+Redis reports a standard error of 0.81% for HyperLogLog estimates.
+PFADD's return value describes a register update or creation. Use PFCOUNT
+for a count estimate. PFADD without elements creates an empty sketch if
+the key is missing. PFCOUNT requires at least one key and treats missing
+keys as empty sketches. A multi-key count estimates the union, so overlap
+and duplicate keys do not add to the result. PFMERGE includes an existing
+destination in the union and creates an empty sketch when all keys are
+missing. A string that does not contain a valid HyperLogLog can raise
+`ResponseError`, as can a key of the wrong Redis type.
+
+References [PFADD](https://redis.io/docs/latest/commands/pfadd/),
+[PFCOUNT](https://redis.io/docs/latest/commands/pfcount/),
+and [PFMERGE](https://redis.io/docs/latest/commands/pfmerge/).
+
 ## Sorted-set commands
 
 Sorted-set keys and members are binary `bytes`. `redis.ScoredMember(member,
