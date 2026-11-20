@@ -845,6 +845,62 @@ References [PFADD](https://redis.io/docs/latest/commands/pfadd/),
 [PFCOUNT](https://redis.io/docs/latest/commands/pfcount/),
 and [PFMERGE](https://redis.io/docs/latest/commands/pfmerge/).
 
+## Geospatial commands
+
+| Method | Result |
+| --- | --- |
+| `geoadd(name, values, nx=False, xx=False, ch=False)` | Added members, or added and updated members with CH |
+| `geodist(name, place1, place2, unit="")` | `Optional[float64]` distance, with meters as the default |
+| `geopos(name, values)` | `list[Optional[GeoPosition]]` in request order |
+| `geohash(name, values)` | `list[Optional[bytes]]` of geohash strings in request order |
+| `geosearch(name, ...)` | `GeoSearchResult.Members` or `GeoSearchResult.Hits` |
+| `geosearchstore(dest, name, ...)` | Number of members stored |
+
+Keys and members are bytes. Each GEOADD entry is a
+`redis.GeoEntry(longitude, latitude, member)`. Redis accepts longitudes
+from -180 through 180 and latitudes from -85.05112878 through 85.05112878.
+GEOPOS uses longitude followed by latitude. Missing members have a None
+slot in GEOPOS and GEOHASH, including when the input has repeated members.
+Coordinates are quantized by Redis, so retrieved positions can differ
+slightly from the values supplied to GEOADD.
+
+```zap
+conn.geoadd(b"places", [
+    redis.GeoEntry(13.361389, 38.115556, b"Palermo"),
+    redis.GeoEntry(15.087269, 37.502669, b"Catania"),
+])
+auto nearby = conn.geosearch(
+    b"places", member=Optional.Some(b"Palermo"),
+    unit="km", radius=Optional.Some(200.0), sort="ASC", withdist=True,
+)
+match nearby:
+    case redis.GeoSearchResult.Hits(hits):
+        for hit in hits:
+            print(hit.member, hit.distance.unwrap())
+    case redis.GeoSearchResult.Members(members):
+        print(len(members))
+```
+
+Supply either `member` or both `longitude` and `latitude` for the origin,
+and either `radius` or both `width` and `height` for the shape. Wrap supplied
+values with `Optional.Some`. The units are `m`, `km`, `mi`, and `ft`.
+Use `sort="ASC"` or `"DESC"` for ordering by distance. A positive `count`
+limits the result, and `any=True` with a count lets Redis stop when it
+finds enough matches.
+
+GEOSEARCH without WITH flags returns `Members(list[bytes])`. With flags it
+returns `Hits(list[GeoHit])`. Each hit includes the member and optional
+`distance` in the chosen unit, integer `hash` from WITHHASH, and
+`position` from WITHCOORD. The raw integer hash is the internal geo
+score. GEOHASH returns the textual hash.
+
+GEOSEARCHSTORE takes the same origin, shape, unit, sort, and count options.
+It overwrites the destination with the matching indices, or removes the
+destination when there are no matches. Use `storedist=True` to store the
+distances as sorted-set scores in the requested unit.
+
+[Redis geospatial command reference](https://redis.io/docs/latest/develop/data-types/geospatial/)
+
 ## Sorted-set commands
 
 Sorted-set keys and members are binary `bytes`. `redis.ScoredMember(member,

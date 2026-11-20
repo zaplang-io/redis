@@ -75,3 +75,16 @@ Variable-length elements and source keys use `list[bytes]` in Zap. PFADD
 and PFMERGE default to an empty list, preserving their key-only forms.
 PFCOUNT requires a nonempty list. PFADD returns the integer register
 update flag, PFCOUNT the integer estimate, and PFMERGE its success status.
+
+## Geospatial inputs and results
+
+Issue [#63](https://github.com/zaplang-io/redis/issues/63) follows
+[redis-py's geospatial methods and option names](https://redis.readthedocs.io/en/stable/commands.html).
+GEOADD uses a list of `GeoEntry` records to type each longitude, latitude,
+and binary member. GEOPOS and GEOHASH keep a nullable slot for each member
+in a typed input list. The search origin, shape, and count options use
+`Optional` so that zero and empty member bytes remain valid inputs.
+
+`GeoSearchResult.Members` carries the plain member list. When a WITH flag is
+requested, `GeoSearchResult.Hits` carries typed records with optional
+distance, raw hash, and position fields.
