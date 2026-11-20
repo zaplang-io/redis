@@ -4,19 +4,19 @@ import integration_fixtures
 def check(bool ok, str label):
     integration_fixtures.check(ok, label)
 
-def shard_ack(redis.PubSub session, bytes channel, int64 expected):
+def shard_ack(redis.PubSub session, bytes wanted, int64 expected):
     match session.next_event():
         case redis.PubSubEvent.ShardSubscribed(topic, count):
-            check(topic == channel and count == expected, "shard subscribe acknowledgement")
+            check(topic == wanted and count == expected, "shard subscribe acknowledgement")
         case _:
             raise ValueError("Expected shard subscription")
 
-def shard_unsub(redis.PubSub session, Optional[bytes] channel, int64 expected):
+def shard_unsub(redis.PubSub session, Optional[bytes] wanted, int64 expected):
     match session.next_event():
         case redis.PubSubEvent.ShardUnsubscribed(topic, count):
-            check(topic.is_some() == channel.is_some() and count == expected, "shard unsubscribe count and optional topic")
-            if channel.is_some():
-                check(topic.unwrap() == channel.unwrap(), "shard unsubscribe topic")
+            check(topic.is_some() == wanted.is_some() and count == expected, "shard unsubscribe count and optional topic")
+            if wanted.is_some():
+                check(topic.unwrap() == wanted.unwrap(), "shard unsubscribe topic")
         case _:
             raise ValueError("Expected shard unsubscription")
 
@@ -45,7 +45,7 @@ def exercise(redis.Connection publisher, redis.Connection subscriber, bytes firs
         shard_ack(session, second, 2)
         check(session.subscription_count() == 3, "duplicate subscription does not inflate count")
         check(publisher.publish(first, b"plain") == 1, "ordinary publish recipients")
-        check(publisher.spublish(channel=first, message=payload) == 1, "shard publish recipients")
+        check(publisher.spublish(topic=first, message=payload) == 1, "shard publish recipients")
         match session.next_event():
             case redis.PubSubEvent.Message(topic, value):
                 check(topic == first and value == b"plain", "ordinary and shard messages are distinct")
@@ -86,8 +86,8 @@ def lease_publish(integration_fixtures.Fixture f):
             shard_ack(sharded, topic, 1)
             check(publisher.spublish(topic, b"") == 1, "publish through ordinary pool lease")
             match sharded.next_event():
-                case redis.PubSubEvent.ShardMessage(channel, payload):
-                    check(channel == topic and payload == b"", "lease shard payload")
+                case redis.PubSubEvent.ShardMessage(received_topic, payload):
+                    check(received_topic == topic and payload == b"", "lease shard payload")
                 case _:
                     raise ValueError("Expected shard message")
         finally:

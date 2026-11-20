@@ -101,7 +101,7 @@ remains synchronous and unbounded.
 
 ## Cluster shard subscriptions
 
-`cluster.spublish(channel, message)` routes by the shard channel's slot using
+`cluster.spublish(topic, message)` routes by the shard channel's slot using
 the regular command connection cache. `cluster.ssubscribe(channels)` requires
 a nonempty list whose channels all hash to the same slot. It opens a dedicated
 socket at the slot owner and completes initial routing before returning.

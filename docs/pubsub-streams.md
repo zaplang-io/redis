@@ -65,7 +65,7 @@ integer recipient count, including zero; an ordinary lease may publish.
 `ssubscribe(channels)` takes a nonempty binary channel list.
 `sunsubscribe()` removes all shard subscriptions, and takes an optional
 channel list for specific unsubscribes. Shard channels have their own
-acknowledgements and messages on RESP2 and RESP3. `spublish(channel, message)`
+acknowledgements and messages on RESP2 and RESP3. `spublish(topic, message)`
 returns the number of clients Redis reports receiving the shard message.
 
 ## Backpressure, cancellation, and shutdown

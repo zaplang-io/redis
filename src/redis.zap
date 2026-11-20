@@ -3623,9 +3623,9 @@ struct Connection:
             raise ProtocolError("Negative PUBLISH recipient count")
         return count
 
-    def spublish(self, bytes channel, bytes message) -> int64:
+    def spublish(self, bytes topic, bytes message) -> int64:
         """Publish a message to a shard channel and return its receiver count."""
-        return _pubsub_count(self.execute([b"SPUBLISH", channel, message]))
+        return _pubsub_count(self.execute([b"SPUBLISH", topic, message]))
 
     def transaction(self) -> Transaction:
         if not self._state.compare_and_swap(0, 1):
@@ -6055,9 +6055,9 @@ struct ClusterClient:
         self._connections.append(connection)
         return self._connections[len(self._connections) - 1]
 
-    def spublish(self, bytes channel, bytes message) -> int64:
+    def spublish(self, bytes topic, bytes message) -> int64:
         """Publish using the shard channel's slot and existing redirect handling."""
-        return _pubsub_count(self.execute_for(channel, [b"SPUBLISH", channel, message]))
+        return _pubsub_count(self.execute_for(topic, [b"SPUBLISH", topic, message]))
 
     def ssubscribe(self, list[bytes] channels) -> PubSub:
         """Open an owned Pub/Sub session on the slot for all supplied channels."""
@@ -6436,10 +6436,10 @@ struct Lease:
         finally:
             self._guard.store(0)
 
-    def spublish(self, bytes channel, bytes message) -> int64:
+    def spublish(self, bytes topic, bytes message) -> int64:
         self._enter()
         try:
-            return self._connection.spublish(channel, message)
+            return self._connection.spublish(topic, message)
         finally:
             self._guard.store(0)
 

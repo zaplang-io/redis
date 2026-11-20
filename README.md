@@ -1209,10 +1209,10 @@ connected server. Call it only when clearing that server is intentional.
 Use `sub.ssubscribe(channels)` and `sub.sunsubscribe(channels=[])` on a
 dedicated Pub/Sub session. Read `ShardSubscribed`, `ShardUnsubscribed`,
 and `ShardMessage` events with `next_event()`. Publish through a separate
-connection or lease with `spublish(channel, message)`.
+connection or lease with `spublish(topic, message)`.
 
 Cluster clients expose `cluster.ssubscribe(channels)` and
-`cluster.spublish(channel, message)`. The returned subscription owns a
+`cluster.spublish(topic, message)`. The returned subscription owns a
 separate socket. Read its first acknowledgement with `next_event()` and
 disconnect that session when finished. Use channels with matching hash
 tags for one session. [Cluster shard routing](docs/high-availability.md)
