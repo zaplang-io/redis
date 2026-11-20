@@ -1110,6 +1110,50 @@ metadata. `xinfo_stream(full=True)` includes entries and pending details.
 See [API, delivery/backpressure, ID, timeout, and shutdown semantics](docs/pubsub-streams.md)
 and the [complete installed-package example](examples/pubsub_streams.zap).
 
+## Server administration
+
+| Methods | Result |
+| --- | --- |
+| `info(section=b"", sections=[])` | `ServerInfo` containing ordered `InfoSection` and `InfoField` records |
+| `config_get(pattern=b"*", patterns=[])` | Matching configuration names and values as `list[KeyValue]` |
+| `config_set(name, value, additional=[])`, `config_resetstat()` | True on Redis OK |
+| `dbsize()` | Number of keys in the selected database |
+| `flushdb(asynchronous=False)`, `flushall(asynchronous=False)` | True on Redis OK |
+| `client_id()`, `client_getname()`, `client_setname(name)` | Numeric connection ID, optional binary name, and name-change status |
+| `client_list(_type=b"", client_id=[])` | `list[ClientInfo]` with IDs and ordered binary fields |
+| `client_kill(address)`, `client_kill_filter(...)` | Status for the legacy address form and match count for the filter form |
+| `client_no_evict(mode)` | True on Redis OK for ON or OFF on the current connection |
+| `slowlog_get(num=None)`, `slowlog_reset()` | Ordered `SlowLogEntry` records and reset status |
+| `memory_usage(key, samples=None)` | Estimated bytes as `Optional[int64]`, None for an absent key |
+| `command_count()`, `command_docs(names=[])` | Command count and named documentation records |
+
+INFO values are tagged as `InfoValue.Integer`, `.Decimal`, `.Text`, or
+`.Attributes`. Text and compound attribute values remain bytes. Unknown
+section and field names remain available, and integers outside signed
+64-bit range stay exact as text. COMMAND DOCS preserves heterogeneous field
+values as `Reply`. Slow log entries include client address and name when
+supplied by Redis, and the original argument count on Redis 8.10+.
+
+**FLUSHDB deletes all keys in the currently selected database. FLUSHALL
+deletes all keys in every database on the connected server.** Both use
+explicit SYNC by default. `asynchronous=True` requests ASYNC, which makes
+the affected keys inaccessible while Redis reclaims memory in the
+background. Confirm which server and database the connection targets
+before calling either method.
+
+CONFIG SET changes live server configuration. CONFIG RESETSTAT and
+SLOWLOG RESET affect server-wide state. CLIENT KILL disconnects connections
+matching the supplied address or filters. Prefer a known client ID for
+targeted disconnects. These commands require the corresponding Redis ACL
+permissions. CLIENT SETNAME and NO-EVICT apply to the active session.
+A reconnect uses the original connection options.
+
+The `--disposable-admin` integration flag enables global reset and flush
+cases plus DEBUG SLEEP. Use it only with a dedicated disposable Redis
+instance with two empty databases, administrative access, and DEBUG
+enabled at startup. Regular integration runs exercise the read-only and
+connection-local admin cases.
+
 ## Lua scripts
 
 `eval(source, keys, arguments)` and `evalsha(sha, keys, arguments)` return raw

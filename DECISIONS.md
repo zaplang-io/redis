@@ -102,3 +102,13 @@ XCLAIM uses a tagged value for entries or JUSTID results. XAUTOCLAIM
 retains the continuation and deleted IDs in both modes and exposes JUSTID
 values in its new `ids` field. XINFO metadata uses typed records and
 ignores unknown fields. Stream IDs and group and consumer names remain bytes.
+
+## Server administration results
+
+Issue [#65](https://github.com/zaplang-io/redis/issues/65) follows
+[redis-py's administration method names and option shapes](https://redis.readthedocs.io/en/stable/commands.html).
+INFO keeps ordered sections and tags numeric, text, and compound values.
+CONFIG and CLIENT metadata use ordered byte pairs. COMMAND DOCS exposes
+named fields with their Redis reply types. The `asynchronous` option on
+FLUSHDB and FLUSHALL selects ASYNC when true and explicit SYNC when false.
+DEBUG SLEEP is used only in the disposable integration fixture.
