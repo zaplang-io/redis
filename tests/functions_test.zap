@@ -98,7 +98,7 @@ def errors(redis.Connection conn):
 
 def main():
     auto binary = bytes([255, 0, 13, 10])
-    auto read = reply_array([bulk(b"name"), bulk(b"read"), bulk(b"description"), b"$-1\r\n", bulk(b"flags"), reply_array([bulk(b"no-writes")])])
+    auto read = reply_array([bulk(b"name"), bulk(b"read"), bulk(b"description"), b"$-1\r\n", bulk(b"flags"), reply_array([b"+no-writes\r\n"])])
     auto write = reply_array([bulk(b"name"), bulk(b"write"), bulk(b"description"), bulk(b""), bulk(b"flags"), b"*0\r\n"])
     auto libraries = reply_array([reply_array([bulk(b"engine"), bulk(b"LUA"), bulk(b"library_name"), bulk(b"fixture"), bulk(b"functions"), reply_array([read, write]), bulk(b"library_code"), bulk(binary)])])
     auto stats = reply_array([bulk(b"LUA"), reply_array([bulk(b"libraries_count"), b":2\r\n", bulk(b"functions_count"), b":3\r\n"])])

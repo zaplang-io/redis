@@ -2321,12 +2321,26 @@ struct FunctionStats:
 def _function_fields(Reply reply) -> _ReplyFields:
     return _ReplyFields(_reply_pairs(reply), "FUNCTION")
 
+def _function_flags(Reply reply) -> list[bytes]:
+    list[bytes] flags = []
+    match reply:
+        case Reply.Array(items):
+            for item in items:
+                match item:
+                    case Reply.Simple(data):
+                        flags.append(data)
+                    case _:
+                        raise ProtocolError("Expected FUNCTION flag simple string")
+            return flags
+        case _:
+            raise ProtocolError("Expected FUNCTION flags collection")
+
 def _function_info(Reply reply) -> FunctionInfo:
     auto fields = _function_fields(reply)
     return FunctionInfo(
         _required_bulk(fields.get(b"name")),
         _bulk_value(fields.get(b"description")),
-        _bulk_array(fields.get(b"flags")),
+        _function_flags(fields.get(b"flags")),
     )
 
 def _function_libraries(Reply reply) -> list[FunctionLibrary]:
