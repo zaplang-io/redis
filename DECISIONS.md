@@ -66,3 +66,12 @@ indexes. Zap reserves `set`, so the builder uses `set_value` for SET.
 The builder is bound to a connection and key, queues ordered operations,
 and resets after execution. Its result uses `Optional[int64]` for each
 slot so a FAIL overflow remains distinct from zero.
+
+## HyperLogLog argument lists
+
+Issue [#62](https://github.com/zaplang-io/redis/issues/62) follows
+[redis-py's HyperLogLog method names and argument order](https://redis.readthedocs.io/en/stable/commands.html).
+Variable-length elements and source keys use `list[bytes]` in Zap. PFADD
+and PFMERGE default to an empty list, preserving their key-only forms.
+PFCOUNT requires a nonempty list. PFADD returns the integer register
+update flag, PFCOUNT the integer estimate, and PFMERGE its success status.

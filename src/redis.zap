@@ -1617,6 +1617,12 @@ def _integer_value(Reply reply) -> int64:
         case _:
             raise ProtocolError("Expected Redis integer reply")
 
+def _zero_or_one(Reply reply) -> int64:
+    auto bit = _integer_value(reply)
+    if bit != 0 and bit != 1:
+        raise ProtocolError("Expected Redis zero or one reply")
+    return bit
+
 def _string_length(Reply reply) -> int64:
     auto length = _integer_value(reply)
     if length < 0:
@@ -1632,12 +1638,6 @@ def _bitmap_offset(int64 offset) -> bytes:
     if offset < 0 or offset >= 4294967296:
         raise ValueError("Redis bitmap offset must be in 0..4294967295")
     return bytes(str(offset))
-
-def _bitmap_reply_bit(Reply reply) -> int64:
-    auto bit = _integer_value(reply)
-    if bit != 0 and bit != 1:
-        raise ProtocolError("Expected Redis bitmap reply of zero or one")
-    return bit
 
 def _append_bitmap_range(
     list[bytes] args,
@@ -1722,10 +1722,7 @@ def _status_value(Reply reply, bytes expected) -> bool:
     raise ProtocolError("Unexpected Redis status value")
 
 def _boolean_value(Reply reply) -> bool:
-    auto value = _integer_value(reply)
-    if value != 0 and value != 1:
-        raise ProtocolError("Expected Redis zero or one reply")
-    return value == 1
+    return _zero_or_one(reply) == 1
 
 def _resp3_unwrap(Resp3 value) -> Resp3:
     match value:
@@ -3084,11 +3081,11 @@ struct Connection:
 
     def setbit(self, bytes name, int64 offset, int64 value) -> int64:
         """Set one bit and return its previous value, zero or one."""
-        return _bitmap_reply_bit(self.execute([b"SETBIT", name, _bitmap_offset(offset), _bitmap_bit(value)]))
+        return _zero_or_one(self.execute([b"SETBIT", name, _bitmap_offset(offset), _bitmap_bit(value)]))
 
     def getbit(self, bytes name, int64 offset) -> int64:
         """Read one bit. Missing and unset bits are zero."""
-        return _bitmap_reply_bit(self.execute([b"GETBIT", name, _bitmap_offset(offset)]))
+        return _zero_or_one(self.execute([b"GETBIT", name, _bitmap_offset(offset)]))
 
     def bitcount(
         self,
@@ -3836,6 +3833,27 @@ struct Connection:
 
     def sunionstore(self, bytes dest, list[bytes] keys) -> int64:
         return self._set_store(b"SUNIONSTORE", dest, keys)
+
+    def pfadd(self, bytes name, list[bytes] values = []) -> int64:
+        """Add binary elements. Return one if registers changed or the key was created."""
+        list[bytes] args = [b"PFADD", name]
+        for value in values:
+            args.append(value)
+        return _zero_or_one(self.execute(args))
+
+    def pfcount(self, list[bytes] sources) -> int64:
+        """Estimate the number of distinct elements across one or more HyperLogLogs."""
+        auto count = _integer_value(self.execute(_keys_command(b"PFCOUNT", sources)))
+        if count < 0:
+            raise ProtocolError("Redis PFCOUNT estimate must not be negative")
+        return count
+
+    def pfmerge(self, bytes dest, list[bytes] sources = []) -> bool:
+        """Merge sources into the destination, including any existing destination data."""
+        list[bytes] args = [b"PFMERGE", dest]
+        for source in sources:
+            args.append(source)
+        return _status_value(self.execute(args), b"OK")
 
     def zadd(
         self,
