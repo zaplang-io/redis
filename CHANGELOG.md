@@ -22,6 +22,7 @@ is created by this change.
   multi-pops, including cancellation-safe BRPOPLPUSH and BLMPOP (#59).
 - Typed set membership, intersection cardinality, moves, and store operations.
   SPOP and SRANDMEMBER support counted and uncounted selection (#60).
+- Typed bitmap commands with BYTE/BIT ranges and an ordered BITFIELD builder (#61).
 - Bounded guarded pools with finite reset/reinitialization and dedicated leases.
 - Dedicated pull-based Pub/Sub sessions and PUBLISH, with typed binary events,
   explicit acknowledgements and at-most-once/no-replay semantics.

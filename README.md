@@ -558,6 +558,50 @@ match snapshot:
         print("source key is missing")
 ```
 
+## Bitmap commands
+
+| Method | Result |
+| --- | --- |
+| `setbit(name, offset, value)` | Previous bit as `int64`, zero or one |
+| `getbit(name, offset)` | Bit as `int64`, zero for a missing or unset bit |
+| `bitcount(key, start=None, end=None, mode="")` | Number of set bits |
+| `bitpos(key, bit, start=None, end=None, mode="")` | Absolute bit position, or -1 if the bit is absent from the search range |
+| `bitop(operation, dest, keys)` | Byte length of the stored result |
+| `bitfield(key, default_overflow="WRAP")` | Reusable `redis.BitFieldOperation` builder |
+
+Keys are bytes. SETBIT and GETBIT use zero-based bit offsets from 0 through
+4294967295, with offset zero at the most significant bit of the first byte.
+BITCOUNT accepts either both range endpoints or neither. BITPOS also
+accepts a start-only range. Endpoints use `Optional.Some(index)`, are
+inclusive, and may be negative. The default unit is BYTE. Supply both
+endpoints to use the explicit BYTE or BIT mode. An open-ended BITPOS
+search for zero can include zero padding after the last byte.
+
+BITOP takes a list of source keys. AND, OR, XOR, and NOT are available on
+both supported Redis versions. NOT requires exactly one source. Redis
+validates the operator against the connected server version.
+
+```zap
+conn.setbit(b"flags", 9, 1)
+auto count = conn.bitcount(b"flags", Optional.Some(8), Optional.Some(15), mode="BIT")
+auto fields = conn.bitfield(b"counters")
+fields.set_value("u8", "#1", 255).get("u8", "8")
+fields.incrby("u8", "#1", 1, overflow="FAIL")
+auto results = fields.execute()
+```
+
+BITFIELD offsets are text tokens such as `"8"` for a bit offset or
+`"#1"` for a field-width multiplier. GET, SET, and INCRBY each occupy
+one slot in the ordered `list[Optional[int64]]` returned by `execute()`.
+In the example the results are the previous value 0, the new value 255,
+and None for the increment that would overflow. OVERFLOW changes the mode
+for subsequent writes and adds no result slot. The modes are WRAP, SAT,
+and FAIL. Execution sends the queued operations in one command and resets
+the builder to its default mode. Use `reset()` to discard queued work.
+
+See the [Redis bitmap reference](https://redis.io/docs/latest/develop/data-types/bitmaps/)
+and the [BITFIELD command reference](https://redis.io/docs/latest/commands/bitfield/).
+
 ## Typed hash commands
 
 Hash helpers accept binary keys, fields, and values. `redis.HashField(field,

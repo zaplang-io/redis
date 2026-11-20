@@ -1623,6 +1623,42 @@ def _string_length(Reply reply) -> int64:
         raise ProtocolError("Redis string length must not be negative")
     return length
 
+def _bitmap_bit(int64 bit) -> bytes:
+    if bit != 0 and bit != 1:
+        raise ValueError("Redis bitmap value must be zero or one")
+    return bytes(str(bit))
+
+def _bitmap_offset(int64 offset) -> bytes:
+    if offset < 0 or offset >= 4294967296:
+        raise ValueError("Redis bitmap offset must be in 0..4294967295")
+    return bytes(str(offset))
+
+def _bitmap_reply_bit(Reply reply) -> int64:
+    auto bit = _integer_value(reply)
+    if bit != 0 and bit != 1:
+        raise ProtocolError("Expected Redis bitmap reply of zero or one")
+    return bit
+
+def _append_bitmap_range(
+    list[bytes] args,
+    Optional[int64] start,
+    Optional[int64] end,
+    str mode,
+):
+    if end.is_some() and start.is_none():
+        raise ValueError("Redis bitmap range end requires start")
+    if mode != "" and end.is_none():
+        raise ValueError("Redis bitmap range mode requires start and end")
+    if start.is_some():
+        args.append(bytes(str(start.unwrap())))
+    if end.is_some():
+        args.append(bytes(str(end.unwrap())))
+    if mode != "":
+        auto unit = mode.upper()
+        if unit != "BYTE" and unit != "BIT":
+            raise ValueError("Redis bitmap range mode must be BYTE or BIT")
+        args.append(bytes(unit))
+
 def _append_string_expiry(
     list[bytes] args,
     int64 ex,
@@ -1917,6 +1953,84 @@ struct RegisteredScript:
 
 def register_script(bytes source) -> RegisteredScript:
     return RegisteredScript(source, bytes(crypto.sha1(source)))
+
+def _bitfield_overflow(str overflow) -> str:
+    auto mode = overflow.upper()
+    if mode != "WRAP" and mode != "SAT" and mode != "FAIL":
+        raise ValueError("BITFIELD overflow must be WRAP, SAT, or FAIL")
+    return mode
+
+# Builds an ordered, atomic BITFIELD command for one connection and key.
+struct BitFieldOperation:
+    Connection _connection
+    bytes _key
+    str _default_overflow
+    str _last_overflow
+    list[bytes] _args
+    int64 _count
+
+    def reset(self):
+        """Discard queued operations and restore the default overflow mode."""
+        self._args = [b"BITFIELD", self._key]
+        self._count = 0
+        self._last_overflow = "WRAP"
+        self.overflow(self._default_overflow)
+
+    def overflow(self, str overflow) -> BitFieldOperation:
+        """Set the mode for following writes. This adds no reply slot."""
+        auto mode = _bitfield_overflow(overflow)
+        if mode != self._last_overflow:
+            self._args.append(b"OVERFLOW")
+            self._args.append(bytes(mode))
+            self._last_overflow = mode
+        return self
+
+    def _operation(self, bytes operation, str fmt, str offset):
+        self._args.append(operation)
+        self._args.append(bytes(fmt))
+        self._args.append(bytes(offset))
+        self._count = self._count + 1
+
+    def get(self, str fmt, str offset) -> BitFieldOperation:
+        """Queue GET. Use a bit offset or a # prefixed field index."""
+        self._operation(b"GET", fmt, offset)
+        return self
+
+    def set_value(self, str fmt, str offset, int64 value) -> BitFieldOperation:
+        """Queue SET, whose result is the previous field value."""
+        self._operation(b"SET", fmt, offset)
+        self._args.append(bytes(str(value)))
+        return self
+
+    def incrby(self, str fmt, str offset, int64 increment, str overflow = "") -> BitFieldOperation:
+        """Queue INCRBY with an optional mode for this and following writes."""
+        if overflow != "":
+            self.overflow(overflow)
+        self._operation(b"INCRBY", fmt, offset)
+        self._args.append(bytes(str(increment)))
+        return self
+
+    def execute(self) -> list[Optional[int64]]:
+        """Execute queued operations and reset the builder for reuse."""
+        auto args = self._args
+        auto count = self._count
+        self.reset()
+        match self._connection.execute(args):
+            case Reply.Array(items):
+                if len(items) != count:
+                    raise ProtocolError("BITFIELD reply length differs from operation count")
+                list[Optional[int64]] values = []
+                for item in items:
+                    match item:
+                        case Reply.Integer(value):
+                            values.append(Optional.Some(value))
+                        case Reply.NullBulk:
+                            values.append(None)
+                        case _:
+                            raise ProtocolError("Expected BITFIELD integer or null item")
+                return values
+            case _:
+                raise ProtocolError("Expected BITFIELD array reply")
 
 # A builder is local to one caller. Execution seals it before touching the
 # connection; failures never leave a replayable queue. Replies retain errors.
@@ -2967,6 +3081,64 @@ struct Connection:
 
     def strlen(self, bytes name) -> int64:
         return _string_length(self.execute([b"STRLEN", name]))
+
+    def setbit(self, bytes name, int64 offset, int64 value) -> int64:
+        """Set one bit and return its previous value, zero or one."""
+        return _bitmap_reply_bit(self.execute([b"SETBIT", name, _bitmap_offset(offset), _bitmap_bit(value)]))
+
+    def getbit(self, bytes name, int64 offset) -> int64:
+        """Read one bit. Missing and unset bits are zero."""
+        return _bitmap_reply_bit(self.execute([b"GETBIT", name, _bitmap_offset(offset)]))
+
+    def bitcount(
+        self,
+        bytes key,
+        Optional[int64] start = None,
+        Optional[int64] end = None,
+        str mode = "",
+    ) -> int64:
+        """Count set bits over the whole value or an inclusive BYTE or BIT range."""
+        if start.is_some() and end.is_none():
+            raise ValueError("BITCOUNT requires both start and end when using a range")
+        list[bytes] args = [b"BITCOUNT", key]
+        _append_bitmap_range(args, start, end, mode)
+        return _string_length(self.execute(args))
+
+    def bitpos(
+        self,
+        bytes key,
+        int64 bit,
+        Optional[int64] start = None,
+        Optional[int64] end = None,
+        str mode = "",
+    ) -> int64:
+        """Find the absolute bit position of zero or one, or return -1."""
+        list[bytes] args = [b"BITPOS", key, _bitmap_bit(bit)]
+        _append_bitmap_range(args, start, end, mode)
+        auto position = _integer_value(self.execute(args))
+        if position < -1:
+            raise ProtocolError("Expected Redis BITPOS result of -1 or a bit offset")
+        return position
+
+    def bitop(self, str operation, bytes dest, list[bytes] keys) -> int64:
+        """Store a bitwise operation on the source keys and return its byte length."""
+        auto op = operation.upper()
+        if len(keys) == 0:
+            raise ValueError("BITOP requires at least one source key")
+        if op == "NOT" and len(keys) != 1:
+            raise ValueError("BITOP NOT requires exactly one source key")
+        list[bytes] args = [b"BITOP", bytes(op), dest]
+        for key in keys:
+            args.append(key)
+        return _string_length(self.execute(args))
+
+    def bitfield(self, bytes key, str default_overflow = "WRAP") -> BitFieldOperation:
+        """Build an atomic sequence of bitfield operations for this key."""
+        auto mode = _bitfield_overflow(default_overflow)
+        list[bytes] args = []
+        auto builder = BitFieldOperation(self, key, mode, "WRAP", args, 0)
+        builder.reset()
+        return builder
 
     def mget(self, list[bytes] keys) -> list[Optional[bytes]]:
         auto reply = self.execute(_keys_command(b"MGET", keys))

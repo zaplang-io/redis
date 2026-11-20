@@ -54,3 +54,15 @@ available on the tagged result.
 SMISMEMBER returns boolean membership flags in request order, following the
 existing SISMEMBER type. SINTERCARD derives the Redis key count from the
 typed key list, as the package does for other counted-key commands.
+
+## Bitmap options and BITFIELD builder
+
+Issue [#61](https://github.com/zaplang-io/redis/issues/61) follows
+[redis-py's bitmap command names and options](https://redis.readthedocs.io/en/stable/commands.html).
+BITCOUNT and BITPOS represent omitted endpoints with `Optional[int64]`,
+preserving zero and negative indexes. BITOP takes a typed source-key list.
+BITFIELD uses a text offset token for both absolute offsets and `#` field
+indexes. Zap reserves `set`, so the builder uses `set_value` for SET.
+The builder is bound to a connection and key, queues ordered operations,
+and resets after execution. Its result uses `Optional[int64]` for each
+slot so a FAIL overflow remains distinct from zero.
