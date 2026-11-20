@@ -32,7 +32,7 @@ def server(bytes listener, list[Step] steps):
 def bulk(bytes data) -> bytes:
     return b"$" + bytes(str(len(data))) + b"\r\n" + data + b"\r\n"
 
-def array(list[bytes] parts) -> bytes:
+def reply_array(list[bytes] parts) -> bytes:
     auto result = b"*" + bytes(str(len(parts))) + b"\r\n"
     for part in parts:
         result = result + part
@@ -98,11 +98,11 @@ def errors(redis.Connection conn):
 
 def main():
     auto binary = bytes([255, 0, 13, 10])
-    auto read = array([bulk(b"name"), bulk(b"read"), bulk(b"description"), b"$-1\r\n", bulk(b"flags"), array([bulk(b"no-writes")])])
-    auto write = array([bulk(b"name"), bulk(b"write"), bulk(b"description"), bulk(b""), bulk(b"flags"), b"*0\r\n"])
-    auto libraries = array([array([bulk(b"engine"), bulk(b"LUA"), bulk(b"library_name"), bulk(b"fixture"), bulk(b"functions"), array([read, write]), bulk(b"library_code"), bulk(binary)])])
-    auto stats = array([bulk(b"LUA"), array([bulk(b"libraries_count"), b":2\r\n", bulk(b"functions_count"), b":3\r\n"])])
-    auto running = array([bulk(b"name"), bulk(b"read"), bulk(b"duration_ms"), b":123\r\n", bulk(b"command"), array([bulk(b"FCALL_RO"), bulk(b"read"), bulk(b"0"), bulk(binary)])])
+    auto read = reply_array([bulk(b"name"), bulk(b"read"), bulk(b"description"), b"$-1\r\n", bulk(b"flags"), reply_array([bulk(b"no-writes")])])
+    auto write = reply_array([bulk(b"name"), bulk(b"write"), bulk(b"description"), bulk(b""), bulk(b"flags"), b"*0\r\n"])
+    auto libraries = reply_array([reply_array([bulk(b"engine"), bulk(b"LUA"), bulk(b"library_name"), bulk(b"fixture"), bulk(b"functions"), reply_array([read, write]), bulk(b"library_code"), bulk(binary)])])
+    auto stats = reply_array([bulk(b"LUA"), reply_array([bulk(b"libraries_count"), b":2\r\n", bulk(b"functions_count"), b":3\r\n"])])
+    auto running = reply_array([bulk(b"name"), bulk(b"read"), bulk(b"duration_ms"), b":123\r\n", bulk(b"command"), reply_array([bulk(b"FCALL_RO"), bulk(b"read"), bulk(b"0"), bulk(binary)])])
     list[Step] steps = [
         Step([b"FUNCTION", b"LOAD", b"source"], bulk(b"fixture")),
         Step([b"FUNCTION", b"LOAD", b"REPLACE", b"new source"], bulk(b"fixture")),
@@ -112,13 +112,13 @@ def main():
         Step([b"FUNCTION", b"DUMP"], bulk(binary)),
         Step([b"FUNCTION", b"FLUSH", b"SYNC"], b"+OK\r\n"),
         Step([b"FUNCTION", b"FLUSH", b"ASYNC"], b"+OK\r\n"),
-        Step([b"FUNCTION", b"STATS"], array([bulk(b"running_script"), b"$-1\r\n", bulk(b"engines"), stats])),
-        Step([b"FUNCTION", b"STATS"], array([bulk(b"engines"), stats, bulk(b"running_script"), running])),
+        Step([b"FUNCTION", b"STATS"], reply_array([bulk(b"running_script"), b"$-1\r\n", bulk(b"engines"), stats])),
+        Step([b"FUNCTION", b"STATS"], reply_array([bulk(b"engines"), stats, bulk(b"running_script"), running])),
         Step([b"FCALL", b"write", b"2", binary, b"", b"", binary], b":2\r\n"),
         Step([b"FCALL_RO", b"read", b"0", binary], b"$-1\r\n"),
         Step([b"FUNCTION", b"LOAD", b"bad"], b"-ERR Bad library data\r\n"),
-        Step([b"FUNCTION", b"LIST", b"LIBRARYNAME", b"*"], array([array([bulk(b"library_name"), bulk(b"fixture")])])),
-        Step([b"FUNCTION", b"STATS"], array([bulk(b"running_script"), b"$-1\r\n", bulk(b"engines"), array([bulk(b"LUA"), array([bulk(b"libraries_count"), b":-1\r\n", bulk(b"functions_count"), b":3\r\n"])])])),
+        Step([b"FUNCTION", b"LIST", b"LIBRARYNAME", b"*"], reply_array([reply_array([bulk(b"library_name"), bulk(b"fixture")])])),
+        Step([b"FUNCTION", b"STATS"], reply_array([bulk(b"running_script"), b"$-1\r\n", bulk(b"engines"), reply_array([bulk(b"LUA"), reply_array([bulk(b"libraries_count"), b":-1\r\n", bulk(b"functions_count"), b":3\r\n"])])])),
         Step([b"FUNCTION", b"DUMP"], b"$-1\r\n"),
         Step([b"FUNCTION", b"DELETE", b"fixture"], b"+PONG\r\n"),
         Step([b"PING"], b"+PONG\r\n"),
