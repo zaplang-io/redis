@@ -707,48 +707,68 @@ versions in [SUPPORT.md](docs/SUPPORT.md).
 
 ## Set commands
 
-Set helpers use binary keys/members and retain Redis deduplication semantics:
+Set helpers accept binary keys and members, including empty bytes.
 
 | Connection method | Result |
 | --- | --- |
-| `sadd(key, members)` | `int64` number of newly added members |
-| `srem(key, members)` | `int64` number of members removed |
-| `sismember(key, member)` | `bool`, whether the member exists |
+| `sadd(key, members)`, `srem(key, members)` | `int64` count of added or removed members |
+| `sismember(key, member)` | `bool` membership |
+| `smismember(name, values)` | `list[bool]` in request order, including duplicates |
+| `smove(src, dst, value)` | `bool` indicating whether the source held the member |
 | `scard(key)` | `int64` cardinality, zero for a missing set |
-| `smembers(key)` | `list[bytes]` members, in unspecified order |
-| `spop(key)` | `Optional[bytes]` one removed member, None for a missing/empty set |
-| `sunion(keys)` | `list[bytes]` union of the sets |
-| `sinter(keys)` | `list[bytes]` intersection of the sets |
-| `sdiff(keys)` | `list[bytes]` first set minus every following set |
+| `smembers(key)` | `list[bytes]` members in unspecified order |
+| `srandmember(name, count=None)`, `spop(name, count=None)` | `redis.SetSelection` with one member, a missing result, or a list of members |
+| `sunion(keys)`, `sinter(keys)`, `sdiff(keys)` | `list[bytes]` union, intersection, or difference |
+| `sintercard(keys, limit=0)` | `int64` intersection cardinality, capped by a positive limit |
+| `sunionstore(dest, keys)`, `sinterstore(dest, keys)`, `sdiffstore(dest, keys)` | `int64` resulting destination cardinality |
+
+SADD and SREM require a nonempty member list. SMISMEMBER requires at least
+one value and returns false for each value when the set is missing. Set
+algebra requires at least one key. A missing input is an empty set, and
+SDIFF uses the first input as its source. SINTERCARD derives the wire key
+count from the list. A zero limit requests the full cardinality.
+
+SMOVE atomically removes the member from the source and adds it to the
+destination. When the destination already holds the member, Redis still
+removes it from the source and returns true. The STORE commands replace the
+destination and its prior expiry. An empty result removes the destination.
 
 ```zap
-conn.sadd(b"first", [b"shared", b"first-only", b"shared"])
+conn.sadd(b"first", [b"shared", b"first-only"])
 conn.sadd(b"second", [b"shared", b"second-only"])
-auto common = conn.sinter([b"first", b"second"])
-auto only_first = conn.sdiff([b"first", b"second"])
+auto shared = conn.sinterstore(b"both", [b"first", b"second"])
+match conn.srandmember(b"first", count=Optional.Some(-3)):
+    case redis.SetSelection.Members(values):
+        print(len(values))
+    case _:
+        print("expected a counted sample")
 ```
 
-All array results are unordered; compare membership rather than list positions.
-SADD/SREM require a nonempty member list, and set algebra requires at least one
-key. Empty argument lists raise `ValueError` before network I/O. Duplicate
-members are sent unchanged and Redis counts actual additions/removals. Empty
-bytes are valid members and remain distinct from a nil SPOP result.
+With count omitted, `SetSelection.Member(value)` holds the chosen bytes
+and `.Missing` represents an absent set. An explicit `Optional.Some(count)`
+returns `.Members(values)`, with an empty list for a missing set or zero
+count. Positive counts are bounded by cardinality and select distinct
+members. A negative SRANDMEMBER count samples with replacement and returns
+its magnitude in values if the set exists. SRANDMEMBER preserves the set.
+SPOP rejects negative counts and removes the selected members. Removing
+the final member deletes the key.
 
-Missing keys act as empty sets. SDIFF respects input key order; the other
-algebra operations do not promise an output order. These helpers read their
-operands without storing a destination set. Removing/popping the final member
-removes the key. SPOP uses only the single-member form with no count argument;
-its result is chosen by Redis, with no promise of a particular random member.
+The scalar helpers `.is_some()`, `.is_none()`, and `.unwrap()` support
+existing uncounted SPOP flows. Callers that explicitly typed the old
+`Optional[bytes]` result can switch to `SetSelection` or match its cases.
+For keyword calls, use `name=` for the set key. Set-member results have unspecified order. SMISMEMBER follows input order.
 
-Wrong key types raise `ResponseError`, preserving the raw server error through
-`last_error()`. Array replies must be non-null arrays of non-null bulk strings;
-unexpected types raise `ProtocolError` after consuming the complete frame.
-The existing connection recovery and no-replay contracts apply. SSCAN belongs
-to #14; count-based SPOP and STORE variants remain available via raw `execute`.
+Empty argument lists, negative SINTERCARD limits, invalid selection counts,
+and the most negative int64 SRANDMEMBER count raise `ValueError` locally.
+Wrong key types raise `ResponseError`, preserving server bytes in
+`last_error()`. An unexpected typed reply raises `ProtocolError` after
+consuming its complete frame. See the existing recovery and no-replay contract.
 
-References: [SADD](https://redis.io/docs/latest/commands/sadd/),
-[SPOP](https://redis.io/docs/latest/commands/spop/),
-[SDIFF](https://redis.io/docs/latest/commands/sdiff/).
+References [SMISMEMBER](https://redis.io/docs/latest/commands/smismember/),
+[SINTERCARD](https://redis.io/docs/latest/commands/sintercard/),
+[SMOVE](https://redis.io/docs/latest/commands/smove/),
+[SRANDMEMBER](https://redis.io/docs/latest/commands/srandmember/), and
+[SPOP](https://redis.io/docs/latest/commands/spop/).
 
 ## Sorted-set commands
 

@@ -1093,6 +1093,33 @@ enum SetResult:
             case _:
                 return False
 
+# SPOP and SRANDMEMBER return an array when COUNT is supplied.
+enum SetSelection:
+    Member(bytes value)
+    Members(list[bytes] values)
+    Missing
+
+    def is_some(self) -> bool:
+        match self:
+            case SetSelection.Member(value):
+                return True
+            case _:
+                return False
+
+    def is_none(self) -> bool:
+        match self:
+            case SetSelection.Missing:
+                return True
+            case _:
+                return False
+
+    def unwrap(self) -> bytes:
+        match self:
+            case SetSelection.Member(value):
+                return value
+            case _:
+                raise ValueError("Expected one Redis set member")
+
 # OBJECT's reply type depends on the selected metadata.
 enum ObjectInfo:
     Missing
@@ -3536,14 +3563,78 @@ struct Connection:
     def sismember(self, bytes key, bytes member) -> bool:
         return _boolean_value(self.execute([b"SISMEMBER", key, member]))
 
+    def smismember(self, bytes name, list[bytes] values) -> list[bool]:
+        if len(values) == 0:
+            raise ValueError("SMISMEMBER requires at least one member")
+        list[bytes] args = [b"SMISMEMBER", name]
+        for value in values:
+            args.append(value)
+        match self.execute(args):
+            case Reply.Array(items):
+                if len(items) != len(values):
+                    raise ProtocolError("SMISMEMBER result count differs from member count")
+                list[bool] membership = []
+                for item in items:
+                    membership.append(_boolean_value(item))
+                return membership
+            case _:
+                raise ProtocolError("Expected SMISMEMBER array reply")
+
+    def smove(self, bytes src, bytes dst, bytes value) -> bool:
+        return _boolean_value(self.execute([b"SMOVE", src, dst, value]))
+
+    def sintercard(self, list[bytes] keys, int64 limit = 0) -> int64:
+        if limit < 0:
+            raise ValueError("SINTERCARD limit must not be negative")
+        list[bytes] args = [b"SINTERCARD"]
+        _numkeys_args(args, keys)
+        if limit > 0:
+            args.append(b"LIMIT")
+            args.append(bytes(str(limit)))
+        auto count = _integer_value(self.execute(args))
+        if count < 0 or (limit > 0 and count > limit):
+            raise ProtocolError("Invalid Redis SINTERCARD reply count")
+        return count
+
     def scard(self, bytes key) -> int64:
         return _integer_value(self.execute([b"SCARD", key]))
 
     def smembers(self, bytes key) -> list[bytes]:
         return _bulk_array(self.execute([b"SMEMBERS", key]))
 
-    def spop(self, bytes key) -> Optional[bytes]:
-        return _bulk_value(self.execute([b"SPOP", key]))
+    def _set_selection(
+        self,
+        bytes command,
+        bytes name,
+        Optional[int64] count,
+    ) -> SetSelection:
+        match count:
+            case Optional.None:
+                match _bulk_value(self.execute([command, name])):
+                    case Optional.Some(member):
+                        return SetSelection.Member(member)
+                    case Optional.None:
+                        return SetSelection.Missing
+            case Optional.Some(requested):
+                if command == b"SPOP" and requested < 0:
+                    raise ValueError("SPOP count must not be negative")
+                if requested < -9223372036854775807:
+                    raise ValueError("SRANDMEMBER count magnitude exceeds int64")
+                auto values = _bulk_array(
+                    self.execute([command, name, bytes(str(requested))]),
+                )
+                if requested < 0:
+                    if len(values) > 0 and len(values) != -requested:
+                        raise ProtocolError("Invalid Redis SRANDMEMBER replacement sample count")
+                elif len(values) > requested:
+                    raise ProtocolError("Too many Redis set selection results")
+                return SetSelection.Members(values)
+
+    def spop(self, bytes name, Optional[int64] count = None) -> SetSelection:
+        return self._set_selection(b"SPOP", name, count)
+
+    def srandmember(self, bytes name, Optional[int64] count = None) -> SetSelection:
+        return self._set_selection(b"SRANDMEMBER", name, count)
 
     def sunion(self, list[bytes] keys) -> list[bytes]:
         return _bulk_array(self.execute(_keys_command(b"SUNION", keys)))
@@ -3553,6 +3644,26 @@ struct Connection:
 
     def sdiff(self, list[bytes] keys) -> list[bytes]:
         return _bulk_array(self.execute(_keys_command(b"SDIFF", keys)))
+
+    def _set_store(self, bytes command, bytes dest, list[bytes] keys) -> int64:
+        if len(keys) == 0:
+            raise ValueError("Redis set store requires at least one input key")
+        list[bytes] args = [command, dest]
+        for key in keys:
+            args.append(key)
+        auto count = _integer_value(self.execute(args))
+        if count < 0:
+            raise ProtocolError("Redis set store count must not be negative")
+        return count
+
+    def sdiffstore(self, bytes dest, list[bytes] keys) -> int64:
+        return self._set_store(b"SDIFFSTORE", dest, keys)
+
+    def sinterstore(self, bytes dest, list[bytes] keys) -> int64:
+        return self._set_store(b"SINTERSTORE", dest, keys)
+
+    def sunionstore(self, bytes dest, list[bytes] keys) -> int64:
+        return self._set_store(b"SUNIONSTORE", dest, keys)
 
     def zadd(
         self,

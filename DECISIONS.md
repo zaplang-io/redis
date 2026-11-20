@@ -41,3 +41,16 @@ The LPOS count uses -1 to omit COUNT, preserving zero as the server's
 all-matches value. LMPOP and BLMPOP derive the key count from a typed list
 and return `ListPopBatch` with its key and values. The conditional pushes
 take a list of values, matching the existing typed LPUSH and RPUSH APIs.
+
+## Set sampling and counted pops
+
+Issue [#60](https://github.com/zaplang-io/redis/issues/60) follows
+[redis-py's single entry point per command](https://redis.readthedocs.io/en/stable/commands.html).
+SPOP and SRANDMEMBER use `Optional[int64]` to distinguish an omitted count
+from zero and negative values. `SetSelection` distinguishes a scalar member,
+missing result, and counted list. Scalar SPOP checks and unwrapping remain
+available on the tagged result.
+
+SMISMEMBER returns boolean membership flags in request order, following the
+existing SISMEMBER type. SINTERCARD derives the Redis key count from the
+typed key list, as the package does for other counted-key commands.
