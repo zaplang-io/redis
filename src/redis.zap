@@ -1812,6 +1812,216 @@ def _append_bitmap_range(
             raise ValueError("Redis bitmap range mode must be BYTE or BIT")
         args.append(bytes(unit))
 
+enum InfoValue:
+    Integer(int64 value)
+    Decimal(float64 value)
+    Text(bytes value)
+    Attributes(list[KeyValue] values)
+
+struct InfoField:
+    bytes name
+    InfoValue value
+
+struct InfoSection:
+    bytes name
+    list[InfoField] fields
+
+struct ServerInfo:
+    list[InfoSection] sections
+
+struct ClientInfo:
+    int64 id
+    list[KeyValue] fields
+
+struct SlowLogEntry:
+    int64 id
+    int64 timestamp
+    int64 duration_us
+    list[bytes] args
+    Optional[bytes] client_address
+    Optional[bytes] client_name
+    Optional[int64] argument_count
+
+struct CommandDocField:
+    bytes name
+    Reply value
+
+struct CommandDoc:
+    bytes name
+    list[CommandDocField] fields
+
+def _admin_index(bytes data, int64 delimiter) -> int64:
+    auto i = 0
+    while i < len(data) and data[i] != delimiter:
+        i = i + 1
+    return i
+
+def _admin_split(bytes data, int64 delimiter) -> list[bytes]:
+    list[bytes] parts = []
+    auto start = 0
+    auto i = 0
+    while i < len(data):
+        if data[i] == delimiter:
+            parts.append(data[start:i])
+            start = i + 1
+        i = i + 1
+    parts.append(data[start:i])
+    return parts
+
+def _info_value(bytes data) -> InfoValue:
+    if len(data) == 0:
+        return InfoValue.Text(data)
+    auto first = data[0]
+    if (first >= 48 and first <= 57) or first == 45 or first == 43 or first == 46:
+        try:
+            return InfoValue.Integer(_number(data))
+        except ValueError:
+            auto ignored = 0
+        try:
+            auto text = str(data)
+            # Preserve integers that exceed the signed integer range exactly.
+            if text =~ m/\A[+-]?[0-9]+\z/:
+                return InfoValue.Text(data)
+            auto number = _score_value(Reply.Bulk(data))
+            if not math.isinf(number):
+                return InfoValue.Decimal(number)
+        except Exception:
+            auto ignored = 0
+    if _admin_index(data, 61) < len(data):
+        list[KeyValue] attributes = []
+        for part in _admin_split(data, 44):
+            auto equal = _admin_index(part, 61)
+            if equal == 0 or equal == len(part):
+                return InfoValue.Text(data)
+            attributes.append(KeyValue(part[0:equal], part[equal + 1:len(part)]))
+        return InfoValue.Attributes(attributes)
+    return InfoValue.Text(data)
+
+def _server_info(Reply reply) -> ServerInfo:
+    list[InfoSection] sections = []
+    list[InfoField] fields = []
+    auto section = b""
+    for raw in _admin_split(_required_bulk(reply), 10):
+        auto line = raw
+        if len(line) > 0 and line[len(line) - 1] == 13:
+            line = line[0:len(line) - 1]
+        if len(line) >= 2 and line[0:2] == b"# ":
+            if len(section) > 0 or len(fields) > 0:
+                sections.append(InfoSection(section, fields))
+            section = line[2:len(line)]
+            list[InfoField] next_fields = []
+            fields = next_fields
+        else:
+            auto colon = _admin_index(line, 58)
+            if colon > 0 and colon < len(line):
+                fields.append(InfoField(line[0:colon], _info_value(line[colon + 1:len(line)])))
+    if len(section) > 0 or len(fields) > 0:
+        sections.append(InfoSection(section, fields))
+    return ServerInfo(sections)
+
+def _admin_nonnegative(Reply reply) -> int64:
+    auto value = _integer_value(reply)
+    if value < 0:
+        raise ProtocolError("Expected a nonnegative Redis administrative reply")
+    return value
+
+def _admin_pairs(Reply reply) -> list[Reply]:
+    match reply:
+        case Reply.Array(items):
+            if len(items) % 2 == 0:
+                return items
+        case _:
+            auto ignored = 0
+    raise ProtocolError("Expected Redis key/value reply")
+
+def _config_options(Reply reply) -> list[KeyValue]:
+    auto items = _admin_pairs(reply)
+    list[KeyValue] values = []
+    auto i = 0
+    while i < len(items):
+        values.append(KeyValue(_required_bulk(items[i]), _required_bulk(items[i + 1])))
+        i = i + 2
+    return values
+
+def _clients(Reply reply) -> list[ClientInfo]:
+    list[ClientInfo] clients = []
+    for line in _admin_split(_required_bulk(reply), 10):
+        if len(line) > 0:
+            auto id = 0
+            list[KeyValue] fields = []
+            for token in _admin_split(line, 32):
+                if len(token) > 0:
+                    auto equal = _admin_index(token, 61)
+                    if equal == 0 or equal == len(token):
+                        raise ProtocolError("Expected CLIENT LIST name=value field")
+                    auto name = token[0:equal]
+                    auto value = token[equal + 1:len(token)]
+                    if name == b"id":
+                        if id != 0:
+                            raise ProtocolError("Duplicate CLIENT LIST ID")
+                        try:
+                            id = _number(value)
+                        except ValueError:
+                            raise ProtocolError("Invalid CLIENT LIST ID")
+                        if id <= 0:
+                            raise ProtocolError("Invalid CLIENT LIST ID")
+                    fields.append(KeyValue(name, value))
+            if id == 0:
+                raise ProtocolError("Missing CLIENT LIST ID")
+            clients.append(ClientInfo(id, fields))
+    return clients
+
+def _slowlog(Reply reply) -> list[SlowLogEntry]:
+    list[SlowLogEntry] entries = []
+    match reply:
+        case Reply.Array(items):
+            for item in items:
+                match item:
+                    case Reply.Array(row):
+                        if len(row) != 4 and len(row) != 6 and len(row) != 7:
+                            raise ProtocolError("Unexpected SLOWLOG entry field count")
+                        auto args = _bulk_array(row[3])
+                        Optional[bytes] address = None
+                        Optional[bytes] name = None
+                        Optional[int64] argument_count = None
+                        if len(row) >= 6:
+                            address = Optional.Some(_required_bulk(row[4]))
+                            name = Optional.Some(_required_bulk(row[5]))
+                        if len(row) == 7:
+                            auto total = _admin_nonnegative(row[6])
+                            if total < len(args):
+                                raise ProtocolError("SLOWLOG argument count is smaller than its argument list")
+                            argument_count = Optional.Some(total)
+                        entries.append(SlowLogEntry(
+                            _admin_nonnegative(row[0]), _admin_nonnegative(row[1]),
+                            _admin_nonnegative(row[2]), args, address, name, argument_count,
+                        ))
+                    case _:
+                        raise ProtocolError("Expected SLOWLOG row array")
+            return entries
+        case _:
+            raise ProtocolError("Expected SLOWLOG array")
+
+def _command_docs(Reply reply) -> list[CommandDoc]:
+    auto items = _admin_pairs(reply)
+    list[CommandDoc] docs = []
+    auto i = 0
+    while i < len(items):
+        auto metadata = _admin_pairs(items[i + 1])
+        list[CommandDocField] fields = []
+        auto j = 0
+        while j < len(metadata):
+            fields.append(CommandDocField(_required_bulk(metadata[j]), metadata[j + 1]))
+            j = j + 2
+        docs.append(CommandDoc(_required_bulk(items[i]), fields))
+        i = i + 2
+    return docs
+
+def _append_client_filter(list[bytes] args, bytes name, bytes value):
+    if len(value) > 0:
+        args.append(name)
+        args.append(value)
+
 def _append_string_expiry(
     list[bytes] args,
     int64 ex,
@@ -3444,6 +3654,165 @@ struct Connection:
 
     def ping(self) -> bool:
         return _status_value(self.execute([b"PING"]), b"PONG")
+
+    def info(self, bytes section = b"", list[bytes] sections = []) -> ServerInfo:
+        """Return ordered INFO sections with typed fields and binary text."""
+        list[bytes] args = [b"INFO"]
+        if section != b"":
+            args.append(section)
+        for name in sections:
+            args.append(name)
+        return _server_info(self.execute(args))
+
+    def config_get(self, bytes pattern = b"*", list[bytes] patterns = []) -> list[KeyValue]:
+        """Read matching configuration fields and values as bytes."""
+        list[bytes] args = [b"CONFIG", b"GET", pattern]
+        for extra in patterns:
+            args.append(extra)
+        return _config_options(self.execute(args))
+
+    def config_set(self, bytes name, bytes value, list[KeyValue] additional = []) -> bool:
+        """Set server configuration values in a single command."""
+        list[bytes] args = [b"CONFIG", b"SET", name, value]
+        for pair in additional:
+            args.append(pair.key)
+            args.append(pair.value)
+        return _status_value(self.execute(args), b"OK")
+
+    def config_resetstat(self) -> bool:
+        """Reset server-wide statistics."""
+        return _status_value(self.execute([b"CONFIG", b"RESETSTAT"]), b"OK")
+
+    def dbsize(self) -> int64:
+        """Return the number of keys in the selected database."""
+        return _admin_nonnegative(self.execute([b"DBSIZE"]))
+
+    def flushdb(self, bool asynchronous = False) -> bool:
+        """Delete all keys in the selected database. Default to explicit SYNC."""
+        auto mode = b"SYNC"
+        if asynchronous:
+            mode = b"ASYNC"
+        return _status_value(self.execute([b"FLUSHDB", mode]), b"OK")
+
+    def flushall(self, bool asynchronous = False) -> bool:
+        """Delete all keys in every database on this server. Default to explicit SYNC."""
+        auto mode = b"SYNC"
+        if asynchronous:
+            mode = b"ASYNC"
+        return _status_value(self.execute([b"FLUSHALL", mode]), b"OK")
+
+    def client_id(self) -> int64:
+        """Return the current connection's server-assigned client ID."""
+        auto id = _admin_nonnegative(self.execute([b"CLIENT", b"ID"]))
+        if id == 0:
+            raise ProtocolError("Expected positive Redis client ID")
+        return id
+
+    def client_getname(self) -> Optional[bytes]:
+        """Return the current connection name, if set."""
+        return _bulk_value(self.execute([b"CLIENT", b"GETNAME"]))
+
+    def client_setname(self, bytes name) -> bool:
+        """Set the current connection name. An empty name clears it."""
+        return _status_value(self.execute([b"CLIENT", b"SETNAME", name]), b"OK")
+
+    def client_list(self, bytes _type = b"", list[int64] client_id = []) -> list[ClientInfo]:
+        """List clients, optionally filtering by type and explicit IDs."""
+        list[bytes] args = [b"CLIENT", b"LIST"]
+        _append_client_filter(args, b"TYPE", _type)
+        if len(client_id) > 0:
+            args.append(b"ID")
+            for id in client_id:
+                if id <= 0:
+                    raise ValueError("CLIENT LIST IDs must be positive")
+                args.append(bytes(str(id)))
+        return _clients(self.execute(args))
+
+    def client_kill(self, bytes address) -> bool:
+        """Disconnect the client at the supplied address using Redis's legacy form."""
+        if len(address) == 0:
+            raise ValueError("CLIENT KILL requires an address")
+        return _status_value(self.execute([b"CLIENT", b"KILL", address]), b"OK")
+
+    def client_kill_filter(
+        self,
+        Optional[int64] _id = None,
+        bytes _type = b"",
+        bytes addr = b"",
+        Optional[bool] skipme = None,
+        bytes laddr = b"",
+        bytes user = b"",
+        Optional[int64] maxage = None,
+    ) -> int64:
+        """Disconnect matching clients and return their number."""
+        list[bytes] args = [b"CLIENT", b"KILL"]
+        if _id.is_some():
+            auto id = _id.unwrap()
+            if id <= 0:
+                raise ValueError("CLIENT KILL ID must be positive")
+            _append_client_filter(args, b"ID", bytes(str(id)))
+        _append_client_filter(args, b"TYPE", _type)
+        _append_client_filter(args, b"ADDR", addr)
+        if skipme.is_some():
+            if skipme.unwrap():
+                _append_client_filter(args, b"SKIPME", b"YES")
+            else:
+                _append_client_filter(args, b"SKIPME", b"NO")
+        _append_client_filter(args, b"LADDR", laddr)
+        _append_client_filter(args, b"USER", user)
+        if maxage.is_some():
+            auto age = maxage.unwrap()
+            if age < 0:
+                raise ValueError("CLIENT KILL MAXAGE must be nonnegative")
+            _append_client_filter(args, b"MAXAGE", bytes(str(age)))
+        if len(args) == 2:
+            raise ValueError("CLIENT KILL requires at least one filter")
+        return _admin_nonnegative(self.execute(args))
+
+    def client_no_evict(self, bytes mode) -> bool:
+        """Set ON or OFF for the current connection's eviction exemption."""
+        return _status_value(self.execute([b"CLIENT", b"NO-EVICT", mode]), b"OK")
+
+    def slowlog_get(self, Optional[int64] num = None) -> list[SlowLogEntry]:
+        """Read slow log entries from newest to oldest. Use -1 for all entries."""
+        list[bytes] args = [b"SLOWLOG", b"GET"]
+        if num.is_some():
+            auto count = num.unwrap()
+            if count < -1:
+                raise ValueError("SLOWLOG GET count must be -1 or nonnegative")
+            args.append(bytes(str(count)))
+        return _slowlog(self.execute(args))
+
+    def slowlog_reset(self) -> bool:
+        """Clear the server-wide slow log."""
+        return _status_value(self.execute([b"SLOWLOG", b"RESET"]), b"OK")
+
+    def memory_usage(self, bytes key, Optional[int64] samples = None) -> Optional[int64]:
+        """Return estimated bytes used by a key, or None when it is absent."""
+        list[bytes] args = [b"MEMORY", b"USAGE", key]
+        if samples.is_some():
+            auto count = samples.unwrap()
+            if count < 0:
+                raise ValueError("MEMORY USAGE samples must be nonnegative")
+            args.append(b"SAMPLES")
+            args.append(bytes(str(count)))
+        auto reply = self.execute(args)
+        match reply:
+            case Reply.NullBulk:
+                return None
+            case _:
+                return Optional.Some(_admin_nonnegative(reply))
+
+    def command_count(self) -> int64:
+        """Return the server's command count."""
+        return _admin_nonnegative(self.execute([b"COMMAND", b"COUNT"]))
+
+    def command_docs(self, list[bytes] names = []) -> list[CommandDoc]:
+        """Return command documentation with named fields and Redis reply values."""
+        list[bytes] args = [b"COMMAND", b"DOCS"]
+        for name in names:
+            args.append(name)
+        return _command_docs(self.execute(args))
 
     def get(self, bytes key) -> Optional[bytes]:
         return _bulk_value(self.execute([b"GET", key]))

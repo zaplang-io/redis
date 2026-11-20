@@ -35,6 +35,7 @@ jobs:
     services:
       redis:
         image: ${{ matrix.server.image }}
+        command: redis-server --enable-debug-command yes
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 1s
@@ -46,7 +47,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
       - name: Execute live basic and isolated session tests
-        run: sh tools/run-integration-tests.sh --isolated
+        run: sh tools/run-integration-tests.sh --isolated --disposable-admin
       - name: Execute installed-package examples
         env:
           REDIS_EXAMPLE_URL: redis://redis:6379/0

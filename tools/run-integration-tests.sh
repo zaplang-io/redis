@@ -5,11 +5,13 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 zap="${ZAP:-zap}"
 check=0
 isolated=0
+disposable_admin=0
 for arg do
     case "$arg" in
         --check) check=1 ;;
         --isolated) isolated=1 ;;
-        *) echo 'usage: tools/run-integration-tests.sh [--check] [--isolated]' >&2; exit 2 ;;
+        --disposable-admin) disposable_admin=1 ;;
+        *) echo 'usage: tools/run-integration-tests.sh [--check] [--isolated] [--disposable-admin]' >&2; exit 2 ;;
     esac
 done
 if [ "$check" = 0 ] && [ -z "${REDIS_TEST_URL:-}" ]; then
@@ -20,6 +22,8 @@ if [ "$isolated" = 1 ]; then
     REDIS_TEST_ISOLATED=1
     export REDIS_TEST_ISOLATED
 fi
+REDIS_TEST_DISPOSABLE_ADMIN="$disposable_admin"
+export REDIS_TEST_DISPOSABLE_ADMIN
 build=$(mktemp -d "${TMPDIR:-/tmp}/redis-live-tests.XXXXXX")
 trap 'rm -rf "$build"' EXIT HUP INT TERM
 cp "$here/src/redis.zap" "$build/redis.zap"
