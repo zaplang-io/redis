@@ -1,4 +1,4 @@
-# Pub/Sub sessions and basic Streams
+# Pub/Sub sessions and Streams
 
 ## Pull-based RESP2 Pub/Sub
 
@@ -107,7 +107,9 @@ field names; no dict conversion occurs.
 
 | Connection method | Result / options |
 | --- | --- |
-| `xadd(key, fields, id=b"*")` | Full ID bytes. `*` generates an ID; explicit IDs must be canonical full tokens. At least one pair required. |
+| `xadd(key, fields, id=b"*", maxlen=None, approximate=True, nomkstream=False, minid=None, limit=None)` | `Optional[bytes]` with the full ID, or None for NOMKSTREAM on a missing key. Accepts `*`, a full ID, or `milliseconds-*`. |
+| `xtrim(name, maxlen=None, approximate=True, minid=None, limit=None)` | Number removed. Supply either MAXLEN or MINID. |
+| `xsetid(name, last_id, entries_added=None, max_deleted_id=None)` | True on OK. Redis checks the supplied metadata against the existing stream. |
 | `xlen(key)` | Non-negative length; missing stream returns zero. |
 | `xrange(key, start=b"-", end=b"+", count=0)` | Entries in increasing order. Zero omits COUNT. |
 | `xrevrange(key, end=b"+", start=b"-", count=0)` | Entries in decreasing order; end precedes start in the API/wire. |
@@ -116,8 +118,24 @@ field names; no dict conversion occurs.
 
 Range boundaries accept `-`, `+`, canonical full IDs, or a canonical unsigned
 millisecond component. Prefix an ID with `(` for an exclusive boundary. COUNT
-must be nonnegative; zero omits it. No trimming, NOMKSTREAM, ms-* generated IDs,
-Redis 8.x IDMP/MAXCOUNT/MAXSIZE, or consumer-group options are added here.
+must be nonnegative. Zero omits COUNT on range and read commands.
+
+XADD requires at least one field/value pair. Use `.unwrap()` for an XADD
+result when the operation can create a stream. Supply MAXLEN or MINID as
+`Optional.Some(value)`. MINID accepts a full ID or a millisecond component.
+The default approximate mode trims complete storage nodes. Use
+`approximate=False` for exact trimming. LIMIT is available with approximate
+trimming, and an explicit zero disables the limit.
+
+```zap
+auto added = conn.xadd(
+    b"events", [redis.StreamField(b"kind", b"login")],
+    maxlen=Optional.Some(1000),
+).unwrap()
+auto removed = conn.xtrim(
+    b"events", minid=Optional.Some(b"1000-0"), approximate=False,
+)
+```
 
 `xread` requires at least one StreamCursor. Its IDs accept full canonical tokens,
 a millisecond component (`b"0"` starts at the beginning), or `b"$"` for new
@@ -141,11 +159,36 @@ literally named BLOCK after STREAMS is not confused with that option. Dedicated
 leases close on release, including after a healthy server timeout. Request/reply
 parser limits and the whole-command budget apply to all Streams helpers.
 
-Consumer groups expose explicit pending/acknowledgement operations through
-`xgroup_create`, `xreadgroup`, `xack`, `xpending`, and `xautoclaim`. This API
-does not claim durable consumer processing or exactly-once effects. See
+Consumer groups expose pending and acknowledgement operations through
+`xgroup_create`, `xreadgroup`, `xack`, `xpending`, `xclaim`, and `xautoclaim`.
 [Redis XREAD](https://redis.io/docs/latest/commands/xread/) and
 [XRANGE](https://redis.io/docs/latest/commands/xrange/).
+
+## Claiming and inspecting Streams
+
+- `xclaim(name, groupname, consumername, min_idle_time, message_ids, idle=None, time=None, retrycount=None, force=False, justid=False)`
+  returns `StreamClaimResult.Entries` or `.Ids`. Specify IDLE in milliseconds
+  or TIME as Unix time in milliseconds. RETRYCOUNT sets the delivery count.
+  Without an explicit retry count, JUSTID leaves it unchanged.
+- `xautoclaim(key, group, consumer, min_idle_ms, start_id=b"0-0", count=0, justid=False)`
+  returns a `StreamAutoClaim` with `next_id`, `deleted_ids`, and the
+  requested `entries` or `ids`. Use `next_id` as the next start ID
+  and stop the current scan at `b"0-0"`.
+- `xinfo_stream(name, full=False, count=None)` returns a `StreamInfo`.
+  It includes the current length, radix tree counters, IDs, and entries-added
+  count. `details` is `StreamInfoDetails.Summary` with the number of groups
+  and nullable first and last entries, or `.Full` with entries and nested
+  group and consumer pending data. With FULL, COUNT caps entry and pending
+  samples. An explicit zero requests all samples.
+- `xinfo_groups(name)` returns `StreamGroupInfo` records with binary group
+  names, consumer and pending counts, last delivered IDs, and optional
+  read counts and lag.
+- `xinfo_consumers(name, groupname)` returns `StreamConsumerInfo` records
+  with binary names, pending counts, idle milliseconds, and optional
+  inactive milliseconds. Inactive is absent when Redis has no successful
+  interaction timestamp for that consumer.
+
+[Redis Streams commands](https://redis.io/docs/latest/develop/data-types/streams/)
 
 The [complete executable example](../examples/pubsub_streams.zap) runs from both
 installed dependency types on both pinned Redis versions in CI. Focused fixtures

@@ -42,7 +42,7 @@ def main():
                 redis.StreamField(b"event", payload),
                 redis.StreamField(b"event", b"repeated"),
             ],
-        )
+        ).unwrap()
         publisher.execute([b"PEXPIRE", topic, b"60000"])
         auto batches = publisher.xread([redis.StreamCursor(topic, b"0")], count=1)
         if len(batches) != 1 or batches[0].entries[0].id != id:

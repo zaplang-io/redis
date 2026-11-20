@@ -87,7 +87,7 @@ def main():
         pool.shutdown()
     auto conn = redis.connect_options(cfg)
     check(
-        conn.xadd(b"key", [redis.StreamField(topic, payload)]) == b"1-0",
+        conn.xadd(b"key", [redis.StreamField(topic, payload)]).unwrap() == b"1-0",
         "TLS XADD ID",
     )
     auto batches = conn.xread([redis.StreamCursor(b"key", b"0")])

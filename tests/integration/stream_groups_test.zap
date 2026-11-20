@@ -14,7 +14,7 @@ def main():
         auto id = conn.xadd(
             key,
             [redis.StreamField(field, value), redis.StreamField(field, b"second")],
-        )
+        ).unwrap()
         conn.xgroup_create(key, group, b"0-0", True)
         auto duplicate = False
         try:

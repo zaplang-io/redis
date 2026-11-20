@@ -1076,12 +1076,17 @@ policy. Delivery is at-most-once; there is no replay or transparent resubscripti
 Cancel/join a blocked reader's scope before disconnecting. Always disconnect the
 session and release its dedicated lease in finally.
 
-## Basic Streams
+## Streams
 
 Connection helpers `xadd`, `xlen`, `xrange`, `xrevrange`, `xdel`, and `xread` use
 byte-token IDs and ordered `StreamField` pairs, preserving repeated binary fields.
 XREAD takes `StreamCursor(key, after_id)` values and returns `StreamBatch` values
 containing `StreamEntry` objects. IDs above signed int64 stay exact bytes.
+
+`xadd` returns `Optional[bytes]`. Use `.unwrap()` when the command can
+create the stream. With `nomkstream=True` an absent stream returns None.
+Both `xadd` and `xtrim` support MAXLEN or MINID, exact or approximate
+trimming, and LIMIT with approximate trimming.
 
 `xread(..., block_ms=-1)` is nonblocking; zero blocks indefinitely at Redis and
 positive values set a server wait in milliseconds. Server timeout/missing data
@@ -1089,15 +1094,18 @@ returns an empty list. Client deadlines/cancellation independently discard
 incomplete connections. Blocking XREAD requires a dedicated pool lease; ordinary
 leases support nonblocking `xread` and reject blocking raw/pipelined XREAD.
 Consumer groups use `xgroup_create`, `xgroup_destroy`, `xreadgroup`, `xack`,
-`xpending`, and `xautoclaim`. Group reads use `StreamCursor` identities:
+`xpending`, `xclaim`, and `xautoclaim`. Group reads use `StreamCursor` identities:
 `b">"` requests entries never delivered to this consumer, while a full stream
 ID resumes this consumer's pending entries. `xpending` returns a summary with
 the total, ID range, and per-consumer pending counts. `xautoclaim` returns the
-continuation ID, reclaimed entries, and (on Redis 7+) IDs removed during the
-claim scan; it requires Redis 6.2 or newer. Delivery is at least once: process
-an entry before acknowledging it, and make consumers idempotent where needed.
-Blocking XREADGROUP, like blocking XREAD, requires a dedicated pool lease.
-Trimming and automatic cursor/retry policy are not included.
+continuation ID, reclaimed entries or JUSTID results, and (on Redis 7+)
+IDs removed during the claim scan. Delivery is at least once. Process an
+entry before acknowledging it, and make consumers idempotent where needed.
+Blocking XREADGROUP requires a dedicated pool lease.
+
+Use `xinfo_stream`, `xinfo_groups`, and `xinfo_consumers` to inspect typed
+metadata. `xinfo_stream(full=True)` includes entries and pending details.
+`xsetid` updates an existing stream's last ID and optional bookkeeping fields.
 
 See [API, delivery/backpressure, ID, timeout, and shutdown semantics](docs/pubsub-streams.md)
 and the [complete installed-package example](examples/pubsub_streams.zap).

@@ -108,11 +108,11 @@ def wire():
         "local stream validation preserves connection",
     )
     check(
-        conn.xadd(b"key", [redis.StreamField(field, value), redis.StreamField(field, b"second")]) == id,
+        conn.xadd(b"key", [redis.StreamField(field, value), redis.StreamField(field, b"second")]).unwrap() == id,
         "generated ID kept as bytes",
     )
     check(
-        conn.xadd(b"key", fields, max_id) == max_id and conn.xlen(b"key") == 2,
+        conn.xadd(b"key", fields, max_id).unwrap() == max_id and conn.xlen(b"key") == 2,
         "uint64 IDs not narrowed",
     )
     auto entries = conn.xrange(b"key", b"(" + id, b"+", 2)
