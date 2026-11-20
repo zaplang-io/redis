@@ -1296,6 +1296,159 @@ def _score_value(Reply reply) -> float64:
         raise ProtocolError("Redis score underflows float64")
     return value
 
+struct GeoEntry:
+    float64 longitude
+    float64 latitude
+    bytes member
+
+struct GeoPosition:
+    float64 longitude
+    float64 latitude
+
+struct GeoHit:
+    bytes member
+    Optional[float64] distance
+    Optional[int64] hash
+    Optional[GeoPosition] position
+
+enum GeoSearchResult:
+    Members(list[bytes] values)
+    Hits(list[GeoHit] values)
+
+def _geo_unit(str unit) -> bytes:
+    auto token = bytes(unit)
+    if token != b"m" and token != b"km" and token != b"mi" and token != b"ft":
+        raise ValueError("Redis geo unit must be m, km, mi, or ft")
+    return token
+
+def _geo_coordinates(list[bytes] args, float64 longitude, float64 latitude):
+    if math.isnan(longitude) or longitude < -180.0 or longitude > 180.0:
+        raise ValueError("Redis longitude must be between -180 and 180")
+    if math.isnan(latitude) or latitude < -85.05112878 or latitude > 85.05112878:
+        raise ValueError("Redis latitude must be between -85.05112878 and 85.05112878")
+    args.append(_score_argument(longitude))
+    args.append(_score_argument(latitude))
+
+def _geo_size(float64 value) -> bytes:
+    if math.isnan(value) or math.isinf(value) or value < 0.0:
+        raise ValueError("Redis geo dimensions must be finite and nonnegative")
+    return _score_argument(value)
+
+def _geo_search_args(
+    list[bytes] args,
+    Optional[bytes] member,
+    Optional[float64] longitude,
+    Optional[float64] latitude,
+    str unit,
+    Optional[float64] radius,
+    Optional[float64] width,
+    Optional[float64] height,
+    str sort,
+    Optional[int64] count,
+    bool any,
+):
+    if member.is_some():
+        if longitude.is_some() or latitude.is_some():
+            raise ValueError("Redis geo search member and coordinates are mutually exclusive")
+        args.append(b"FROMMEMBER")
+        args.append(member.unwrap())
+    else:
+        if longitude.is_none() or latitude.is_none():
+            raise ValueError("Redis geo search requires a member or both coordinates")
+        args.append(b"FROMLONLAT")
+        _geo_coordinates(args, longitude.unwrap(), latitude.unwrap())
+
+    if radius.is_some():
+        if width.is_some() or height.is_some():
+            raise ValueError("Redis geo search radius and box are mutually exclusive")
+        args.append(b"BYRADIUS")
+        args.append(_geo_size(radius.unwrap()))
+    else:
+        if width.is_none() or height.is_none():
+            raise ValueError("Redis geo search requires a radius or both box dimensions")
+        args.append(b"BYBOX")
+        args.append(_geo_size(width.unwrap()))
+        args.append(_geo_size(height.unwrap()))
+    args.append(_geo_unit(unit))
+
+    if sort != "":
+        auto order = sort.upper()
+        if order != "ASC" and order != "DESC":
+            raise ValueError("Redis geo sort must be ASC or DESC")
+        args.append(bytes(order))
+    if count.is_some():
+        auto limit = count.unwrap()
+        if limit <= 0:
+            raise ValueError("Redis geo search COUNT must be positive")
+        args.append(b"COUNT")
+        args.append(bytes(str(limit)))
+        if any:
+            args.append(b"ANY")
+    elif any:
+        raise ValueError("Redis geo search ANY requires COUNT")
+
+def _geo_count(Reply reply) -> int64:
+    auto count = _integer_value(reply)
+    if count < 0:
+        raise ProtocolError("Redis geo result count must not be negative")
+    return count
+
+def _geo_distance(Reply reply) -> float64:
+    auto distance = _score_value(reply)
+    if math.isinf(distance) or distance < 0.0:
+        raise ProtocolError("Redis geo distance must be finite and nonnegative")
+    return distance
+
+def _geo_position(Reply reply) -> GeoPosition:
+    match reply:
+        case Reply.Array(items):
+            if len(items) != 2:
+                raise ProtocolError("Expected longitude and latitude in Redis geo reply")
+            auto longitude = _score_value(items[0])
+            auto latitude = _score_value(items[1])
+            if math.isinf(longitude) or math.isinf(latitude):
+                raise ProtocolError("Redis geo coordinates must be finite")
+            return GeoPosition(longitude, latitude)
+        case _:
+            raise ProtocolError("Expected Redis geo coordinate array")
+
+def _geo_hits(Reply reply, bool withcoord, bool withdist, bool withhash) -> list[GeoHit]:
+    auto size = 1
+    if withdist:
+        size = size + 1
+    if withhash:
+        size = size + 1
+    if withcoord:
+        size = size + 1
+    match reply:
+        case Reply.Array(items):
+            list[GeoHit] hits = []
+            for item in items:
+                match item:
+                    case Reply.Array(fields):
+                        if len(fields) != size:
+                            raise ProtocolError("GEOSEARCH result fields differ from selected options")
+                        auto member = _required_bulk(fields[0])
+                        Optional[float64] distance = None
+                        Optional[int64] hash = None
+                        Optional[GeoPosition] position = None
+                        auto i = 1
+                        # Redis orders metadata by type, independent of request flag order.
+                        if withdist:
+                            distance = Optional.Some(_geo_distance(fields[i]))
+                            i = i + 1
+                        if withhash:
+                            hash = Optional.Some(_geo_count(fields[i]))
+                            i = i + 1
+                        if withcoord:
+                            position = Optional.Some(_geo_position(fields[i]))
+                        hits.append(GeoHit(member, distance, hash, position))
+                    case _:
+                        raise ProtocolError("Expected GEOSEARCH result row")
+            return hits
+        case _:
+            raise ProtocolError("Expected GEOSEARCH array reply")
+
 def _rank_value(Reply reply) -> Optional[int64]:
     match reply:
         case Reply.NullBulk:
@@ -3833,6 +3986,138 @@ struct Connection:
 
     def sunionstore(self, bytes dest, list[bytes] keys) -> int64:
         return self._set_store(b"SUNIONSTORE", dest, keys)
+
+    def geoadd(
+        self,
+        bytes name,
+        list[GeoEntry] values,
+        bool nx = False,
+        bool xx = False,
+        bool ch = False,
+    ) -> int64:
+        """Add GeoEntry coordinates and return the added or changed count."""
+        if nx and xx:
+            raise ValueError("GEOADD NX and XX are mutually exclusive")
+        if len(values) == 0:
+            raise ValueError("GEOADD requires at least one entry")
+        list[bytes] args = [b"GEOADD", name]
+        if nx:
+            args.append(b"NX")
+        if xx:
+            args.append(b"XX")
+        if ch:
+            args.append(b"CH")
+        for entry in values:
+            _geo_coordinates(args, entry.longitude, entry.latitude)
+            args.append(entry.member)
+        auto result = _geo_count(self.execute(args))
+        if result > len(values):
+            raise ProtocolError("GEOADD count exceeds the number of entries")
+        return result
+
+    def geodist(self, bytes name, bytes place1, bytes place2, str unit = "") -> Optional[float64]:
+        """Return the distance in the requested unit, or None if a member is missing."""
+        list[bytes] args = [b"GEODIST", name, place1, place2]
+        if unit != "":
+            args.append(_geo_unit(unit))
+        auto reply = self.execute(args)
+        match reply:
+            case Reply.NullBulk:
+                return None
+            case _:
+                return Optional.Some(_geo_distance(reply))
+
+    def geopos(self, bytes name, list[bytes] values) -> list[Optional[GeoPosition]]:
+        """Return coordinates or None for each requested member in input order."""
+        list[bytes] args = [b"GEOPOS", name]
+        for value in values:
+            args.append(value)
+        match self.execute(args):
+            case Reply.Array(items):
+                if len(items) != len(values):
+                    raise ProtocolError("GEOPOS result count differs from member count")
+                list[Optional[GeoPosition]] positions = []
+                for item in items:
+                    match item:
+                        case Reply.NullArray:
+                            positions.append(None)
+                        case Reply.NullBulk:
+                            positions.append(None)
+                        case _:
+                            positions.append(Optional.Some(_geo_position(item)))
+                return positions
+            case _:
+                raise ProtocolError("Expected GEOPOS array reply")
+
+    def geohash(self, bytes name, list[bytes] values) -> list[Optional[bytes]]:
+        """Return geohash bytes or None for each requested member in input order."""
+        list[bytes] args = [b"GEOHASH", name]
+        for value in values:
+            args.append(value)
+        match self.execute(args):
+            case Reply.Array(items):
+                if len(items) != len(values):
+                    raise ProtocolError("GEOHASH result count differs from member count")
+                list[Optional[bytes]] hashes = []
+                for item in items:
+                    hashes.append(_bulk_value(item))
+                return hashes
+            case _:
+                raise ProtocolError("Expected GEOHASH array reply")
+
+    def geosearch(
+        self,
+        bytes name,
+        Optional[bytes] member = None,
+        Optional[float64] longitude = None,
+        Optional[float64] latitude = None,
+        str unit = "m",
+        Optional[float64] radius = None,
+        Optional[float64] width = None,
+        Optional[float64] height = None,
+        str sort = "",
+        Optional[int64] count = None,
+        bool any = False,
+        bool withcoord = False,
+        bool withdist = False,
+        bool withhash = False,
+    ) -> GeoSearchResult:
+        """Search around a member or coordinates for matches in a radius or box."""
+        list[bytes] args = [b"GEOSEARCH", name]
+        _geo_search_args(args, member, longitude, latitude, unit, radius, width, height, sort, count, any)
+        if withcoord:
+            args.append(b"WITHCOORD")
+        if withdist:
+            args.append(b"WITHDIST")
+        if withhash:
+            args.append(b"WITHHASH")
+        auto reply = self.execute(args)
+        if withcoord or withdist or withhash:
+            return GeoSearchResult.Hits(_geo_hits(reply, withcoord, withdist, withhash))
+        return GeoSearchResult.Members(_bulk_array(reply))
+
+    def geosearchstore(
+        self,
+        bytes dest,
+        bytes name,
+        Optional[bytes] member = None,
+        Optional[float64] longitude = None,
+        Optional[float64] latitude = None,
+        str unit = "m",
+        Optional[float64] radius = None,
+        Optional[float64] width = None,
+        Optional[float64] height = None,
+        str sort = "",
+        Optional[int64] count = None,
+        bool any = False,
+        bool storedist = False,
+    ) -> int64:
+        """Store matching members with geo scores or distances and return their count."""
+        list[bytes] args = [b"GEOSEARCHSTORE", dest, name]
+        _geo_search_args(args, member, longitude, latitude, unit, radius, width, height, sort, count, any)
+        if storedist:
+            args.append(b"STOREDIST")
+        return _geo_count(self.execute(args))
 
     def pfadd(self, bytes name, list[bytes] values = []) -> int64:
         """Add binary elements. Return one if registers changed or the key was created."""
