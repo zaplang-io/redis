@@ -50,14 +50,23 @@ reach a total count of zero.
 | `PatternUnsubscribed` | Optional binary pattern, total count |
 | `Message` | binary topic, binary payload |
 | `PatternMessage` | binary pattern, actual binary topic, binary payload |
+| `ShardSubscribed` | binary shard topic, shard subscription count |
+| `ShardUnsubscribed` | Optional binary shard topic, shard subscription count |
+| `ShardMessage` | binary shard topic, binary payload |
 
 A null unsubscribe target means Redis had no subscription of that kind.
-`subscription_count()` reports the most recently consumed acknowledgement's
-count, not a prediction based on pending commands; it becomes zero on close.
+`subscription_count()` sums the most recent ordinary and shard counts
+consumed by the caller. It becomes zero on close.
 Acknowledgements and messages are read in wire order. Overlapping channel and
 pattern subscriptions may intentionally yield more than one event for a publish.
 `conn.publish(topic, payload)` / `lease.publish(topic, payload)` return Redis's
 integer recipient count, including zero; an ordinary lease may publish.
+
+`ssubscribe(channels)` takes a nonempty binary channel list.
+`sunsubscribe()` removes all shard subscriptions, and takes an optional
+channel list for specific unsubscribes. Shard channels have their own
+acknowledgements and messages on RESP2 and RESP3. `spublish(channel, message)`
+returns the number of clients Redis reports receiving the shard message.
 
 ## Backpressure, cancellation, and shutdown
 

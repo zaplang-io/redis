@@ -27,6 +27,7 @@ is created by this change.
 - Typed geospatial updates, lookups, radius and box searches, and search stores (#63).
 - Stream trimming, NOMKSTREAM with nullable XADD IDs, claim modes, typed XINFO, and XSETID (#64).
 - Typed server administration and introspection, including parsed INFO and explicit flush modes (#65).
+- Typed Redis Functions and sharded Pub/Sub with same-slot Cluster routing (#66).
 - Bounded guarded pools with finite reset/reinitialization and dedicated leases.
 - Dedicated pull-based Pub/Sub sessions and PUBLISH, with typed binary events,
   explicit acknowledgements and at-most-once/no-replay semantics.

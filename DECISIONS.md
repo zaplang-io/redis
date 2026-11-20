@@ -112,3 +112,16 @@ CONFIG and CLIENT metadata use ordered byte pairs. COMMAND DOCS exposes
 named fields with their Redis reply types. The `asynchronous` option on
 FLUSHDB and FLUSHALL selects ASYNC when true and explicit SYNC when false.
 DEBUG SLEEP is used only in the disposable integration fixture.
+
+## Functions and shard session routing
+
+Issue [#66](https://github.com/zaplang-io/redis/issues/66) follows
+[redis-py's Functions and shard command names](https://redis.readthedocs.io/en/stable/commands.html).
+FCALL and FCALL_RO derive the key count from the binary key list, as EVAL
+does. Function listing and stats expose typed records with nullable metadata.
+
+A Cluster shard subscription uses the existing slot and redirect logic
+and owns a separate socket. The first acknowledgement stays visible to
+callers of `next_event()`. Ordinary and shard counts are tracked separately
+because Redis reports them separately. Cluster command connection ownership
+stays independent of the returned session.
