@@ -1925,7 +1925,7 @@ def _admin_nonnegative(Reply reply) -> int64:
         raise ProtocolError("Expected a nonnegative Redis administrative reply")
     return value
 
-def _admin_pairs(Reply reply) -> list[Reply]:
+def _reply_pairs(Reply reply) -> list[Reply]:
     match reply:
         case Reply.Array(items):
             if len(items) % 2 == 0:
@@ -1935,7 +1935,7 @@ def _admin_pairs(Reply reply) -> list[Reply]:
     raise ProtocolError("Expected Redis key/value reply")
 
 def _config_options(Reply reply) -> list[KeyValue]:
-    auto items = _admin_pairs(reply)
+    auto items = _reply_pairs(reply)
     list[KeyValue] values = []
     auto i = 0
     while i < len(items):
@@ -2003,11 +2003,11 @@ def _slowlog(Reply reply) -> list[SlowLogEntry]:
             raise ProtocolError("Expected SLOWLOG array")
 
 def _command_docs(Reply reply) -> list[CommandDoc]:
-    auto items = _admin_pairs(reply)
+    auto items = _reply_pairs(reply)
     list[CommandDoc] docs = []
     auto i = 0
     while i < len(items):
-        auto metadata = _admin_pairs(items[i + 1])
+        auto metadata = _reply_pairs(items[i + 1])
         list[CommandDocField] fields = []
         auto j = 0
         while j < len(metadata):
@@ -2229,11 +2229,19 @@ def _pubsub_event3(Resp3 value) -> PubSubEvent:
                 raise ProtocolError("Expected three-part Pub/Sub push")
             if kind == b"message":
                 return PubSubEvent.Message(_resp3_bulk(items[1]), _resp3_bulk(items[2]))
+            if kind == b"smessage":
+                return PubSubEvent.ShardMessage(_resp3_bulk(items[1]), _resp3_bulk(items[2]))
             auto count = _resp3_integer(items[2])
             if count < 0:
                 raise ProtocolError("Negative RESP3 subscription count")
             if kind == b"subscribe":
                 return PubSubEvent.Subscribed(_resp3_bulk(items[1]), count)
+            if kind == b"ssubscribe":
+                return PubSubEvent.ShardSubscribed(_resp3_bulk(items[1]), count)
+            if kind == b"sunsubscribe":
+                if _resp3_is_null(items[1]):
+                    return PubSubEvent.ShardUnsubscribed(_none_bytes(), count)
+                return PubSubEvent.ShardUnsubscribed(Optional.Some(_resp3_bulk(items[1])), count)
             if kind == b"psubscribe":
                 return PubSubEvent.PatternSubscribed(_resp3_bulk(items[1]), count)
             if kind == b"unsubscribe":
@@ -2284,6 +2292,106 @@ def _script_command(
     for argument in arguments:
         command.append(argument)
     return command
+
+struct FunctionInfo:
+    bytes name
+    Optional[bytes] description
+    list[bytes] flags
+
+struct FunctionLibrary:
+    bytes name
+    bytes engine
+    list[FunctionInfo] functions
+    Optional[bytes] code
+
+struct RunningFunction:
+    bytes name
+    list[bytes] command
+    int64 duration_ms
+
+struct FunctionEngineStats:
+    bytes engine
+    int64 libraries_count
+    int64 functions_count
+
+struct FunctionStats:
+    Optional[RunningFunction] running
+    list[FunctionEngineStats] engines
+
+def _function_fields(Reply reply) -> _ReplyFields:
+    return _ReplyFields(_reply_pairs(reply), "FUNCTION")
+
+def _function_flags(Reply reply) -> list[bytes]:
+    list[bytes] flags = []
+    match reply:
+        case Reply.Array(items):
+            for item in items:
+                match item:
+                    case Reply.Simple(data):
+                        flags.append(data)
+                    case _:
+                        raise ProtocolError("Expected FUNCTION flag simple string")
+            return flags
+        case _:
+            raise ProtocolError("Expected FUNCTION flags collection")
+
+def _function_info(Reply reply) -> FunctionInfo:
+    auto fields = _function_fields(reply)
+    return FunctionInfo(
+        _required_bulk(fields.get(b"name")),
+        _bulk_value(fields.get(b"description")),
+        _function_flags(fields.get(b"flags")),
+    )
+
+def _function_libraries(Reply reply) -> list[FunctionLibrary]:
+    list[FunctionLibrary] libraries = []
+    match reply:
+        case Reply.Array(items):
+            for item in items:
+                auto fields = _function_fields(item)
+                list[FunctionInfo] functions = []
+                match fields.get(b"functions"):
+                    case Reply.Array(rows):
+                        for row in rows:
+                            functions.append(_function_info(row))
+                    case _:
+                        raise ProtocolError("Expected FUNCTION LIST functions array")
+                libraries.append(FunctionLibrary(
+                    _required_bulk(fields.get(b"library_name")),
+                    _required_bulk(fields.get(b"engine")),
+                    functions,
+                    _bulk_value(fields.get(b"library_code", False)),
+                ))
+            return libraries
+        case _:
+            raise ProtocolError("Expected FUNCTION LIST array")
+
+def _running_function(Reply reply) -> Optional[RunningFunction]:
+    match reply:
+        case Reply.NullBulk:
+            return None
+        case _:
+            auto fields = _function_fields(reply)
+            return Optional.Some(RunningFunction(
+                _required_bulk(fields.get(b"name")),
+                _bulk_array(fields.get(b"command")),
+                _admin_nonnegative(fields.get(b"duration_ms")),
+            ))
+
+def _function_stats(Reply reply) -> FunctionStats:
+    auto fields = _function_fields(reply)
+    auto engines = _reply_pairs(fields.get(b"engines"))
+    list[FunctionEngineStats] stats = []
+    auto i = 0
+    while i < len(engines):
+        auto counters = _function_fields(engines[i + 1])
+        stats.append(FunctionEngineStats(
+            _required_bulk(engines[i]),
+            _admin_nonnegative(counters.get(b"libraries_count")),
+            _admin_nonnegative(counters.get(b"functions_count")),
+        ))
+        i = i + 2
+    return FunctionStats(_running_function(fields.get(b"running_script")), stats)
 
 # A registered script never retries transport/protocol errors or ordinary server
 # errors. An explicit NOSCRIPT means EVALSHA did not execute the script.
@@ -2460,7 +2568,7 @@ def _command_name(list[bytes] args) -> str:
 
 def _stream_command(list[bytes] args) -> bool:
     auto name = _command_name(args)
-    return name == "SUBSCRIBE" or name == "PSUBSCRIBE" or name == "SSUBSCRIBE" or name == "MONITOR" or name == "HELLO" or name == "SYNC" or name == "PSYNC" or name == "REPLCONF"
+    return name == "SUBSCRIBE" or name == "PSUBSCRIBE" or name == "SSUBSCRIBE" or name == "SUNSUBSCRIBE" or name == "MONITOR" or name == "HELLO" or name == "SYNC" or name == "PSYNC" or name == "REPLCONF"
 
 def _transaction_args(list[bytes] args):
     auto name = _command_name(args)
@@ -2983,10 +3091,10 @@ def _append_stream_number(list[bytes] args, bytes option, Optional[int64] value)
         args.append(option)
         args.append(bytes(str(number)))
 
-# RESP2 returns alternating key/value arrays. Connection.execute normalizes
-# RESP3 maps to the same shape, including maps nested inside FULL replies.
-struct _StreamInfoFields:
+# Connection.execute normalizes RESP3 maps to RESP2's alternating pairs.
+struct _ReplyFields:
     list[Reply] values
+    str context
 
     def get(self, bytes name, bool required = True) -> Reply:
         auto i = 0
@@ -2995,22 +3103,16 @@ struct _StreamInfoFields:
         while i < len(self.values):
             if _required_bulk(self.values[i]) == name:
                 if found:
-                    raise ProtocolError("Duplicate XINFO field " + str(name))
+                    raise ProtocolError("Duplicate " + self.context + " field " + str(name))
                 value = self.values[i + 1]
                 found = True
             i = i + 2
         if required and not found:
-            raise ProtocolError("Missing XINFO field " + str(name))
+            raise ProtocolError("Missing " + self.context + " field " + str(name))
         return value
 
-def _stream_info_fields(Reply reply) -> _StreamInfoFields:
-    match reply:
-        case Reply.Array(items):
-            if len(items) % 2 == 0:
-                return _StreamInfoFields(items)
-        case _:
-            auto ignored = 0
-    raise ProtocolError("Expected XINFO key/value fields")
+def _stream_info_fields(Reply reply) -> _ReplyFields:
+    return _ReplyFields(_reply_pairs(reply), "XINFO")
 
 def _stream_info_items(Reply reply) -> list[Reply]:
     match reply:
@@ -3116,7 +3218,7 @@ def _stream_full_groups(Reply reply) -> list[StreamFullGroup]:
         ))
     return groups
 
-def _stream_info_details(_StreamInfoFields fields, bool full) -> StreamInfoDetails:
+def _stream_info_details(_ReplyFields fields, bool full) -> StreamInfoDetails:
     if full:
         return StreamInfoDetails.Full(
             _stream_entries(fields.get(b"entries")),
@@ -3218,6 +3320,9 @@ enum PubSubEvent:
     PatternUnsubscribed(Optional[bytes] pattern, int64 count)
     Message(bytes topic, bytes payload)
     PatternMessage(bytes pattern, bytes topic, bytes payload)
+    ShardSubscribed(bytes topic, int64 count)
+    ShardUnsubscribed(Optional[bytes] topic, int64 count)
+    ShardMessage(bytes topic, bytes payload)
 
 def _pubsub_count(Reply reply) -> int64:
     auto count = _integer_value(reply)
@@ -3246,9 +3351,15 @@ def _pubsub_event(Reply reply) -> PubSubEvent:
                     _required_bulk(items[1]),
                     _required_bulk(items[2]),
                 )
+            if kind == b"smessage":
+                return PubSubEvent.ShardMessage(_required_bulk(items[1]), _required_bulk(items[2]))
             auto count = _pubsub_count(items[2])
             if kind == b"subscribe":
                 return PubSubEvent.Subscribed(_required_bulk(items[1]), count)
+            if kind == b"ssubscribe":
+                return PubSubEvent.ShardSubscribed(_required_bulk(items[1]), count)
+            if kind == b"sunsubscribe":
+                return PubSubEvent.ShardUnsubscribed(_bulk_value(items[1]), count)
             if kind == b"psubscribe":
                 return PubSubEvent.PatternSubscribed(_required_bulk(items[1]), count)
             if kind == b"unsubscribe":
@@ -3283,6 +3394,9 @@ struct PubSub:
     Atomic[int64] _state
     Atomic[int64] _lease_guard
     Atomic[int64] _count
+    Atomic[int64] _shard_count
+    int64 _shard_slot = -1
+    Optional[PubSubEvent] _primed = None
 
     def _enter(self):
         if not self._state.compare_and_swap(0, 1):
@@ -3298,16 +3412,28 @@ struct PubSub:
             return
         self._connection._invalidate()
         self._count.store(0)
+        self._shard_count.store(0)
+        self._primed = None
         self._state.store(2)
         self._lease_guard.store(0)
 
     def is_closed(self) -> bool:
         return self._state.load() == 2
 
-    # This is the count from the last consumed acknowledgement, not a prediction
-    # based on commands whose acknowledgements have not been read yet.
+    # Counts come from the most recently consumed ordinary and shard acknowledgements.
     def subscription_count(self) -> int64:
-        return self._count.load()
+        return self._count.load() + self._shard_count.load()
+
+    def _record_ack(self, PubSubEvent event):
+        match event:
+            case PubSubEvent.ShardSubscribed(topic, count):
+                self._shard_count.store(count)
+            case PubSubEvent.ShardUnsubscribed(topic, count):
+                self._shard_count.store(count)
+            case _:
+                auto count = _pubsub_ack_count(event)
+                if count >= 0:
+                    self._count.store(count)
 
     def _send_control(self, bytes wire):
         self._enter()
@@ -3340,6 +3466,33 @@ struct PubSub:
     def punsubscribe(self, list[bytes] patterns):
         self._send_control(_unsubscribe_wire(b"PUNSUBSCRIBE", patterns))
 
+    def _check_shard_slot(self, list[bytes] channels):
+        if self._shard_slot >= 0:
+            for topic in channels:
+                if cluster_slot(topic) != self._shard_slot:
+                    raise ValueError("CROSSSLOT channel does not hash to the session slot")
+
+    def ssubscribe(self, list[bytes] channels):
+        """Send SSUBSCRIBE. Read acknowledgements with next_event()."""
+        self._check_shard_slot(channels)
+        self._send_control(encode_command(_keys_command(b"SSUBSCRIBE", channels)))
+
+    def sunsubscribe(self, list[bytes] channels = []):
+        """Send SUNSUBSCRIBE. An empty list removes all shard subscriptions."""
+        self._check_shard_slot(channels)
+        self._send_control(_unsubscribe_wire(b"SUNSUBSCRIBE", channels))
+
+    def _read_event(self, int64 deadline) -> PubSubEvent:
+        if self._connection._protocol3:
+            return _pubsub_event3(self._connection._next_push(deadline, True))
+        auto reply = self._connection._read_reply(deadline)
+        match reply:
+            case Reply.Error(data):
+                self._connection._last_error = data
+                raise ResponseError(_error_text(data))
+            case _:
+                return _pubsub_event(reply)
+
     def next_event(self, int64 timeout_ms = -1) -> PubSubEvent:
         if timeout_ms < -1:
             raise ValueError("Pub/Sub timeout must be -1, zero, or positive")
@@ -3349,30 +3502,19 @@ struct PubSub:
         self._enter()
         auto healthy = False
         try:
-            auto deadline = _budget(budget_ms)
-            net.set_deadline_ns(self._connection._socket, deadline)
-            if self._connection._protocol3:
-                auto frame = self._connection._next_push(deadline)
-                auto event = _pubsub_event3(frame)
-                auto count = _pubsub_ack_count(event)
-                if count >= 0:
-                    self._count.store(count)
-                net.set_deadline_ns(self._connection._socket, 0)
+            if self._primed.is_some():
+                auto event = self._primed.unwrap()
+                self._primed = None
+                self._record_ack(event)
                 healthy = True
                 return event
-            auto reply = self._connection._read_reply(deadline)
-            match reply:
-                case Reply.Error(data):
-                    self._connection._last_error = data
-                    raise ResponseError(_error_text(data))
-                case _:
-                    auto event = _pubsub_event(reply)
-                    auto count = _pubsub_ack_count(event)
-                    if count >= 0:
-                        self._count.store(count)
-                    net.set_deadline_ns(self._connection._socket, 0)
-                    healthy = True
-                    return event
+            auto deadline = _budget(budget_ms)
+            net.set_deadline_ns(self._connection._socket, deadline)
+            auto event = self._read_event(deadline)
+            self._record_ack(event)
+            net.set_deadline_ns(self._connection._socket, 0)
+            healthy = True
+            return event
         finally:
             if not healthy:
                 self._close_session()
@@ -3440,12 +3582,17 @@ struct Connection:
             self._push_head = 0
         return value
 
-    def _next_push(self, int64 deadline) -> Resp3:
+    def _next_push(self, int64 deadline, bool response_errors = False) -> Resp3:
         if self._push_head < len(self._pushes):
             return self._take_push()
         while True:
             auto value = self._read_resp3_frame(deadline)
             if not _resp3_push(value):
+                if response_errors:
+                    auto error = _resp3_error_bytes(value)
+                    if error.is_some():
+                        self._last_error = error.unwrap()
+                        raise ResponseError(_error_text(self._last_error))
                 raise ProtocolError("Expected RESP3 push while awaiting push")
             return value
 
@@ -3482,13 +3629,17 @@ struct Connection:
             if self._state.load() == 2:
                 raise ConnectionError("Redis connection is closed")
             raise BusyError("Redis connection is in use")
-        return PubSub(self, Atomic(0), Atomic(0), Atomic(0))
+        return PubSub(self, Atomic(0), Atomic(0), Atomic(0), Atomic(0))
 
     def publish(self, bytes topic, bytes payload) -> int64:
         auto count = _integer_value(self.execute([b"PUBLISH", topic, payload]))
         if count < 0:
             raise ProtocolError("Negative PUBLISH recipient count")
         return count
+
+    def spublish(self, bytes topic, bytes message) -> int64:
+        """Publish a message to a shard channel and return its receiver count."""
+        return _pubsub_count(self.execute([b"SPUBLISH", topic, message]))
 
     def transaction(self) -> Transaction:
         if not self._state.compare_and_swap(0, 1):
@@ -5225,6 +5376,48 @@ struct Connection:
         _validate_sha(sha)
         return self.execute(_script_command(b"EVALSHA", sha, keys, arguments))
 
+    def function_load(self, bytes code, bool replace = False) -> bytes:
+        """Load a function library and return its name."""
+        list[bytes] args = [b"FUNCTION", b"LOAD"]
+        if replace:
+            args.append(b"REPLACE")
+        args.append(code)
+        return _required_bulk(self.execute(args))
+
+    def function_delete(self, bytes library) -> bool:
+        """Delete the named function library."""
+        return _status_value(self.execute([b"FUNCTION", b"DELETE", library]), b"OK")
+
+    def function_list(self, bytes library = b"*", bool withcode = False) -> list[FunctionLibrary]:
+        """Inspect libraries matching a pattern, optionally with source code."""
+        list[bytes] args = [b"FUNCTION", b"LIST", b"LIBRARYNAME", library]
+        if withcode:
+            args.append(b"WITHCODE")
+        return _function_libraries(self.execute(args))
+
+    def function_dump(self) -> bytes:
+        """Return the server's serialized function libraries."""
+        return _required_bulk(self.execute([b"FUNCTION", b"DUMP"]))
+
+    def function_flush(self, str mode = "SYNC") -> bool:
+        """Delete all function libraries on this server in SYNC or ASYNC mode."""
+        auto token = mode.upper()
+        if token != "SYNC" and token != "ASYNC":
+            raise ValueError("FUNCTION FLUSH mode must be SYNC or ASYNC")
+        return _status_value(self.execute([b"FUNCTION", b"FLUSH", bytes(token)]), b"OK")
+
+    def function_stats(self) -> FunctionStats:
+        """Inspect the running function and available engine counters."""
+        return _function_stats(self.execute([b"FUNCTION", b"STATS"]))
+
+    def fcall(self, bytes function, list[bytes] keys, list[bytes] arguments) -> Reply:
+        """Invoke a function with the key count derived from the key list."""
+        return self.execute(_script_command(b"FCALL", function, keys, arguments))
+
+    def fcall_ro(self, bytes function, list[bytes] keys, list[bytes] arguments) -> Reply:
+        """Invoke a function that Redis permits in read-only mode."""
+        return self.execute(_script_command(b"FCALL_RO", function, keys, arguments))
+
     def script_load(self, bytes source) -> bytes:
         auto sha = _required_bulk(self.execute([b"SCRIPT", b"LOAD", source]))
         try:
@@ -5834,6 +6027,15 @@ struct SentinelClient:
         finally:
             self._state.store(2)
 
+def _cluster_same_slot(list[bytes] keys) -> int64:
+    if len(keys) == 0:
+        raise ValueError("Redis Cluster requires at least one key or shard channel")
+    auto slot = cluster_slot(keys[0])
+    for key in keys:
+        if cluster_slot(key) != slot:
+            raise ValueError("CROSSSLOT keys in request do not hash to the same slot")
+    return slot
+
 struct ClusterClient:
     list[Options] _seeds
     Options _data_config
@@ -5867,6 +6069,70 @@ struct ClusterClient:
         self._connections.append(connection)
         return self._connections[len(self._connections) - 1]
 
+    def spublish(self, bytes topic, bytes message) -> int64:
+        """Publish using the shard channel's slot and existing redirect handling."""
+        return _pubsub_count(self.execute_for(topic, [b"SPUBLISH", topic, message]))
+
+    def ssubscribe(self, list[bytes] channels) -> PubSub:
+        """Open an owned Pub/Sub session on the slot for all supplied channels."""
+        auto slot = _cluster_same_slot(channels)
+        if not self._state.compare_and_swap(0, 1):
+            if self._state.load() == 2:
+                raise ConnectionError("Redis Cluster client is closed")
+            raise BusyError("Redis Cluster client is in use")
+        try:
+            return self._subscribe_routed(slot, channels)
+        finally:
+            self._state.store(0)
+
+    def _subscribe_routed(self, int64 slot, list[bytes] channels) -> PubSub:
+        auto endpoint = self._primary(slot)
+        auto asking = False
+        auto redirects = 0
+        while redirects <= 5:
+            # Never put a subscribed socket in the ordinary command cache.
+            auto connection = connect_options(_endpoint_options(self._data_config, endpoint))
+            auto retained = False
+            try:
+                if asking:
+                    _status_value(connection.execute([b"ASKING"]), b"OK")
+                auto session = connection.pubsub()
+                session._shard_slot = slot
+                try:
+                    session.ssubscribe(channels)
+                    auto event = session.next_event()
+                    match event:
+                        case PubSubEvent.ShardSubscribed(topic, count):
+                            if topic != bytes(channels[0]) or count != 1:
+                                raise ProtocolError("Unexpected first SSUBSCRIBE acknowledgement")
+                        case _:
+                            raise ProtocolError("Expected first SSUBSCRIBE acknowledgement")
+                    session._primed = Optional.Some(event)
+                    session._shard_count.store(0)
+                    retained = True
+                    return session
+                except ResponseError:
+                    auto redirect = _cluster_redirect(connection.last_error(), slot)
+                    redirects = redirects + 1
+                    if redirects > 5:
+                        raise ProtocolError("Redis Cluster redirection limit exceeded")
+                    asking = self._follow_redirect(slot, redirect)
+                    endpoint = redirect.endpoint
+                finally:
+                    if not retained:
+                        session.disconnect()
+            finally:
+                if not retained and not connection.is_closed():
+                    connection.disconnect()
+        raise ProtocolError("Redis Cluster redirection limit exceeded")
+
+    def _follow_redirect(self, int64 slot, ClusterRedirect redirect) -> bool:
+        if redirect.kind == b"MOVED":
+            self._refresh_topology()
+            self._moved_slots.append(ClusterSlotOverride(slot, redirect.endpoint))
+            return False
+        return True
+
     def execute_for(self, bytes key, list[bytes] args) -> Reply:
         if len(args) < 2:
             raise ValueError("Redis Cluster command must include a single key")
@@ -5889,13 +6155,7 @@ struct ClusterClient:
         if len(args) == 0:
             raise ValueError("Redis Cluster command must not be empty")
         auto command = bytes(_command_name(args))
-        auto keys = _cluster_command_keys(command, args)
-        auto slot = cluster_slot(keys[0])
-        for key in keys:
-            if cluster_slot(key) != slot:
-                raise ValueError(
-                    "CROSSSLOT keys in request do not hash to the same slot",
-                )
+        auto slot = _cluster_same_slot(_cluster_command_keys(command, args))
         if not self._state.compare_and_swap(0, 1):
             if self._state.load() == 2:
                 raise ConnectionError("Redis Cluster client is closed")
@@ -5924,14 +6184,7 @@ struct ClusterClient:
                 redirects = redirects + 1
                 if redirects > 5:
                     raise ProtocolError("Redis Cluster redirection limit exceeded")
-                if redirect.kind == b"MOVED":
-                    self._refresh_topology()
-                    self._moved_slots.append(
-                        ClusterSlotOverride(slot, redirect.endpoint),
-                    )
-                    asking = False
-                else:
-                    asking = True
+                asking = self._follow_redirect(slot, redirect)
                 endpoint = redirect.endpoint
         raise ProtocolError("Redis Cluster redirection limit exceeded")
 
@@ -5977,7 +6230,7 @@ struct ClusterClient:
             self._state.store(2)
 
 def _cluster_single_key_command(bytes command) -> bool:
-    return command == b"APPEND" or command == b"DECR" or command == b"DECRBY" or command == b"EXPIRE" or command == b"EXPIREAT" or command == b"GET" or command == b"GETDEL" or command == b"GETEX" or command == b"GETRANGE" or command == b"GETSET" or command == b"HDEL" or command == b"HEXISTS" or command == b"HGET" or command == b"HGETALL" or command == b"HINCRBY" or command == b"HINCRBYFLOAT" or command == b"HKEYS" or command == b"HLEN" or command == b"HMGET" or command == b"HSET" or command == b"HSETNX" or command == b"HSTRLEN" or command == b"HVALS" or command == b"INCR" or command == b"INCRBY" or command == b"INCRBYFLOAT" or command == b"LINDEX" or command == b"LINSERT" or command == b"LLEN" or command == b"LPOP" or command == b"LPOS" or command == b"LPUSH" or command == b"LPUSHX" or command == b"LRANGE" or command == b"LREM" or command == b"LSET" or command == b"LTRIM" or command == b"PERSIST" or command == b"PEXPIRE" or command == b"PEXPIREAT" or command == b"PTTL" or command == b"RESTORE" or command == b"RPOP" or command == b"RPUSH" or command == b"RPUSHX" or command == b"SADD" or command == b"SCARD" or command == b"SET" or command == b"SETEX" or command == b"SETNX" or command == b"SETRANGE" or command == b"SISMEMBER" or command == b"SMEMBERS" or command == b"SMISMEMBER" or command == b"SPOP" or command == b"SRANDMEMBER" or command == b"SREM" or command == b"STRLEN" or command == b"SUBSTR" or command == b"TTL" or command == b"TYPE" or command == b"XADD" or command == b"XDEL" or command == b"XLEN" or command == b"XPENDING" or command == b"XRANGE" or command == b"XREVRANGE" or command == b"ZADD" or command == b"ZCARD" or command == b"ZCOUNT" or command == b"ZINCRBY" or command == b"ZLEXCOUNT" or command == b"ZMSCORE" or command == b"ZPOPMAX" or command == b"ZPOPMIN" or command == b"ZRANGE" or command == b"ZRANGEBYLEX" or command == b"ZRANGEBYSCORE" or command == b"ZRANK" or command == b"ZREM" or command == b"ZREVRANGE" or command == b"ZREVRANGEBYLEX" or command == b"ZREVRANGEBYSCORE" or command == b"ZREVRANK" or command == b"ZSCAN" or command == b"ZSCORE"
+    return command == b"APPEND" or command == b"DECR" or command == b"DECRBY" or command == b"EXPIRE" or command == b"EXPIREAT" or command == b"GET" or command == b"GETDEL" or command == b"GETEX" or command == b"GETRANGE" or command == b"GETSET" or command == b"HDEL" or command == b"HEXISTS" or command == b"HGET" or command == b"HGETALL" or command == b"HINCRBY" or command == b"HINCRBYFLOAT" or command == b"HKEYS" or command == b"HLEN" or command == b"HMGET" or command == b"HSET" or command == b"HSETNX" or command == b"HSTRLEN" or command == b"HVALS" or command == b"INCR" or command == b"INCRBY" or command == b"INCRBYFLOAT" or command == b"LINDEX" or command == b"LINSERT" or command == b"LLEN" or command == b"LPOP" or command == b"LPOS" or command == b"LPUSH" or command == b"LPUSHX" or command == b"LRANGE" or command == b"LREM" or command == b"LSET" or command == b"LTRIM" or command == b"PERSIST" or command == b"PEXPIRE" or command == b"PEXPIREAT" or command == b"PTTL" or command == b"RESTORE" or command == b"RPOP" or command == b"RPUSH" or command == b"RPUSHX" or command == b"SADD" or command == b"SCARD" or command == b"SET" or command == b"SETEX" or command == b"SETNX" or command == b"SETRANGE" or command == b"SISMEMBER" or command == b"SMEMBERS" or command == b"SMISMEMBER" or command == b"SPOP" or command == b"SRANDMEMBER" or command == b"SREM" or command == b"SPUBLISH" or command == b"STRLEN" or command == b"SUBSTR" or command == b"TTL" or command == b"TYPE" or command == b"XADD" or command == b"XDEL" or command == b"XLEN" or command == b"XPENDING" or command == b"XRANGE" or command == b"XREVRANGE" or command == b"ZADD" or command == b"ZCARD" or command == b"ZCOUNT" or command == b"ZINCRBY" or command == b"ZLEXCOUNT" or command == b"ZMSCORE" or command == b"ZPOPMAX" or command == b"ZPOPMIN" or command == b"ZRANGE" or command == b"ZRANGEBYLEX" or command == b"ZRANGEBYSCORE" or command == b"ZRANK" or command == b"ZREM" or command == b"ZREVRANGE" or command == b"ZREVRANGEBYLEX" or command == b"ZREVRANGEBYSCORE" or command == b"ZREVRANK" or command == b"ZSCAN" or command == b"ZSCORE"
 
 struct PoolClosed:
     str message
@@ -6194,6 +6447,13 @@ struct Lease:
         self._enter()
         try:
             return self._connection.publish(topic, payload)
+        finally:
+            self._guard.store(0)
+
+    def spublish(self, bytes topic, bytes message) -> int64:
+        self._enter()
+        try:
+            return self._connection.spublish(topic, message)
         finally:
             self._guard.store(0)
 

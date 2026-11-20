@@ -1183,12 +1183,39 @@ reconnected; a failed reply can follow a completed side effect. Bare EVALSHA
 never falls back. Do not use NOSCRIPT as an application-defined script error
 code; it is the registered helper's cache-miss signal.
 
-Redis Functions and automatic script warmup are outside this API. Current
-the connection's cancellation/deadline policy applies. Tests simulate cache
+The connection's cancellation and deadline policy applies. Tests simulate cache
 loss and interrupted execution without issuing global SCRIPT FLUSH.
 
 References: [EVAL](https://redis.io/docs/latest/commands/eval/),
 [EVALSHA](https://redis.io/docs/latest/commands/evalsha/).
+
+## Redis Functions
+
+| Method | Result |
+| --- | --- |
+| `function_load(code, replace=False)`, `function_delete(library)` | Loaded library name and deletion status |
+| `function_list(library=b"*", withcode=False)` | `FunctionLibrary` records with engine, functions, flags, and optional source |
+| `function_dump()`, `function_flush(mode="SYNC")` | Binary dump and flush status |
+| `function_stats()` | Optional running function and per-engine library and function counts |
+| `fcall(function, keys, arguments)`, `fcall_ro(function, keys, arguments)` | Raw `Reply` with the key count derived from the list |
+
+Source, function and library names, keys, and arguments are bytes. FCALL_RO
+uses Redis's read-only function rules. Redis errors propagate as
+`ResponseError`. FUNCTION FLUSH deletes all function libraries on the
+connected server. Call it only when clearing that server is intentional.
+
+## Sharded Pub/Sub
+
+Use `sub.ssubscribe(channels)` and `sub.sunsubscribe(channels=[])` on a
+dedicated Pub/Sub session. Read `ShardSubscribed`, `ShardUnsubscribed`,
+and `ShardMessage` events with `next_event()`. Publish through a separate
+connection or lease with `spublish(topic, message)`.
+
+Cluster clients expose `cluster.ssubscribe(channels)` and
+`cluster.spublish(topic, message)`. The returned subscription owns a
+separate socket. Read its first acknowledgement with `next_event()` and
+disconnect that session when finished. Use channels with matching hash
+tags for one session. [Cluster shard routing](docs/high-availability.md)
 
 ## Generated parser checks and performance
 

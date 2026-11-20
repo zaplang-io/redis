@@ -79,8 +79,7 @@ binary key:
 `RENAME`, `RENAMENX`, `RPOPLPUSH`, `SMOVE`, `SUNION`, `SINTER`, `SDIFF`, and
 `BITOP`. It extracts each key for those command forms and rejects a cross-slot
 request locally before opening a socket or sending a command. Unknown command
-forms, pipelines, transactions, Pub/Sub and blocking/stateful commands are not
-supported by the Cluster client.
+forms, pipelines, transactions, ordinary Pub/Sub and blocking/stateful commands are outside this routing API.
 
 The client caches a connection for each primary and reuses it. A MOVED response
 refreshes the slot map and routes that slot to the advertised primary. An ASK
@@ -99,3 +98,19 @@ Discovered addresses are used as returned by Sentinel or `CLUSTER SLOTS`. For a
 bounded connect timeout, discovered and redirected addresses must be numeric;
 there is no endpoint-specific resolved-IP override. Hostname DNS resolution
 remains synchronous and unbounded.
+
+## Cluster shard subscriptions
+
+`cluster.spublish(topic, message)` routes by the shard channel's slot using
+the regular command connection cache. `cluster.ssubscribe(channels)` requires
+a nonempty list whose channels all hash to the same slot. It opens a dedicated
+socket at the slot owner and completes initial routing before returning.
+The initial acknowledgement remains available with `next_event()`.
+
+The initial subscription follows a complete MOVED or ASK response with the
+same five-hop limit as regular commands. An already active session belongs to
+the caller. It is independent of cluster refresh and disconnect, so call
+`session.disconnect()` explicitly. After a topology change, open a new session
+if the original server removes the subscription or the socket closes.
+The session validates subsequent shard control commands against its original
+slot. Open separate sessions for different slots.
