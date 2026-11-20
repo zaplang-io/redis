@@ -125,3 +125,22 @@ and owns a separate socket. The first acknowledgement stays visible to
 callers of `next_event()`. Ordinary and shard counts are tracked separately
 because Redis reports them separately. Cluster command connection ownership
 stays independent of the returned session.
+
+## Top-level Redis client API
+
+For [#67](https://github.com/zaplang-io/redis/issues/67), the public client
+is `Connection`. Create it with `redis.connect()`, `redis.connect_url()`,
+or `redis.connect_options()`. Typed command helpers and the raw command
+entry points live on `Connection`. Use `redis.pool()` for explicit pooled
+leases and the dedicated session APIs for transactions and Pub/Sub.
+
+For callers coming from redis-py's `Redis` or `StrictRedis`, use
+`redis.connect_url()` for `Redis.from_url()` and call `disconnect()` in a
+`finally` block for scoped cleanup. Each typed helper defines its reply
+shape. For application-specific decoding, call `execute()` or
+`execute_raw()` and transform the returned `Reply` in application code.
+These are the Zap equivalents of redis-py's client facade, context manager,
+and response callbacks. Command names and options follow redis-py where
+they fit Zap's declared types and the package's binary-safe API.
+
+[redis-py client API](https://redis.readthedocs.io/en/stable/connections.html)

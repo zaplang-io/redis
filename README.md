@@ -55,6 +55,8 @@ been closed. One active operation owns the connection: overlapping `execute` or
 `disconnect`/`reconnect` calls raise `redis.BusyError` instead of queuing or
 sharing replies.
 The connection fields and direct construction are internal; use `connect()`.
+See the [top-level client API decision](DECISIONS.md#top-level-redis-client-api)
+for the equivalents of redis-py's URL, cleanup, and response handling APIs.
 
 Transport failures, EOF before a complete reply, and invalid framing close the
 connection and discard buffered bytes. Commands are never automatically retried.
