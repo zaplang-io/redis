@@ -25,6 +25,7 @@ is created by this change.
 - Typed bitmap commands with BYTE/BIT ranges and an ordered BITFIELD builder (#61).
 - Typed HyperLogLog updates, union estimates, and merges with binary-safe inputs (#62).
 - Typed geospatial updates, lookups, radius and box searches, and search stores (#63).
+- Stream trimming, NOMKSTREAM with nullable XADD IDs, claim modes, typed XINFO, and XSETID (#64).
 - Bounded guarded pools with finite reset/reinitialization and dedicated leases.
 - Dedicated pull-based Pub/Sub sessions and PUBLISH, with typed binary events,
   explicit acknowledgements and at-most-once/no-replay semantics.

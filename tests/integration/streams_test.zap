@@ -35,11 +35,11 @@ def commands(integration_fixtures.Fixture f):
                 redis.StreamField(b"field", b"second"),
             ],
             b"1-0",
-        )
+        ).unwrap()
         conn.execute([b"PEXPIRE", key, b"60000"])
         integration_fixtures.check(id == b"1-0", "explicit ID")
         conn.xadd(key, [redis.StreamField(b"empty", b"")], b"1-1")
-        auto generated = conn.xadd(key, [redis.StreamField(b"generated", b"yes")])
+        auto generated = conn.xadd(key, [redis.StreamField(b"generated", b"yes")]).unwrap()
         integration_fixtures.check(
             generated != b"*" and conn.xlen(key) == 3,
             "generated ID and length",
@@ -69,7 +69,7 @@ def commands(integration_fixtures.Fixture f):
         )
         auto large = b"9223372036854775808-9223372036854775809"
         integration_fixtures.check(
-            conn.xadd(other, [redis.StreamField(bytes([255]), value)], large) == large,
+            conn.xadd(other, [redis.StreamField(bytes([255]), value)], large).unwrap() == large,
             "IDs above signed int64 remain exact",
         )
         conn.execute([b"PEXPIRE", other, b"60000"])

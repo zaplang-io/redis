@@ -2466,6 +2466,61 @@ struct StreamAutoClaim:
     bytes next_id
     list[StreamEntry] entries
     list[bytes] deleted_ids
+    list[bytes] ids = []
+
+enum StreamClaimResult:
+    Entries(list[StreamEntry] values)
+    Ids(list[bytes] values)
+
+struct StreamGroupInfo:
+    bytes name
+    int64 consumers
+    int64 pending
+    bytes last_delivered_id
+    Optional[int64] entries_read
+    Optional[int64] lag
+
+struct StreamConsumerInfo:
+    bytes name
+    int64 pending
+    int64 idle_ms
+    Optional[int64] inactive_ms
+
+struct StreamPendingEntry:
+    bytes id
+    Optional[bytes] consumer
+    int64 delivery_time_ms
+    int64 deliveries
+
+struct StreamFullConsumer:
+    bytes name
+    int64 seen_time_ms
+    Optional[int64] active_time_ms
+    int64 pending_count
+    list[StreamPendingEntry] pending
+
+struct StreamFullGroup:
+    bytes name
+    bytes last_delivered_id
+    Optional[int64] entries_read
+    Optional[int64] lag
+    int64 pending_count
+    list[StreamPendingEntry] pending
+    list[StreamFullConsumer] consumers
+
+enum StreamInfoDetails:
+    Summary(int64 groups, Optional[StreamEntry] first_entry, Optional[StreamEntry] last_entry)
+    Full(list[StreamEntry] entries, list[StreamFullGroup] groups)
+
+struct StreamInfo:
+    int64 length
+    int64 radix_tree_keys
+    int64 radix_tree_nodes
+    bytes last_generated_id
+    bytes max_deleted_entry_id
+    int64 entries_added
+    bytes recorded_first_entry_id
+    StreamInfoDetails details
 
 def _stream_component(str part) -> bool:
     if part !~ m/\A(?:0|[1-9][0-9]*)\z/:
@@ -2488,6 +2543,13 @@ def _stream_id_valid(bytes raw) -> bool:
     if not _stream_component(parsed.group("ms")):
         return False
     return _stream_component(parsed.group("seq"))
+
+def _stream_add_id(bytes id):
+    if id == b"*" or _stream_id_valid(id):
+        return
+    if len(id) >= 3 and id[len(id) - 2:len(id)] == b"-*" and _stream_id_valid(id[0:len(id) - 1] + b"0"):
+        return
+    raise ValueError("XADD requires *, a full canonical stream ID, or a millisecond-* ID")
 
 def _stream_position(bytes raw, bool allow_dollar):
     if allow_dollar and raw == b"$":
@@ -2635,24 +2697,239 @@ def _stream_pending_summary(Reply reply) -> StreamPendingSummary:
         case _:
             raise ProtocolError("Expected XPENDING summary array")
 
-def _stream_autoclaim(Reply reply) -> StreamAutoClaim:
+def _stream_returned_id(Reply reply) -> bytes:
+    auto id = _required_bulk(reply)
+    if not _stream_id_valid(id):
+        raise ProtocolError("Invalid returned Redis stream ID")
+    return id
+
+def _stream_ids(Reply reply) -> list[bytes]:
+    auto ids = _bulk_array(reply)
+    for id in ids:
+        if not _stream_id_valid(id):
+            raise ProtocolError("Invalid returned Redis stream ID")
+    return ids
+
+def _stream_autoclaim(Reply reply, bool justid) -> StreamAutoClaim:
     match reply:
         case Reply.Array(parts):
             if len(parts) != 2 and len(parts) != 3:
                 raise ProtocolError("XAUTOCLAIM reply must contain two or three fields")
-            auto next_id = _required_bulk(parts[0])
-            if not _stream_id_valid(next_id):
-                raise ProtocolError("Invalid XAUTOCLAIM continuation ID")
-            auto entries = _stream_entries(parts[1])
+            auto next_id = _stream_returned_id(parts[0])
             list[bytes] deleted = []
             if len(parts) == 3:
-                deleted = _bulk_array(parts[2])
-                for id in deleted:
-                    if not _stream_id_valid(id):
-                        raise ProtocolError("Invalid XAUTOCLAIM deleted ID")
-            return StreamAutoClaim(next_id, entries, deleted)
+                deleted = _stream_ids(parts[2])
+            list[StreamEntry] entries = []
+            list[bytes] ids = []
+            if justid:
+                ids = _stream_ids(parts[1])
+            else:
+                entries = _stream_entries(parts[1])
+            return StreamAutoClaim(next_id, entries, deleted, ids)
         case _:
             raise ProtocolError("Expected XAUTOCLAIM array")
+
+def _stream_trim_args(
+    list[bytes] args,
+    Optional[int64] maxlen,
+    bool approximate,
+    Optional[bytes] minid,
+    Optional[int64] limit,
+):
+    if maxlen.is_some() and minid.is_some():
+        raise ValueError("Redis stream MAXLEN and MINID are mutually exclusive")
+    if maxlen.is_none() and minid.is_none():
+        if limit.is_some():
+            raise ValueError("Redis stream LIMIT requires MAXLEN or MINID")
+        return
+    auto threshold = b""
+    if maxlen.is_some():
+        auto length = maxlen.unwrap()
+        if length < 0:
+            raise ValueError("Redis stream MAXLEN must not be negative")
+        args.append(b"MAXLEN")
+        threshold = bytes(str(length))
+    else:
+        threshold = minid.unwrap()
+        _stream_position(threshold, False)
+        args.append(b"MINID")
+    if approximate:
+        args.append(b"~")
+    else:
+        args.append(b"=")
+    args.append(threshold)
+    if limit.is_some():
+        auto count = limit.unwrap()
+        if not approximate or count < 0:
+            raise ValueError("Redis stream LIMIT must be nonnegative and requires approximate trimming")
+        args.append(b"LIMIT")
+        args.append(bytes(str(count)))
+
+def _append_stream_number(list[bytes] args, bytes option, Optional[int64] value):
+    if value.is_some():
+        auto number = value.unwrap()
+        if number < 0:
+            raise ValueError("Redis stream option must not be negative: " + str(option))
+        args.append(option)
+        args.append(bytes(str(number)))
+
+# RESP2 returns alternating key/value arrays. Connection.execute normalizes
+# RESP3 maps to the same shape, including maps nested inside FULL replies.
+struct _StreamInfoFields:
+    list[Reply] values
+
+    def get(self, bytes name, bool required = True) -> Reply:
+        auto i = 0
+        auto found = False
+        auto value = Reply.NullBulk
+        while i < len(self.values):
+            if _required_bulk(self.values[i]) == name:
+                if found:
+                    raise ProtocolError("Duplicate XINFO field " + str(name))
+                value = self.values[i + 1]
+                found = True
+            i = i + 2
+        if required and not found:
+            raise ProtocolError("Missing XINFO field " + str(name))
+        return value
+
+def _stream_info_fields(Reply reply) -> _StreamInfoFields:
+    match reply:
+        case Reply.Array(items):
+            if len(items) % 2 == 0:
+                return _StreamInfoFields(items)
+        case _:
+            auto ignored = 0
+    raise ProtocolError("Expected XINFO key/value fields")
+
+def _stream_info_items(Reply reply) -> list[Reply]:
+    match reply:
+        case Reply.Array(items):
+            return items
+        case _:
+            raise ProtocolError("Expected XINFO array")
+
+def _stream_info_number(Reply reply) -> Optional[int64]:
+    match reply:
+        case Reply.NullBulk:
+            return None
+        case _:
+            return Optional.Some(_stream_nonnegative(reply))
+
+def _stream_info_time(Reply reply) -> Optional[int64]:
+    match reply:
+        case Reply.Integer(value):
+            if value == -1:
+                return None
+        case _:
+            auto ignored = 0
+    return _stream_info_number(reply)
+
+def _stream_info_entry(Reply reply) -> Optional[StreamEntry]:
+    match reply:
+        case Reply.NullBulk:
+            return None
+        case _:
+            return Optional.Some(_stream_entry(reply))
+
+def _stream_group_infos(Reply reply) -> list[StreamGroupInfo]:
+    list[StreamGroupInfo] groups = []
+    for row in _stream_info_items(reply):
+        auto fields = _stream_info_fields(row)
+        groups.append(StreamGroupInfo(
+            _required_bulk(fields.get(b"name")),
+            _stream_nonnegative(fields.get(b"consumers")),
+            _stream_nonnegative(fields.get(b"pending")),
+            _stream_returned_id(fields.get(b"last-delivered-id")),
+            _stream_info_number(fields.get(b"entries-read", False)),
+            _stream_info_number(fields.get(b"lag", False)),
+        ))
+    return groups
+
+def _stream_consumer_infos(Reply reply) -> list[StreamConsumerInfo]:
+    list[StreamConsumerInfo] consumers = []
+    for row in _stream_info_items(reply):
+        auto fields = _stream_info_fields(row)
+        consumers.append(StreamConsumerInfo(
+            _required_bulk(fields.get(b"name")),
+            _stream_nonnegative(fields.get(b"pending")),
+            _stream_nonnegative(fields.get(b"idle")),
+            _stream_info_time(fields.get(b"inactive", False)),
+        ))
+    return consumers
+
+def _stream_info_pending(Reply reply, bool has_consumer) -> list[StreamPendingEntry]:
+    list[StreamPendingEntry] pending = []
+    auto delivery_index = 1
+    if has_consumer:
+        delivery_index = 2
+    for row in _stream_info_items(reply):
+        auto parts = _stream_info_items(row)
+        if len(parts) != delivery_index + 2:
+            raise ProtocolError("Unexpected XINFO pending row length")
+        Optional[bytes] consumer = None
+        if has_consumer:
+            consumer = Optional.Some(_required_bulk(parts[1]))
+        pending.append(StreamPendingEntry(
+            _stream_returned_id(parts[0]),
+            consumer,
+            _stream_nonnegative(parts[delivery_index]),
+            _stream_nonnegative(parts[delivery_index + 1]),
+        ))
+    return pending
+
+def _stream_full_consumers(Reply reply) -> list[StreamFullConsumer]:
+    list[StreamFullConsumer] consumers = []
+    for row in _stream_info_items(reply):
+        auto fields = _stream_info_fields(row)
+        consumers.append(StreamFullConsumer(
+            _required_bulk(fields.get(b"name")),
+            _stream_nonnegative(fields.get(b"seen-time")),
+            _stream_info_time(fields.get(b"active-time", False)),
+            _stream_nonnegative(fields.get(b"pel-count")),
+            _stream_info_pending(fields.get(b"pending"), False),
+        ))
+    return consumers
+
+def _stream_full_groups(Reply reply) -> list[StreamFullGroup]:
+    list[StreamFullGroup] groups = []
+    for row in _stream_info_items(reply):
+        auto fields = _stream_info_fields(row)
+        groups.append(StreamFullGroup(
+            _required_bulk(fields.get(b"name")),
+            _stream_returned_id(fields.get(b"last-delivered-id")),
+            _stream_info_number(fields.get(b"entries-read", False)),
+            _stream_info_number(fields.get(b"lag", False)),
+            _stream_nonnegative(fields.get(b"pel-count")),
+            _stream_info_pending(fields.get(b"pending"), True),
+            _stream_full_consumers(fields.get(b"consumers")),
+        ))
+    return groups
+
+def _stream_info_details(_StreamInfoFields fields, bool full) -> StreamInfoDetails:
+    if full:
+        return StreamInfoDetails.Full(
+            _stream_entries(fields.get(b"entries")),
+            _stream_full_groups(fields.get(b"groups")),
+        )
+    return StreamInfoDetails.Summary(
+        _stream_nonnegative(fields.get(b"groups")),
+        _stream_info_entry(fields.get(b"first-entry")),
+        _stream_info_entry(fields.get(b"last-entry")),
+    )
+
+def _stream_info(Reply reply, bool full) -> StreamInfo:
+    auto fields = _stream_info_fields(reply)
+    return StreamInfo(
+        _stream_nonnegative(fields.get(b"length")),
+        _stream_nonnegative(fields.get(b"radix-tree-keys")),
+        _stream_nonnegative(fields.get(b"radix-tree-nodes")),
+        _stream_returned_id(fields.get(b"last-generated-id")),
+        _stream_returned_id(fields.get(b"max-deleted-entry-id")),
+        _stream_nonnegative(fields.get(b"entries-added")),
+        _stream_returned_id(fields.get(b"recorded-first-entry-id")),
+        _stream_info_details(fields, full),
+    )
 
 def _stream_group_id(bytes raw):
     if raw == b">":
@@ -3702,19 +3979,37 @@ struct Connection:
         _list_mpop_args(args, keys, direction, count)
         return _list_mpop_reply(self.execute(args), keys, count, self._protocol3)
 
-    def xadd(self, bytes key, list[StreamField] fields, bytes id = b"*") -> bytes:
-        if id != b"*" and not _stream_id_valid(id):
-            raise ValueError("XADD requires * or a full canonical stream ID")
+    def xadd(
+        self,
+        bytes key,
+        list[StreamField] fields,
+        bytes id = b"*",
+        Optional[int64] maxlen = None,
+        bool approximate = True,
+        bool nomkstream = False,
+        Optional[bytes] minid = None,
+        Optional[int64] limit = None,
+    ) -> Optional[bytes]:
+        """Append ordered fields. NOMKSTREAM returns None if the key is absent."""
+        _stream_add_id(id)
         if len(fields) == 0:
             raise ValueError("XADD requires at least one field/value pair")
-        list[bytes] args = [b"XADD", key, id]
+        list[bytes] args = [b"XADD", key]
+        if nomkstream:
+            args.append(b"NOMKSTREAM")
+        _stream_trim_args(args, maxlen, approximate, minid, limit)
+        args.append(id)
         for field in fields:
             args.append(field.field)
             args.append(field.value)
-        bytes created = _required_bulk(self.execute(args))
-        if not _stream_id_valid(created):
-            raise ProtocolError("Invalid XADD returned ID")
-        return created
+        auto reply = self.execute(args)
+        match reply:
+            case Reply.NullBulk:
+                if nomkstream:
+                    return None
+                raise ProtocolError("Unexpected null XADD reply")
+            case _:
+                return Optional.Some(_stream_returned_id(reply))
 
     def xlen(self, bytes key) -> int64:
         return _stream_nonnegative(self.execute([b"XLEN", key]))
@@ -3842,6 +4137,43 @@ struct Connection:
     def xpending(self, bytes key, bytes group) -> StreamPendingSummary:
         return _stream_pending_summary(self.execute([b"XPENDING", key, group]))
 
+    def xclaim(
+        self,
+        bytes name,
+        bytes groupname,
+        bytes consumername,
+        int64 min_idle_time,
+        list[bytes] message_ids,
+        Optional[int64] idle = None,
+        Optional[int64] time = None,
+        Optional[int64] retrycount = None,
+        bool force = False,
+        bool justid = False,
+    ) -> StreamClaimResult:
+        """Transfer pending messages to a consumer and return entries or IDs."""
+        if min_idle_time < 0:
+            raise ValueError("XCLAIM minimum idle time must not be negative")
+        if len(message_ids) == 0:
+            raise ValueError("XCLAIM requires at least one stream ID")
+        if idle.is_some() and time.is_some():
+            raise ValueError("XCLAIM IDLE and TIME are mutually exclusive")
+        list[bytes] args = [b"XCLAIM", name, groupname, consumername, bytes(str(min_idle_time))]
+        for id in message_ids:
+            if not _stream_id_valid(bytes(id)):
+                raise ValueError("XCLAIM requires full canonical stream IDs")
+            args.append(id)
+        _append_stream_number(args, b"IDLE", idle)
+        _append_stream_number(args, b"TIME", time)
+        _append_stream_number(args, b"RETRYCOUNT", retrycount)
+        if force:
+            args.append(b"FORCE")
+        if justid:
+            args.append(b"JUSTID")
+        auto reply = self.execute(args)
+        if justid:
+            return StreamClaimResult.Ids(_stream_ids(reply))
+        return StreamClaimResult.Entries(_stream_entries(reply))
+
     def xautoclaim(
         self,
         bytes key,
@@ -3850,9 +4182,11 @@ struct Connection:
         int64 min_idle_ms,
         bytes start_id = b"0-0",
         int64 count = 0,
+        bool justid = False,
     ) -> StreamAutoClaim:
-        if min_idle_ms < 0 or count < 0:
-            raise ValueError("XAUTOCLAIM idle time and COUNT must be non-negative")
+        """Claim stale entries, preserving continuation and deleted IDs in both modes."""
+        if min_idle_ms < 0:
+            raise ValueError("XAUTOCLAIM idle time must not be negative")
         if not _stream_id_valid(start_id):
             raise ValueError("XAUTOCLAIM requires a full canonical start ID")
         list[bytes] args = [
@@ -3863,10 +4197,63 @@ struct Connection:
             bytes(str(min_idle_ms)),
             start_id,
         ]
-        if count > 0:
-            args.append(b"COUNT")
-            args.append(bytes(str(count)))
-        return _stream_autoclaim(self.execute(args))
+        _stream_count(args, count)
+        if justid:
+            args.append(b"JUSTID")
+        return _stream_autoclaim(self.execute(args), justid)
+
+    def xinfo_stream(self, bytes name, bool full = False, Optional[int64] count = None) -> StreamInfo:
+        """Read stream metadata and optionally include entries, groups, and pending details."""
+        if count.is_some() and not full:
+            raise ValueError("XINFO STREAM COUNT requires FULL")
+        list[bytes] args = [b"XINFO", b"STREAM", name]
+        if full:
+            args.append(b"FULL")
+        _append_stream_number(args, b"COUNT", count)
+        return _stream_info(self.execute(args), full)
+
+    def xinfo_groups(self, bytes name) -> list[StreamGroupInfo]:
+        """Read consumer-group counts, delivery position, and nullable lag."""
+        return _stream_group_infos(self.execute([b"XINFO", b"GROUPS", name]))
+
+    def xinfo_consumers(self, bytes name, bytes groupname) -> list[StreamConsumerInfo]:
+        """Read consumer pending counts and idle times for one group."""
+        return _stream_consumer_infos(self.execute([b"XINFO", b"CONSUMERS", name, groupname]))
+
+    def xtrim(
+        self,
+        bytes name,
+        Optional[int64] maxlen = None,
+        bool approximate = True,
+        Optional[bytes] minid = None,
+        Optional[int64] limit = None,
+    ) -> int64:
+        """Trim by maximum length or minimum ID and return the number removed."""
+        if maxlen.is_none() and minid.is_none():
+            raise ValueError("XTRIM requires MAXLEN or MINID")
+        list[bytes] args = [b"XTRIM", name]
+        _stream_trim_args(args, maxlen, approximate, minid, limit)
+        return _stream_nonnegative(self.execute(args))
+
+    def xsetid(
+        self,
+        bytes name,
+        bytes last_id,
+        Optional[int64] entries_added = None,
+        Optional[bytes] max_deleted_id = None,
+    ) -> bool:
+        """Set an existing stream's last ID and optional bookkeeping fields."""
+        if not _stream_id_valid(last_id):
+            raise ValueError("XSETID requires a full canonical stream ID")
+        list[bytes] args = [b"XSETID", name, last_id]
+        _append_stream_number(args, b"ENTRIESADDED", entries_added)
+        if max_deleted_id.is_some():
+            auto id = max_deleted_id.unwrap()
+            if not _stream_id_valid(id):
+                raise ValueError("XSETID MAXDELETEDID requires a full canonical stream ID")
+            args.append(b"MAXDELETEDID")
+            args.append(id)
+        return _status_value(self.execute(args), b"OK")
 
     def _set_members(self, bytes command, bytes key, list[bytes] members) -> int64:
         if len(members) == 0:
@@ -5610,6 +5997,7 @@ struct Lease:
         int64 min_idle_ms,
         bytes start_id = b"0-0",
         int64 count = 0,
+        bool justid = False,
     ) -> StreamAutoClaim:
         self._enter()
         try:
@@ -5620,6 +6008,7 @@ struct Lease:
                 min_idle_ms,
                 start_id,
                 count,
+                justid,
             )
         finally:
             self._guard.store(0)

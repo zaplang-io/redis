@@ -88,3 +88,17 @@ in a typed input list. The search origin, shape, and count options use
 `GeoSearchResult.Members` carries the plain member list. When a WITH flag is
 requested, `GeoSearchResult.Hits` carries typed records with optional
 distance, raw hash, and position fields.
+
+## Stream trimming, claim results, and metadata
+
+Issue [#64](https://github.com/zaplang-io/redis/issues/64) follows
+[redis-py's Stream option names](https://redis.readthedocs.io/en/stable/commands.html).
+XADD retains the ordered field pair list to preserve repeated field names
+and returns `Optional[bytes]` for NOMKSTREAM. Callers that permit stream
+creation can unwrap the result. Trim thresholds and limits use Optional
+so omitted values stay distinct from zero.
+
+XCLAIM uses a tagged value for entries or JUSTID results. XAUTOCLAIM
+retains the continuation and deleted IDs in both modes and exposes JUSTID
+values in its new `ids` field. XINFO metadata uses typed records and
+ignores unknown fields. Stream IDs and group and consumer names remain bytes.
