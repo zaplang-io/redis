@@ -20,6 +20,8 @@ is created by this change.
   returns a tagged result (#58).
 - Typed LPOS, LINSERT, LREM, conditional pushes, and list moves and
   multi-pops, including cancellation-safe BRPOPLPUSH and BLMPOP (#59).
+- Typed set membership, intersection cardinality, moves, and store operations.
+  SPOP and SRANDMEMBER support counted and uncounted selection (#60).
 - Bounded guarded pools with finite reset/reinitialization and dedicated leases.
 - Dedicated pull-based Pub/Sub sessions and PUBLISH, with typed binary events,
   explicit acknowledgements and at-most-once/no-replay semantics.
