@@ -195,7 +195,17 @@ def consumer(redis.PubSub sub, channel[bool] entered, Atomic[int64] cancelled):
         entered <- True
         sub.next_event(0)
     except Cancelled:
-        check(sub.is_closed(), "cancel propagated after close")
+        # Cooperative cancellation is delivered at the NEXT cancellation point the
+        # coroutine reaches. That can be the `entered <- True` send above, BEFORE
+        # `next_event(0)` opens its read critical section — in which case the
+        # session has not been closed yet when this handler runs. So do not assert
+        # `sub.is_closed()` here: the delivery point is scheduler-dependent (it is
+        # the `next_event(0)` read under multi-core, the handshake send under
+        # MAXPROCS=1). Closure is still asserted after the scope, where the
+        # `finally` below has run `disconnect()`. Asserting closure here made this
+        # test fail deterministically on a single worker and flakily on multi-core
+        # (see zaplang-io/zap#1238 — the core scope join is correct; it fully
+        # awaits a cancelled child's except/finally before re-raising).
         cancelled.add(1)
     finally:
         sub.disconnect()
