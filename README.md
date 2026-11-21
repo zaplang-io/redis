@@ -186,6 +186,14 @@ and fail after 60 seconds, with forced termination five seconds later.
   unchanged; the rejected operation does not touch its socket or buffer.
 - `ValueError`: invalid local arguments. The existing connection is unchanged.
 
+Every server error reply maps to the single `redis.ResponseError`, whatever its prefix;
+branch on the prefix (below) rather than on the exception type. This mirrors redis-py's
+base-class `except ResponseError` — one handler catches every server error — and is
+deliberate: Zap exceptions are flat (no subclassing yet), so a single type is what keeps
+one `except` able to catch them all. A typed subclass hierarchy (`AuthenticationError`,
+`ReadOnlyError`, …, as in redis-py) will be revisited if Zap gains exception inheritance
+([zaplang-io/zap#139](https://github.com/zaplang-io/zap/issues/139)).
+
 Zap's `except Error as message` binds a string. `conn.last_error()` retains the
 exact bytes of the most recently consumed top-level server error, including
 non-UTF-8 payloads. Success preserves it; another server error replaces it and
